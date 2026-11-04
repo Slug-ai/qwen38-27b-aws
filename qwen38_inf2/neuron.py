@@ -7,7 +7,7 @@ import torch
 from neuronx_distributed import ModelBuilder, NxDParallelState
 from neuronx_distributed.parallel_layers.mappings import reduce_from_tensor_model_parallel_region
 from neuronx_distributed.trace.nxd_model import NxDModel
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load_file
 
 from . import checkpoint
 from .config import TextConfig
@@ -56,15 +56,6 @@ def build(
     info = {"max_seq_len": max_seq_len, "tp_degree": tp_degree, "target": target, "layers": cfg.num_hidden_layers}
     (output_dir / checkpoint.BUILD_INFO_FILE).write_text(json.dumps(info, indent=2))
     return path
-
-
-def write_rank_weights(source, cfg: TextConfig, weights_dir: str | Path, block_layers: int, tp_degree: int = 2) -> None:
-    """Write one file per block per NeuronCore. Vision and MTP tensors are never read."""
-    Path(weights_dir).mkdir(parents=True, exist_ok=True)
-    for block in range(cfg.num_hidden_layers // block_layers):
-        for rank in range(tp_degree):
-            weights = checkpoint.block_weights(source, cfg, block, block_layers, rank, tp_degree, DTYPE)
-            save_file({k: v.contiguous() for k, v in weights.items()}, checkpoint.shard_path(weights_dir, block, rank))
 
 
 class NeuronStep(BlockChain):

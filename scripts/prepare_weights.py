@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""Cut the checkpoint into one weights file per NeuronCore. Needs no Neuron hardware.
+"""Cut the checkpoint into one weights file per block per NeuronCore. Needs no Neuron SDK or hardware.
 
 Vision and MTP tensors are never read. In total this is about 6.9 GB per core.
 """
 
 import argparse
 
-from qwen38_inf2.checkpoint import TensorSource, read_build_info
+from qwen38_inf2.checkpoint import TensorSource, read_build_info, write_rank_weights
 from qwen38_inf2.config import TextConfig
-from qwen38_inf2.neuron import write_rank_weights
 
 
 def main():

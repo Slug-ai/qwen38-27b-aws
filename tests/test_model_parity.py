@@ -5,7 +5,6 @@ from dataclasses import replace
 
 import pytest
 import torch
-from safetensors.torch import save_file
 
 from qwen38_inf2 import checkpoint
 from qwen38_inf2.config import tiny_config
@@ -176,10 +175,7 @@ def test_simulated_cores_from_weight_files_match_hf_generate(tmp_path):
     reference, tensors = build_reference(cfg)
     source = checkpoint.DictSource(tensors)
     block_layers, tp_degree = 4, 2
-    for block in range(cfg.num_hidden_layers // block_layers):
-        for rank in range(tp_degree):
-            weights = checkpoint.block_weights(source, cfg, block, block_layers, rank, tp_degree)
-            save_file({k: v.contiguous() for k, v in weights.items()}, checkpoint.shard_path(tmp_path, block, rank))
+    checkpoint.write_rank_weights(source, cfg, tmp_path, block_layers, tp_degree)
     info = {"layers": block_layers, "tp_degree": tp_degree, "max_seq_len": MAX_SEQ_LEN}
 
     step = SimulatedCoresStep(tmp_path, cfg, info, torch.float32)

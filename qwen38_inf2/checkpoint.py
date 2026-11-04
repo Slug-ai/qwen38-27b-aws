@@ -14,6 +14,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from safetensors.torch import save_file
 
 from . import fp4
 from .config import FULL, LINEAR, TextConfig
@@ -241,6 +242,15 @@ class RecordingSource:
 
 def shard_path(weights_dir: str | Path, block: int, rank: int) -> Path:
     return Path(weights_dir) / f"block{block:02d}_tp{rank}.safetensors"
+
+
+def write_rank_weights(source, cfg: TextConfig, weights_dir: str | Path, block_layers: int, tp_degree: int = 2) -> None:
+    """Write one file per block per NeuronCore. Vision and MTP tensors are never read."""
+    Path(weights_dir).mkdir(parents=True, exist_ok=True)
+    for block in range(cfg.num_hidden_layers // block_layers):
+        for rank in range(tp_degree):
+            weights = block_weights(source, cfg, block, block_layers, rank, tp_degree)
+            save_file({k: v.contiguous() for k, v in weights.items()}, shard_path(weights_dir, block, rank))
 
 
 def read_build_info(model_dir: str | Path) -> dict:
