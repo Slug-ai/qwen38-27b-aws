@@ -1,0 +1,196 @@
+{
+  "agree": 38,
+  "positions": 38,
+  "results": [
+    {
+      "position": 0,
+      "bf16": " following",
+      "float32": " following"
+    },
+    {
+      "position": 1,
+      "bf16": " of",
+      "float32": " of"
+    },
+    {
+      "position": 2,
+      "bf16": " the",
+      "float32": " the"
+    },
+    {
+      "position": 3,
+      "bf16": " is",
+      "float32": " is"
+    },
+    {
+      "position": 4,
+      "bf16": " Paris",
+      "float32": " Paris"
+    },
+    {
+      "position": 5,
+      "bf16": ".",
+      "float32": "."
+    },
+    {
+      "position": 6,
+      "bf16": "\n",
+      "float32": "\n"
+    },
+    {
+      "position": 7,
+      "bf16": " capital",
+      "float32": " capital"
+    },
+    {
+      "position": 8,
+      "bf16": " of",
+      "float32": " of"
+    },
+    {
+      "position": 9,
+      "bf16": " Germany",
+      "float32": " Germany"
+    },
+    {
+      "position": 10,
+      "bf16": " is",
+      "float32": " is"
+    },
+    {
+      "position": 11,
+      "bf16": " Tokyo",
+      "float32": " Tokyo"
+    },
+    {
+      "position": 12,
+      "bf16": ".",
+      "float32": "."
+    },
+    {
+      "position": 13,
+      "bf16": " The",
+      "float32": " The"
+    },
+    {
+      "position": 14,
+      "bf16": " capital",
+      "float32": " capital"
+    },
+    {
+      "position": 15,
+      "bf16": " of",
+      "float32": " of"
+    },
+    {
+      "position": 16,
+      "bf16": " Germany",
+      "float32": " Germany"
+    },
+    {
+      "position": 17,
+      "bf16": " is",
+      "float32": " is"
+    },
+    {
+      "position": 18,
+      "bf16": " Rome",
+      "float32": " Rome"
+    },
+    {
+      "position": 19,
+      "bf16": ".",
+      "float32": "."
+    },
+    {
+      "position": 20,
+      "bf16": " The",
+      "float32": " The"
+    },
+    {
+      "position": 21,
+      "bf16": " is",
+      "float32": " is"
+    },
+    {
+      "position": 22,
+      "bf16": " wet",
+      "float32": " wet"
+    },
+    {
+      "position": 23,
+      "bf16": " of",
+      "float32": " of"
+    },
+    {
+      "position": 24,
+      "bf16": " hydrogen",
+      "float32": " hydrogen"
+    },
+    {
+      "position": 25,
+      "bf16": " and",
+      "float32": " and"
+    },
+    {
+      "position": 26,
+      "bf16": " oxygen",
+      "float32": " oxygen"
+    },
+    {
+      "position": 27,
+      "bf16": ".",
+      "float32": "."
+    },
+    {
+      "position": 28,
+      "bf16": " The",
+      "float32": " The"
+    },
+    {
+      "position": 29,
+      "bf16": " sun",
+      "float32": " sun"
+    },
+    {
+      "position": 30,
+      "bf16": " orbits",
+      "float32": " orbits"
+    },
+    {
+      "position": 31,
+      "bf16": " the",
+      "float32": " the"
+    },
+    {
+      "position": 32,
+      "bf16": " Sun",
+      "float32": " Sun"
+    },
+    {
+      "position": 33,
+      "bf16": ".",
+      "float32": "."
+    },
+    {
+      "position": 34,
+      "bf16": " every",
+      "float32": " every"
+    },
+    {
+      "position": 35,
+      "bf16": " ",
+      "float32": " "
+    },
+    {
+      "position": 36,
+      "bf16": ".",
+      "float32": "."
+    },
+    {
+      "position": 37,
+      "bf16": " The",
+      "float32": " The"
+    }
+  ]
+}

@@ -140,6 +140,7 @@ PYTHONPATH=. .venv/bin/python scripts/verify_real_weights.py
 | Chained blocks vs one whole graph, on a tiny model | Identical greedy output |
 | All 64 real layers vs Hugging Face, in float32 ([results](docs/real_weights_check.json)) | Same top token at 38 of 38 positions, worst relative layer error 5.3e-6. Predicts `France is -> Paris`, `Japan is -> Tokyo` |
 | Full greedy run on real weights: per-core files, two simulated cores, 16 chained blocks, BF16 | `The capital of France is` -> ` Paris.\nThe capital of Germany is` |
+| BF16 vs float32 on real weights, on the CPU simulation ([results](docs/bf16_check.json)) | Same top token at 38 of 38 positions |
 | Real layers 0 and 3 as two simulated cores vs one core | Absolute error about 1e-6 to 2e-6 |
 | Real checkpoint header vs the full model | Every tensor maps, for both cores and all 16 blocks |
 | Traced graph through XLA on CPU vs PyTorch, on a tiny model | float32 error under 1e-4 relative, at every token |
