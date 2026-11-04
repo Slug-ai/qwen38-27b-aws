@@ -1,5 +1,7 @@
 # Throughput log
 
+![Throughput by change](throughput.png)
+
 **The goal is maximum throughput, not latency.** Time per token doesn't matter, so any trade that raises total tokens per second is worth making.
 
 One change per row, each measured on the real chip with `scripts/batch_generate.py`.

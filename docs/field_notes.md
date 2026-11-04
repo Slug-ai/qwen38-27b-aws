@@ -110,3 +110,4 @@ Goal: tokens per second across all sequences. Latency per token doesn't matter.
 - Host time swings came from a cold disk cache. Loading the weights pushes the checkpoint's lm_head and embedding rows out of the cache, and each step then waits on the disk for scattered rows. `TensorSource.touch` reads them once after loading, in about 32 s, which holds host time at 0.026 s per step.
 - Chip time doesn't always rise with batch, because the compiler's plan depends on the batch size. Batch 62 takes 0.287 s per step and batch 60 takes 0.304 s, in two runs each.
 - Chip time per step at nearby batch sizes: 0.304 s at 60, 0.287 s at 62, 0.262 s at 63. The compiler's plan varies, so it's worth trying neighbouring sizes.
+- Compiler settings at batch 63, on one 16-layer block: 0.065 s with `--optimize-layout`, the same with `-O2` added, and 0.116 s without layout optimization. Keep layout optimization, because it's worth almost 2x now.
