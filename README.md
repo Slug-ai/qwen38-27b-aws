@@ -48,6 +48,17 @@ bash scripts/run_guarded.sh python scripts/compile.py --config tests/fixtures/co
 
 `run_guarded.sh` is for shared machines: it runs at the lowest priority and stops the job before memory runs out.
 
+`--optimize-layout` turns on NxD's weight layout optimization, which rearranges weights once at load instead of every run. Use a different `--output` to keep both, such as `artifacts/block4_wlo`. It adds a load-time step that can only run on a chip, so try the plain block first. Compiler estimates per block, per core, before any chip has run:
+
+| | Plain | `--optimize-layout` |
+|---|---|---|
+| Memory traffic | 1.83 GB | 0.97 GB |
+| Instructions executed | 929k | 837k |
+| Internal transfers | 11.9 GB | 10.5 GB |
+| Weight copies per run | 25 | 0 |
+
+`scripts/compile_report.py` prints these from any compile. They are useful for comparing designs, and they aren't speed measurements.
+
 Then check the graph, which should end with `graph check passed`:
 
 ```bash
@@ -104,6 +115,38 @@ python scripts/generate.py --model-dir model --compiled artifacts/block4 --weigh
 
 Each step's time goes to stderr, and the script prints decode tokens per second at the end.
 
+## On a chip for the first time
+
+Don't start with `generate.py`. `scripts/chip_check.py` compares the chip with CPU results saved in `tests/golden`, one level at a time, and stops at the first failure with a hint about the likely cause.
+
+Compile the small graphs on the same machine as the block, then copy `artifacts/` to the instance:
+
+```bash
+python scripts/compile_levels.py --config tests/fixtures/config.json --output artifacts/levels
+```
+
+On the instance:
+
+```bash
+python scripts/chip_check.py --model-dir model --weights weights --compiled artifacts/block4 --output chip_report.json
+```
+
+| Level | What it adds | If it fails, suspect |
+|---|---|---|
+| `decode` | FP4 decode alone, which must be exact | floor, clamp or the uint8 cast |
+| `matrix` | One real matrix on one core | Weight loading or BF16 matmul |
+| `layer` | One gated delta layer, two cores, several tokens | The all-reduce, or state if only later tokens fail |
+| `block` | The compiled 4-layer block, adding full attention | Attention or the KV cache |
+| `model` | All 16 blocks, top tokens on a test passage | Block chaining or later blocks' weights |
+| `greedy` | Real generation | Read the text first, since one near-tie changes every later token |
+| `speed` | Real per-token time, split between chip and host | No pass or fail |
+
+The chip won't match the CPU exactly, because it approximates sigmoid and exp with lookup tables and rounds differently. Token-level checks allow it 3 times the CPU's own BF16 error, and at least 2%. A top token may only change where the CPU's top two logits were within 0.25. Those limits were chosen before any chip has run, so treat a narrow failure as something to look at, not a verdict.
+
+Run the plain block first, since it has fewer moving parts, then rerun with `--compiled artifacts/block4_wlo` to compare speed. Optimize only from these real numbers.
+
+`scripts/make_golden.py` regenerates the saved results, and `--backend cpu` runs the check without a chip, which tests the script and not the hardware.
+
 ## Tests
 
 On any machine, with no Neuron SDK:
@@ -144,7 +187,9 @@ PYTHONPATH=. .venv/bin/python scripts/verify_real_weights.py
 | Real layers 0 and 3 as two simulated cores vs one core | Absolute error about 1e-6 to 2e-6 |
 | Real checkpoint header vs the full model | Every tensor maps, for both cores and all 16 blocks |
 | Traced graph through XLA on CPU vs PyTorch, on a tiny model | float32 error under 1e-4 relative, at every token |
-| Compile for `--target inf2` on two cores, real layer sizes | 4 layers and 8 layers both compile |
+| Compile for `--target inf2` on two cores, real layer sizes | 4 and 8 layers compile, plain. The 4-layer block also compiles with `--optimize-layout` |
+| BF16 vs float32 hidden states on real weights, one layer and one block | Differ by under 1% |
+| Chip check script, fed deliberately broken results | Catches wrong decode, wrong math, NaN, confident token flips and state lost between tokens |
 | Compiled graph structure | All caches persist as device state, all collectives present, every FP4 matrix decoded, no custom calls |
 
 **Not checked, because these need a chip:** whether the compiled graph computes the right values, whether 16 loaded copies of the block run together, weight loading and host RAM use on an instance, throughput, and the install steps above.

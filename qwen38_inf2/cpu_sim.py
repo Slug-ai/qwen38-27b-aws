@@ -10,7 +10,6 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
 import torch
-from safetensors.torch import load_file
 
 from . import checkpoint
 from .config import TextConfig
@@ -44,18 +43,21 @@ class ThreadedAllReduce:
 class SimulatedCoresStep:
     """Same call signature as `neuron.NeuronStep`, with one thread per NeuronCore."""
 
-    def __init__(self, weights_dir, cfg: TextConfig, build_info: dict, dtype: torch.dtype = torch.bfloat16):
+    def __init__(
+        self, weights_dir, cfg: TextConfig, build_info: dict, dtype: torch.dtype = torch.bfloat16, num_blocks: int | None = None
+    ):
         block_layers, tp_degree = build_info["layers"], build_info["tp_degree"]
+        num_blocks = num_blocks or cfg.num_hidden_layers // block_layers
         block_cfg = replace(cfg, layer_types=cfg.layer_types[:block_layers])
         self.reducer = ThreadedAllReduce(tp_degree)
         self.ranks = []
         for rank in range(tp_degree):
             blocks = []
-            for block in range(cfg.num_hidden_layers // block_layers):
+            for block in range(num_blocks):
                 model = Qwen38Step(
                     block_cfg, build_info["max_seq_len"], tp_degree, dtype, self.reducer.bind(rank)
                 ).eval()
-                weights = load_file(checkpoint.shard_path(weights_dir, block, rank))
+                weights = checkpoint.load_rank_block(weights_dir, block, rank, block_layers)
                 # Packed FP4 and its scales stay as stored. The rest takes the model's dtype.
                 weights = {
                     name: t if name.endswith(("weight_packed", "weight_scale")) else t.to(dtype)

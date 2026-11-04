@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 
 from . import fp4
 from .config import FULL, LINEAR, TextConfig
@@ -251,6 +251,14 @@ def write_rank_weights(source, cfg: TextConfig, weights_dir: str | Path, block_l
         for rank in range(tp_degree):
             weights = block_weights(source, cfg, block, block_layers, rank, tp_degree)
             save_file({k: v.contiguous() for k, v in weights.items()}, shard_path(weights_dir, block, rank))
+
+
+def load_rank_block(weights_dir: str | Path, block: int, rank: int, layers: int | None = None) -> dict[str, torch.Tensor]:
+    """One block's weights for one core, optionally keeping only its first `layers` layers."""
+    weights = load_file(shard_path(weights_dir, block, rank))
+    if layers is None:
+        return weights
+    return {name: tensor for name, tensor in weights.items() if int(name.split(".")[1]) < layers}
 
 
 def read_build_info(model_dir: str | Path) -> dict:

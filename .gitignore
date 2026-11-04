@@ -10,3 +10,4 @@ weights/
 .neuron-env/
 log-neuron-cc.txt
 model/
+!tests/golden/*.safetensors
