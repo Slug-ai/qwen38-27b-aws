@@ -86,3 +86,5 @@ Goal: tokens per second across all sequences. Latency per token doesn't matter.
 - `.view(nl.float8_e5m2)` reads a uint8 tile as FP8 in a kernel. Use `neuronxcc.nki`, not the newer `nki` import, to match the SDK's own kernels.
 - Instructions per block fell from about 545k to 58k, and program memory across all blocks from 1.2 GB to 0.1 GB.
 - A sequence's text can differ slightly between builds, because rounding differs and greedy decoding follows near ties. The saved greedy row still matches.
+- Real chip memory, from the table a failed load prints: a core fills at 15.94 GB. The scratchpad is shared across all loaded blocks (512 MB at batch 24), which is why the compiler's total runs high. Each loaded block also costs about 57 MB, mostly collective rings (39 MB) and code (9 MB), so about 0.9 GB across 16 blocks. Batch 24 at max length 2048 fails on the last blocks, and batch 32 at 512 fits.
+- With the FP8 kernel, chip time barely grows with batch: 0.21 s per step at batch 16 and 0.24 s at batch 32.
