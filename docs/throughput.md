@@ -17,12 +17,13 @@ One change per row, each measured on the real chip with `scripts/batch_generate.
 | 5 | Max sequence length 2048 cut to 512, so more rows fit | 32 | 0.24 | 0.80 | 17.03 | 28.49 | yes |
 | 6 | `lm_head` on the chip, using 1.27 GB per core, so fewer rows | 20 | 0.18 | 0.04 | 51.48 | 85.74 | yes, 38 of 38 |
 | 7 | Gated delta state in BF16, which halves the largest cost per row | 32 | 0.23 | 0.03 | 67.00 | 112.04 | yes, 38 of 38, see below |
+| 8 | 16-layer blocks, so 4 loaded graphs instead of 16, which frees memory for rows | 40 | 0.24 | 0.05 | 74.29 | 124.58 | yes, 38 of 38 |
 
 Rows 1 to 4 allow 2048 tokens of prompt plus output, and from row 5 it's 512. Batch 24 at 2048 ran out of chip memory.
 
 Chip s/step counts the 16 blocks, and the chip part of `lm_head` counts as host time. In row 6, with every row generating, the run reached 81.2 tok/s over 13 steps.
 
-Row 7 changes numbers, not just speed. Compared with row 6's build on the same prompts, 36 of 40 sequences are identical, and 1219 of 1280 tokens come before a sequence's first difference. Greedy text can split at a near tie, and the two runs also differ in batch size. Whether output quality changes hasn't been measured. With every row generating, row 7 reached 110.0 tok/s over 14 steps.
+Row 7 changes numbers, not just speed. Compared with row 6's build on the same prompts, 36 of 40 sequences are identical, and 1219 of 1280 tokens come before a sequence's first difference. Row 8, at batch 40, gives exactly the same comparison, so the differences come from the BF16 state rather than batch size. Greedy text can split at a near tie. Whether output quality changes hasn't been measured. With every row generating, row 7 reached 110.0 tok/s over 14 steps.
 
 Raw results are in [throughput/](throughput/). `git log docs/throughput.md` gives the commit for each row.
 

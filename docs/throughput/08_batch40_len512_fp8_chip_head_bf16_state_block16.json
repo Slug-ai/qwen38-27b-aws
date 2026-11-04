@@ -1,0 +1,40 @@
+{
+ "batch_size": 40,
+ "max_seq_len": 512,
+ "sequences": 80,
+ "distinct_prompts": 80,
+ "prompt_tokens": 1733,
+ "generated_tokens": 2560,
+ "steps": 116,
+ "chip_seconds_per_step": 0.24221245124127908,
+ "host_seconds_per_step": 0.054856428819064225,
+ "wall_seconds": 34.459990086999824,
+ "generated_tokens_per_second": 74.28905213080054,
+ "all_tokens_per_second": 124.57925812403388,
+ "steps_with_every_row_generating": 13,
+ "tokens_per_second_when_every_row_generated": 115.7498746187928,
+ "golden_row_matches": true,
+ "golden_row_tokens": [
+  11751,
+  13,
+  198,
+  760,
+  6511,
+  314,
+  9564,
+  369
+ ],
+ "saved_test_passage": {
+  "positions": 38,
+  "wrong": 0,
+  "near_tie_flips": 0,
+  "positions_where_rows_disagree": 0
+ },
+ "load_seconds": 190.88075804300024,
+ "compared_with_reference": {
+  "sequences": 40,
+  "identical_sequences": 36,
+  "tokens_before_first_difference": 1219,
+  "tokens_compared": 1280
+ }
+}
