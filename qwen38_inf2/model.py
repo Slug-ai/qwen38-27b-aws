@@ -1,0 +1,267 @@
+"""Single-token decode graph for the Qwen3.8 text model.
+
+Mirrors `transformers.models.qwen3_5.modeling_qwen3_5` with these changes for NeuronCore-v2:
+
+* Static shapes. One graph runs one token (batch 1, sequence 1). A prompt is fed token by token, so
+  there is no prefill graph and no chunked gated-delta solve (`torch.linalg.solve_triangular` and
+  its unrolled form do not suit this target). Token-by-token is the recurrent form of the same rule.
+* Weights stay MXFP4 and are decoded in the graph by `FP4Linear`.
+* Caches are registered buffers that are reassigned on each step. The Neuron tracer turns that into
+  on-device state. It does not detect `Tensor.copy_`, so do not use that here.
+* Tensor parallelism. Each rank owns a contiguous slice of heads, and each head's computation is
+  independent. Only the output projections need a collective (`all_reduce`).
+* Embeddings and lm_head live on the host (see `generate.py`), so the graph maps hidden to hidden.
+"""
+
+import math
+from collections.abc import Callable
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+from . import fp4
+from .config import FULL, LINEAR, TextConfig
+
+# Added to attention scores of unfilled cache slots. Scores are bounded by about sqrt(head_dim), so
+# this underflows to exactly zero in the float32 softmax without needing an infinity on the device.
+MASKED_SCORE = -1e4
+
+
+def identity_all_reduce(x: torch.Tensor) -> torch.Tensor:
+    return x
+
+
+def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    h = x.float()
+    h = h * torch.rsqrt((h * h).mean(-1, keepdim=True) + eps)
+    return (h * (1.0 + weight.float())).type_as(x)
+
+
+def l2_norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    return x * torch.rsqrt((x * x).sum(dim=-1, keepdim=True) + eps)
+
+
+def repeat_interleave(x: torch.Tensor, repeats: int, dim: int) -> torch.Tensor:
+    """`Tensor.repeat_interleave` expressed as expand and reshape, which avoids a gather."""
+    expanded = x.unsqueeze(dim + 1).expand(*x.shape[: dim + 1], repeats, *x.shape[dim + 1 :])
+    return expanded.reshape(*x.shape[:dim], x.shape[dim] * repeats, *x.shape[dim + 1 :])
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    half = x.shape[-1] // 2
+    return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+
+
+def apply_rotary(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
+    rot = cos.shape[-1]
+    q_rot, q_pass = q[..., :rot], q[..., rot:]
+    k_rot, k_pass = k[..., :rot], k[..., rot:]
+    q_out = q_rot * cos + rotate_half(q_rot) * sin
+    k_out = k_rot * cos + rotate_half(k_rot) * sin
+    return torch.cat((q_out, q_pass), dim=-1), torch.cat((k_out, k_pass), dim=-1)
+
+
+def _frozen(*shape: int, dtype: torch.dtype) -> nn.Parameter:
+    return nn.Parameter(torch.zeros(*shape, dtype=dtype), requires_grad=False)
+
+
+class FP4Linear(nn.Module):
+    """Bias-free linear layer holding MXFP4 weights, expanded to BF16 on every forward."""
+
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__()
+        self.weight_packed = _frozen(out_features, in_features // 2, dtype=torch.uint8)
+        self.weight_scale = _frozen(out_features, in_features // fp4.GROUP_SIZE, dtype=torch.bfloat16)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(x, fp4.decode_in_graph(self.weight_packed, self.weight_scale).to(x.dtype))
+
+
+class MLP(nn.Module):
+    def __init__(self, cfg: TextConfig, tp_degree: int, all_reduce: Callable):
+        super().__init__()
+        intermediate = cfg.intermediate_size // tp_degree
+        self.gate_proj = FP4Linear(cfg.hidden_size, intermediate)
+        self.up_proj = FP4Linear(cfg.hidden_size, intermediate)
+        self.down_proj = FP4Linear(intermediate, cfg.hidden_size)
+        self.all_reduce = all_reduce
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.all_reduce(self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x)))
+
+
+class GatedDeltaNetStep(nn.Module):
+    """One token of the gated delta rule (`torch_recurrent_gated_delta_rule` with a causal conv)."""
+
+    def __init__(self, cfg: TextConfig, tp_degree: int, dtype: torch.dtype, all_reduce: Callable):
+        super().__init__()
+        self.cfg = cfg
+        self.all_reduce = all_reduce
+        self.key_dim = cfg.linear_key_dim // tp_degree
+        self.value_dim = cfg.linear_value_dim // tp_degree
+        self.num_v_heads = cfg.linear_num_value_heads // tp_degree
+        self.num_k_heads = cfg.linear_num_key_heads // tp_degree
+        conv_dim = 2 * self.key_dim + self.value_dim
+
+        self.in_proj_qkv = FP4Linear(cfg.hidden_size, conv_dim)
+        self.in_proj_z = FP4Linear(cfg.hidden_size, self.value_dim)
+        self.out_proj = FP4Linear(self.value_dim, cfg.hidden_size)
+        # These stay float in the checkpoint: the quantization recipe excludes them.
+        self.in_proj_b = _frozen(self.num_v_heads, cfg.hidden_size, dtype=dtype)
+        self.in_proj_a = _frozen(self.num_v_heads, cfg.hidden_size, dtype=dtype)
+        self.conv_weight = _frozen(conv_dim, cfg.linear_conv_kernel_dim, dtype=dtype)
+        self.A_log = _frozen(self.num_v_heads, dtype=dtype)
+        self.dt_bias = _frozen(self.num_v_heads, dtype=dtype)
+        self.norm_weight = _frozen(cfg.linear_value_head_dim, dtype=dtype)
+
+        self.register_buffer("conv_state", torch.zeros(1, conv_dim, cfg.linear_conv_kernel_dim - 1, dtype=dtype))
+        # The reference keeps this in float32 regardless of model dtype.
+        self.register_buffer(
+            "recurrent_state",
+            torch.zeros(1, self.num_v_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim, dtype=torch.float32),
+        )
+
+    def forward(self, x: torch.Tensor, keep_state: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
+        k_head, v_head = self.cfg.linear_key_head_dim, self.cfg.linear_value_head_dim
+
+        # A depthwise causal conv over one new sample is a weighted sum of a sliding window, so no
+        # conv op is needed. Newest sample is last, matching F.conv1d's kernel order.
+        qkv = self.in_proj_qkv(x).transpose(1, 2)
+        window = torch.cat((self.conv_state * keep_state.to(dtype), qkv), dim=-1)
+        self.conv_state = window[:, :, 1:]
+        mixed = F.silu((window * self.conv_weight).sum(dim=-1))
+
+        query = mixed[:, : self.key_dim].reshape(1, self.num_k_heads, k_head)
+        key = mixed[:, self.key_dim : 2 * self.key_dim].reshape(1, self.num_k_heads, k_head)
+        value = mixed[:, 2 * self.key_dim :].reshape(1, self.num_v_heads, v_head)
+        query = repeat_interleave(query, self.cfg.linear_key_repeat, dim=1)
+        key = repeat_interleave(key, self.cfg.linear_key_repeat, dim=1)
+
+        z = self.in_proj_z(x).reshape(1, self.num_v_heads, v_head)
+        beta = F.linear(x, self.in_proj_b).sigmoid().reshape(1, self.num_v_heads, 1).float()
+        a = F.linear(x, self.in_proj_a).reshape(1, self.num_v_heads).float()
+        log_decay = -self.A_log.float().exp() * F.softplus(a + self.dt_bias.float())
+
+        query = l2_norm(query.float()) / math.sqrt(k_head)
+        key = l2_norm(key.float())
+        value = value.float()
+
+        state = self.recurrent_state * keep_state * log_decay.exp()[..., None, None]
+        delta = (value - (state * key.unsqueeze(-1)).sum(dim=-2)) * beta
+        state = state + key.unsqueeze(-1) * delta.unsqueeze(-2)
+        self.recurrent_state = state
+        out = (state * query.unsqueeze(-1)).sum(dim=-2).to(dtype)
+
+        # Gated RMS norm, per value head.
+        h = out.float()
+        h = h * torch.rsqrt((h * h).mean(-1, keepdim=True) + self.cfg.rms_norm_eps)
+        h = self.norm_weight * h.to(dtype)
+        h = (h * F.silu(z.float())).to(dtype)
+        return self.all_reduce(self.out_proj(h.reshape(1, 1, self.value_dim)))
+
+
+class FullAttentionStep(nn.Module):
+    def __init__(self, cfg: TextConfig, tp_degree: int, max_seq_len: int, dtype: torch.dtype, all_reduce: Callable):
+        super().__init__()
+        self.cfg = cfg
+        self.all_reduce = all_reduce
+        self.num_heads = cfg.num_attention_heads // tp_degree
+        self.num_kv_heads = cfg.num_key_value_heads // tp_degree
+        head = cfg.head_dim
+
+        self.q_proj = FP4Linear(cfg.hidden_size, self.num_heads * head * 2)  # query plus output gate
+        self.k_proj = FP4Linear(cfg.hidden_size, self.num_kv_heads * head)
+        self.v_proj = FP4Linear(cfg.hidden_size, self.num_kv_heads * head)
+        self.o_proj = FP4Linear(self.num_heads * head, cfg.hidden_size)
+        self.q_norm_weight = _frozen(head, dtype=dtype)
+        self.k_norm_weight = _frozen(head, dtype=dtype)
+
+        self.register_buffer("k_cache", torch.zeros(1, self.num_kv_heads, max_seq_len, head, dtype=dtype))
+        self.register_buffer("v_cache", torch.zeros(1, self.num_kv_heads, max_seq_len, head, dtype=dtype))
+
+    def forward(self, x, cos, sin, write_mask, attn_mask) -> torch.Tensor:
+        cfg = self.cfg
+        head = cfg.head_dim
+
+        q_and_gate = self.q_proj(x).reshape(1, 1, self.num_heads, head * 2)
+        query, gate = q_and_gate[..., :head], q_and_gate[..., head:]
+        query = rms_norm(query, self.q_norm_weight, cfg.rms_norm_eps).transpose(1, 2)
+        key = self.k_proj(x).reshape(1, 1, self.num_kv_heads, head)
+        key = rms_norm(key, self.k_norm_weight, cfg.rms_norm_eps).transpose(1, 2)
+        value = self.v_proj(x).reshape(1, 1, self.num_kv_heads, head).transpose(1, 2)
+        query, key = apply_rotary(query, key, cos, sin)
+
+        write = write_mask > 0.5
+        self.k_cache = torch.where(write, key, self.k_cache)
+        self.v_cache = torch.where(write, value, self.v_cache)
+
+        keys = repeat_interleave(self.k_cache, cfg.num_key_value_groups, dim=1)
+        values = repeat_interleave(self.v_cache, cfg.num_key_value_groups, dim=1)
+
+        scores = torch.matmul(query, keys.transpose(2, 3)) * head**-0.5
+        weights = torch.softmax(scores.float() + attn_mask, dim=-1).to(query.dtype)
+        out = torch.matmul(weights, values).transpose(1, 2).reshape(1, 1, self.num_heads * head)
+        return self.all_reduce(self.o_proj(out * torch.sigmoid(gate.reshape(1, 1, self.num_heads * head))))
+
+
+class DecoderLayer(nn.Module):
+    def __init__(self, cfg, layer_type, tp_degree, max_seq_len, dtype, all_reduce):
+        super().__init__()
+        self.cfg = cfg
+        self.layer_type = layer_type
+        if layer_type == LINEAR:
+            self.linear_attn = GatedDeltaNetStep(cfg, tp_degree, dtype, all_reduce)
+        elif layer_type == FULL:
+            self.self_attn = FullAttentionStep(cfg, tp_degree, max_seq_len, dtype, all_reduce)
+        else:
+            raise ValueError(f"Unknown layer type {layer_type}")
+        self.mlp = MLP(cfg, tp_degree, all_reduce)
+        self.input_layernorm_weight = _frozen(cfg.hidden_size, dtype=dtype)
+        self.post_attention_layernorm_weight = _frozen(cfg.hidden_size, dtype=dtype)
+
+    def forward(self, x, cos, sin, write_mask, attn_mask, keep_state):
+        eps = self.cfg.rms_norm_eps
+        h = rms_norm(x, self.input_layernorm_weight, eps)
+        if self.layer_type == LINEAR:
+            h = self.linear_attn(h, keep_state)
+        else:
+            h = self.self_attn(h, cos, sin, write_mask, attn_mask)
+        x = x + h
+        return x + self.mlp(rms_norm(x, self.post_attention_layernorm_weight, eps))
+
+
+class Qwen38Step(nn.Module):
+    """The compiled graph: one token's embedding in, one token's final hidden state out.
+
+    Inputs (all built by `generate.step_inputs`):
+        inputs_embeds: ``[1, 1, hidden]``.
+        cos, sin: rotary terms for this position, ``[1, 1, rotary_dim]``.
+        write_mask: float32 ``[1, 1, max_seq_len, 1]``, 1 at this position.
+        attn_mask: float32 ``[1, 1, 1, max_seq_len]``, 0 where filled and `MASKED_SCORE` elsewhere.
+        keep_state: float32 ``[1]``, 0 on a sequence's first token to clear recurrent state.
+    """
+
+    def __init__(
+        self,
+        cfg: TextConfig,
+        max_seq_len: int,
+        tp_degree: int = 1,
+        dtype: torch.dtype = torch.bfloat16,
+        all_reduce: Callable = identity_all_reduce,
+    ):
+        super().__init__()
+        cfg.validate_tp(tp_degree)
+        self.cfg = cfg
+        self.layers = nn.ModuleList(
+            DecoderLayer(cfg, layer_type, tp_degree, max_seq_len, dtype, all_reduce) for layer_type in cfg.layer_types
+        )
+        self.norm_weight = _frozen(cfg.hidden_size, dtype=dtype)
+
+    def forward(self, inputs_embeds, cos, sin, write_mask, attn_mask, keep_state):
+        x = inputs_embeds
+        for layer in self.layers:
+            x = layer(x, cos, sin, write_mask, attn_mask, keep_state)
+        return rms_norm(x, self.norm_weight, self.cfg.rms_norm_eps)

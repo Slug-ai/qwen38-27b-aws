@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+# Build outputs and weights never belong in git.
+artifacts/
+weights/
+*.neff
+*.safetensors
