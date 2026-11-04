@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Cut the checkpoint into one weights file per block per NeuronCore. Needs no Neuron SDK or hardware.
 
-Vision and MTP tensors are never read. In total this is about 6.9 GB per core.
+Vision and MTP tensors are never read. In total this is about 6.9 GB per core for FP4 and 12.2 GB for FP8.
 """
 
 import argparse
+from dataclasses import replace
 
 from qwen38_inf2.checkpoint import TensorSource, read_build_info, write_rank_weights
 from qwen38_inf2.config import TextConfig
@@ -19,6 +20,7 @@ def main():
 
     cfg = TextConfig.from_file(f"{args.model_dir}/config.json")
     info = read_build_info(args.compiled)
+    cfg = replace(cfg, weight_format=info.get("weight_format", "fp4"))
     write_rank_weights(TensorSource(f"{args.model_dir}/model.safetensors"), cfg, args.output, info["layers"], info["tp_degree"])
     print(f"wrote weights to {args.output}")
 

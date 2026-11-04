@@ -147,12 +147,12 @@ def _qkv_rows(t: torch.Tensor, cfg: TextConfig, rank: int, tp_degree: int) -> to
     )
 
 
-def _fp4_weights(source, hf_name: str, name: str, cut) -> dict[str, torch.Tensor]:
+def _fp4_weights(source, hf_name: str, name: str, cut, weight_format: str) -> dict[str, torch.Tensor]:
     """Cut one FP4 matrix. Scale bytes become BF16 here so the device never computes 2**e."""
-    return {
-        f"{name}.weight_packed": fp4.to_sign_free(cut(source.get(f"{hf_name}.weight_packed"))),
-        f"{name}.weight_scale": fp4.scale_to_float(cut(source.get(f"{hf_name}.weight_scale"))),
-    }
+    packed, scale = cut(source.get(f"{hf_name}.weight_packed")), cut(source.get(f"{hf_name}.weight_scale"))
+    if weight_format == "fp8":
+        return {f"{name}.weight_fp8": fp4.to_fp8(packed, scale).transpose(0, 1).contiguous()}
+    return {f"{name}.weight_packed": fp4.to_sign_free(packed), f"{name}.weight_scale": fp4.scale_to_float(scale)}
 
 
 def layer_weights(
@@ -164,19 +164,20 @@ def layer_weights(
     by_rows = lambda t: _rows(t, rank, tp_degree)  # noqa: E731
     by_cols = lambda t: _cols(t, rank, tp_degree)  # noqa: E731
     by_qkv = lambda t: _qkv_rows(t, cfg, rank, tp_degree)  # noqa: E731
+    matrix = lambda hf_name, name, cut: _fp4_weights(source, hf_name, name, cut, cfg.weight_format)  # noqa: E731
     out: dict[str, torch.Tensor] = {}
 
     out[f"{ours}.input_layernorm_weight"] = source.get(f"{hf}.input_layernorm.weight").to(dtype)
     out[f"{ours}.post_attention_layernorm_weight"] = source.get(f"{hf}.post_attention_layernorm.weight").to(dtype)
-    out |= _fp4_weights(source, f"{hf}.mlp.gate_proj", f"{ours}.mlp.gate_proj", by_rows)
-    out |= _fp4_weights(source, f"{hf}.mlp.up_proj", f"{ours}.mlp.up_proj", by_rows)
-    out |= _fp4_weights(source, f"{hf}.mlp.down_proj", f"{ours}.mlp.down_proj", by_cols)
+    out |= matrix(f"{hf}.mlp.gate_proj", f"{ours}.mlp.gate_proj", by_rows)
+    out |= matrix(f"{hf}.mlp.up_proj", f"{ours}.mlp.up_proj", by_rows)
+    out |= matrix(f"{hf}.mlp.down_proj", f"{ours}.mlp.down_proj", by_cols)
 
     if cfg.layer_types[index] == LINEAR:
         la, hl = f"{ours}.linear_attn", f"{hf}.linear_attn"
-        out |= _fp4_weights(source, f"{hl}.in_proj_qkv", f"{la}.in_proj_qkv", by_qkv)
-        out |= _fp4_weights(source, f"{hl}.in_proj_z", f"{la}.in_proj_z", by_rows)
-        out |= _fp4_weights(source, f"{hl}.out_proj", f"{la}.out_proj", by_cols)
+        out |= matrix(f"{hl}.in_proj_qkv", f"{la}.in_proj_qkv", by_qkv)
+        out |= matrix(f"{hl}.in_proj_z", f"{la}.in_proj_z", by_rows)
+        out |= matrix(f"{hl}.out_proj", f"{la}.out_proj", by_cols)
         out[f"{la}.in_proj_b"] = by_rows(source.get(f"{hl}.in_proj_b.weight")).to(dtype)
         out[f"{la}.in_proj_a"] = by_rows(source.get(f"{hl}.in_proj_a.weight")).to(dtype)
         out[f"{la}.conv_weight"] = by_qkv(source.get(f"{hl}.conv1d.weight").squeeze(1)).to(dtype)
@@ -185,10 +186,10 @@ def layer_weights(
         out[f"{la}.norm_weight"] = source.get(f"{hl}.norm.weight").to(dtype)
     elif cfg.layer_types[index] == FULL:
         sa, hs = f"{ours}.self_attn", f"{hf}.self_attn"
-        out |= _fp4_weights(source, f"{hs}.q_proj", f"{sa}.q_proj", by_rows)
-        out |= _fp4_weights(source, f"{hs}.k_proj", f"{sa}.k_proj", by_rows)
-        out |= _fp4_weights(source, f"{hs}.v_proj", f"{sa}.v_proj", by_rows)
-        out |= _fp4_weights(source, f"{hs}.o_proj", f"{sa}.o_proj", by_cols)
+        out |= matrix(f"{hs}.q_proj", f"{sa}.q_proj", by_rows)
+        out |= matrix(f"{hs}.k_proj", f"{sa}.k_proj", by_rows)
+        out |= matrix(f"{hs}.v_proj", f"{sa}.v_proj", by_rows)
+        out |= matrix(f"{hs}.o_proj", f"{sa}.o_proj", by_cols)
         out[f"{sa}.q_norm_weight"] = source.get(f"{hs}.q_norm.weight").to(dtype)
         out[f"{sa}.k_norm_weight"] = source.get(f"{hs}.k_norm.weight").to(dtype)
     return out

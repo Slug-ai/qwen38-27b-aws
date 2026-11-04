@@ -83,7 +83,7 @@ def build(
         ),
         example_inputs(cfg, max_seq_len, batch_size),
         output_dir,
-        {"max_seq_len": max_seq_len, "layers": cfg.num_hidden_layers, "batch_size": batch_size},
+        {"max_seq_len": max_seq_len, "layers": cfg.num_hidden_layers, "batch_size": batch_size, "weight_format": cfg.weight_format},
         tp_degree,
         target,
         extra_compiler_args,

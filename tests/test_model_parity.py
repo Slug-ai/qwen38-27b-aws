@@ -241,6 +241,18 @@ def test_batched_graph_matches_two_simulated_cores(tmp_path):
     assert got == want
 
 
+def test_fp8_weights_match_the_reference():
+    cfg = replace(tiny_config(), weight_format="fp8")
+    reference, tensors = build_reference(cfg)
+    model = load_model(tensors, cfg, torch.float32)
+    head = host_head(tensors)
+    with torch.no_grad():
+        want = reference(input_ids=torch.tensor([PROMPT]), use_cache=False).logits[0].float()
+        got = torch.stack([head.logits(h) for h in run_tokens(model, cfg, head, PROMPT, torch.float32)])
+    assert (got - want).abs().max() < 1e-4
+    assert torch.equal(got.argmax(-1), want.argmax(-1))
+
+
 def test_all_text_tensors_are_consumed():
     cfg = tiny_config()
     _, tensors = build_reference(cfg)

@@ -31,31 +31,19 @@ def test_sign_free_decode_is_exact_for_every_byte_and_exponent():
         assert torch.equal(odd, want[:, 1::2]), f"odd columns differ at exponent {exponent}"
 
 
-def fp8_to_float(byte: torch.Tensor) -> torch.Tensor:
-    """Independent reading of FP8 e5m2 bytes, by their bit fields."""
-    b = byte.long()
-    exponent, mantissa = (b >> 2) & 31, b & 3
-    magnitude = torch.where(
-        exponent == 0,
-        mantissa.double() * 2.0**-16,
-        (1.0 + mantissa.double() / 4.0) * torch.pow(2.0, exponent.double() - 15.0),
-    )
-    return torch.where(b >= 128, -magnitude, magnitude)
-
-
 def test_fp8_is_exact_at_the_checkpoints_common_scales():
     packed = all_bytes()
     for exponent in range(112, 128):  # 99.9997% of the real checkpoint's scale groups
         scale_bytes = torch.full((8, 2), exponent, dtype=torch.uint8)
-        got = fp8_to_float(fp4.to_fp8(packed, scale_bytes))
-        assert torch.equal(got, fp4.decode_host(packed, scale_bytes, torch.float64)), f"differs at exponent {exponent}"
+        got = fp4.fp8_to_float(fp4.to_fp8(packed, scale_bytes))
+        assert torch.equal(got, fp4.decode_host(packed, scale_bytes, torch.float32)), f"differs at exponent {exponent}"
 
 
 def test_fp8_rounds_the_rarest_scales_by_under_one_step():
     packed = all_bytes()
     for exponent in range(106, 112):
         scale_bytes = torch.full((8, 2), exponent, dtype=torch.uint8)
-        error = (fp8_to_float(fp4.to_fp8(packed, scale_bytes)) - fp4.decode_host(packed, scale_bytes, torch.float64)).abs()
+        error = (fp4.fp8_to_float(fp4.to_fp8(packed, scale_bytes)) - fp4.decode_host(packed, scale_bytes, torch.float32)).abs()
         assert error.max() <= 2.0**-17, f"too far at exponent {exponent}"
 
 

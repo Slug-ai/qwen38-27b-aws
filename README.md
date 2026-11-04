@@ -2,7 +2,7 @@
 
 Runs the text part of [RedHatAI/Qwen3.8-27B-MXFP4](https://huggingface.co/RedHatAI/Qwen3.8-27B-MXFP4) on one AWS Inferentia2 chip (two NeuronCores) with FP4 weights and greedy decoding.
 
-**Status: runs end to end on a real `inf2.xlarge`.** Currently 5.78 generated tokens/s at batch 32, measured. See [the throughput log](docs/throughput.md) and [the field notes](docs/field_notes.md), which cover setup on the Amazon Linux Neuron AMI.
+**Status: runs end to end on a real `inf2.xlarge`.** Currently 10.43 generated tokens/s at batch 16, measured. See [the throughput log](docs/throughput.md) and [the field notes](docs/field_notes.md), which cover setup on the Amazon Linux Neuron AMI.
 
 **Goal: maximum throughput, not latency.** Every design choice is judged by total tokens per second across all sequences. Time per token doesn't matter, so large batches and slow steps are fine.
 

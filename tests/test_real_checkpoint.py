@@ -32,9 +32,11 @@ def test_real_config_parses(cfg):
     cfg.validate_tp(2)
 
 
+@pytest.mark.parametrize("weight_format", ["fp4", "fp8"])
 @pytest.mark.parametrize("tp_degree", [1, 2])
 @pytest.mark.parametrize("rank_of", ["first", "last"])
-def test_every_parameter_loads_with_the_right_shape(cfg, header, tp_degree, rank_of):
+def test_every_parameter_loads_with_the_right_shape(cfg, header, tp_degree, rank_of, weight_format):
+    cfg = replace(cfg, weight_format=weight_format)
     rank = 0 if rank_of == "first" else tp_degree - 1
     weights = checkpoint.rank_weights(checkpoint.ShapeSource(header), cfg, rank, tp_degree)
     with torch.device("meta"):

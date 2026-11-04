@@ -25,6 +25,9 @@ class TextConfig:
     rms_norm_eps: float
     rope_theta: float
     partial_rotary_factor: float
+    # How FP4 weights are held on the device: "fp4" stays packed and is decoded in the graph every step,
+    # "fp8" takes about 1.8 times the memory and is read straight by the Tensor Engine.
+    weight_format: str = "fp4"
 
     @property
     def num_hidden_layers(self) -> int:

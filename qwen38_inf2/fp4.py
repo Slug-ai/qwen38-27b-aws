@@ -121,18 +121,35 @@ def to_fp8(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     FP8 holds a value with 1 mantissa bit exactly. In the real checkpoint that covers all but 0.0003% of
     scale groups, and the rest hold weights under 1e-4 that round to the nearest step of 2**-16.
     """
+    rows, half_cols = packed.shape
+    groups = scale.shape[1]
+    if packed.is_meta:
+        return torch.empty(rows, half_cols * 2, dtype=torch.uint8, device="meta")
+    # The checkpoint's largest scale is 1. A larger one is out of range here and fails loudly.
     table = torch.tensor(
         [
-            [_fp8_e5m2_byte(sign * magnitude * 2.0 ** (byte - E8M0_BIAS)) for sign in (1, -1) for magnitude in E2M1_MAGNITUDES]
-            for byte in range(E8M0_BIAS + 1)  # The checkpoint's largest scale is 1. A larger one fails loudly below.
+            _fp8_e5m2_byte(sign * magnitude * 2.0 ** (byte - E8M0_BIAS))
+            for byte in range(E8M0_BIAS + 1)
+            for sign in (1, -1)
+            for magnitude in E2M1_MAGNITUDES
         ],
         dtype=torch.uint8,
     )
-    rows, half_cols = packed.shape
-    groups = scale.shape[1]
-    expanded = scale.long().unsqueeze(-1).expand(rows, groups, GROUP_SIZE).reshape(rows, groups * GROUP_SIZE)
-    nibbles = torch.stack((packed & 15, packed >> 4), dim=-1).reshape(rows, half_cols * 2).long()
-    return table[expanded, nibbles]
+    expanded = scale.int().unsqueeze(-1).expand(rows, groups, GROUP_SIZE).reshape(rows, groups * GROUP_SIZE)
+    nibbles = torch.stack((packed & 15, packed >> 4), dim=-1).reshape(rows, half_cols * 2).int()
+    return table[expanded * 16 + nibbles]
+
+
+def fp8_to_float(byte: torch.Tensor) -> torch.Tensor:
+    """Read FP8 e5m2 bytes as float32 by their bit fields. For the CPU path. The chip reads them directly."""
+    b = byte.int()
+    exponent, mantissa = (b >> 2) & 31, b & 3
+    magnitude = torch.where(
+        exponent == 0,
+        mantissa.float() * 2.0**-16,
+        (1.0 + mantissa.float() / 4.0) * torch.pow(2.0, exponent.float() - 15.0),
+    )
+    return torch.where(b >= 128, -magnitude, magnitude)
 
 
 def encode_host(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

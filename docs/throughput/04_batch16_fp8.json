@@ -1,0 +1,28 @@
+{
+ "batch_size": 16,
+ "max_seq_len": 2048,
+ "sequences": 32,
+ "distinct_prompts": 32,
+ "prompt_tokens": 673,
+ "generated_tokens": 1024,
+ "steps": 111,
+ "chip_seconds_per_step": 0.20589274930631568,
+ "host_seconds_per_step": 0.6782354099999924,
+ "wall_seconds": 98.1382256830002,
+ "generated_tokens_per_second": 10.434262417864158,
+ "all_tokens_per_second": 17.291936838979957,
+ "steps_with_every_row_generating": 16,
+ "tokens_per_second_when_every_row_generated": 14.827763336771357,
+ "golden_row_matches": true,
+ "golden_row_tokens": [
+  11751,
+  13,
+  198,
+  760,
+  6511,
+  314,
+  9564,
+  369
+ ],
+ "load_seconds": 203.3630413739993
+}

@@ -82,3 +82,7 @@ Goal: tokens per second across all sequences. Latency per token doesn't matter.
 - The compiler's memory total overstates what a run needs: batch 32 with the new decode is estimated at 17.0 GB per core, and all 16 blocks load and run.
 - `packed >> 4` on uint8 compiles to an integer divide, not a shift.
 - Testing tiers: `scripts/bench_decode.py` on one real matrix takes under a minute. `scripts/batch_generate.py --screen-blocks 1` times one real block at the real batch, and isn't a throughput result. The full `scripts/batch_generate.py` run gives the number that goes in [throughput.md](throughput.md).
+- FP8 weights: the Tensor Engine reads FP8 directly next to BF16 inputs, so a small kernel skips decoding altogether. On one real matrix: 72.9 G values/s against 7.89. Whole-model chip time per step: 0.21 s at batch 16, against 2.25 s at batch 32 with decode. Weights take 12.2 GB per core against 6.9 GB.
+- `.view(nl.float8_e5m2)` reads a uint8 tile as FP8 in a kernel. Use `neuronxcc.nki`, not the newer `nki` import, to match the SDK's own kernels.
+- Instructions per block fell from about 545k to 58k, and program memory across all blocks from 1.2 GB to 0.1 GB.
+- A sequence's text can differ slightly between builds, because rounding differs and greedy decoding follows near ties. The saved greedy row still matches.

@@ -34,7 +34,7 @@ def expected_counts(cfg: TextConfig) -> dict[str, int]:
     return {
         "states": 2 * linear + 2 * full,  # conv + recurrent, or k + v cache
         "all_reduce": 2 * cfg.num_hidden_layers,  # one for the mixer, one for the MLP
-        "fp4_matrices": 3 * linear + 4 * full + mlp_matrices,
+        "fp4_matrices": (3 * linear + 4 * full + mlp_matrices) if cfg.weight_format == "fp4" else 0,
     }
 
 
@@ -80,12 +80,13 @@ def inspect(workdir: Path, cfg: TextConfig) -> tuple[dict, list[str]]:
         problems.append(f"state tensors not written back each token: {sorted(state_keys ^ aliased)[:5]}")
     if not_cache:
         problems.append(f"non-cache tensors are linked as state: {not_cache[:5]}")
-    if weight_dtypes["UINT8"] != want["fp4_matrices"]:
+    if cfg.weight_format == "fp4" and weight_dtypes["UINT8"] != want["fp4_matrices"]:
         problems.append(f"expected {want['fp4_matrices']} packed uint8 weights, found {weight_dtypes['UINT8']}")
     wanted_inputs = GATED_DELTA_INPUTS | (FULL_ATTENTION_INPUTS if FULL in cfg.layer_types else set())
     if user_keys != wanted_inputs:
         problems.append(f"user inputs differ from the graph contract: {sorted(user_keys ^ wanted_inputs)}")
-    bad_ops = sorted(FORBIDDEN_OPS & all_ops)
+    # Hand-written kernels reach the compiler as custom calls.
+    bad_ops = sorted((FORBIDDEN_OPS - ({"custom-call"} if cfg.weight_format == "fp8" else set())) & all_ops)
     if bad_ops:
         problems.append(f"unexpected ops: {bad_ops}")
 
@@ -130,11 +131,13 @@ def main():
     parser.add_argument("--layers", type=int, help="The --layers value used when compiling.")
     parser.add_argument("--header", type=Path, help="Checkpoint header JSON, to check the weights fit this graph.")
     parser.add_argument("--tp-degree", type=int, default=2)
+    parser.add_argument("--weight-format", choices=("fp4", "fp8"), default="fp4")
     args = parser.parse_args()
 
     cfg = TextConfig.from_file(args.config) if args.config else tiny_config()
     if args.layers:
         cfg = replace(cfg, layer_types=cfg.layer_types[: args.layers])
+    cfg = replace(cfg, weight_format=args.weight_format)
 
     report, problems = inspect(args.workdir, cfg)
     if args.header:

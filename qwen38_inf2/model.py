@@ -89,13 +89,35 @@ class FP4Linear(nn.Module):
         return F.linear(x[..., ::2], even.to(x.dtype)) + F.linear(x[..., 1::2], odd.to(x.dtype))
 
 
+class FP8Linear(nn.Module):
+    """Bias-free linear layer holding weights as FP8 bytes, so a chip runs it with no decoding at all.
+
+    `weight_fp8` is ``[in_features, out_features]`` because the Tensor Engine contracts along the first dimension.
+    """
+
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__()
+        self.weight_fp8 = _frozen(in_features, out_features, dtype=torch.uint8)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.device.type == "cpu":
+            return F.linear(x, fp4.fp8_to_float(self.weight_fp8).T.to(x.dtype))
+        from .kernels import fp8_linear
+
+        return fp8_linear(x.reshape(x.shape[0], -1).transpose(0, 1), self.weight_fp8).unsqueeze(1)
+
+
+def make_linear(cfg: TextConfig, in_features: int, out_features: int) -> nn.Module:
+    return (FP8Linear if cfg.weight_format == "fp8" else FP4Linear)(in_features, out_features)
+
+
 class MLP(nn.Module):
     def __init__(self, cfg: TextConfig, tp_degree: int, all_reduce: Callable):
         super().__init__()
         intermediate = cfg.intermediate_size // tp_degree
-        self.gate_proj = FP4Linear(cfg.hidden_size, intermediate)
-        self.up_proj = FP4Linear(cfg.hidden_size, intermediate)
-        self.down_proj = FP4Linear(intermediate, cfg.hidden_size)
+        self.gate_proj = make_linear(cfg, cfg.hidden_size, intermediate)
+        self.up_proj = make_linear(cfg, cfg.hidden_size, intermediate)
+        self.down_proj = make_linear(cfg, intermediate, cfg.hidden_size)
         self.all_reduce = all_reduce
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -115,9 +137,9 @@ class GatedDeltaNetStep(nn.Module):
         self.num_k_heads = cfg.linear_num_key_heads // tp_degree
         conv_dim = 2 * self.key_dim + self.value_dim
 
-        self.in_proj_qkv = FP4Linear(cfg.hidden_size, conv_dim)
-        self.in_proj_z = FP4Linear(cfg.hidden_size, self.value_dim)
-        self.out_proj = FP4Linear(self.value_dim, cfg.hidden_size)
+        self.in_proj_qkv = make_linear(cfg, cfg.hidden_size, conv_dim)
+        self.in_proj_z = make_linear(cfg, cfg.hidden_size, self.value_dim)
+        self.out_proj = make_linear(cfg, self.value_dim, cfg.hidden_size)
         # These stay float in the checkpoint: the quantization recipe excludes them.
         self.in_proj_b = _frozen(self.num_v_heads, cfg.hidden_size, dtype=dtype)
         self.in_proj_a = _frozen(self.num_v_heads, cfg.hidden_size, dtype=dtype)
@@ -185,10 +207,10 @@ class FullAttentionStep(nn.Module):
         self.num_kv_heads = cfg.num_key_value_heads // tp_degree
         head = cfg.head_dim
 
-        self.q_proj = FP4Linear(cfg.hidden_size, self.num_heads * head * 2)  # query plus output gate
-        self.k_proj = FP4Linear(cfg.hidden_size, self.num_kv_heads * head)
-        self.v_proj = FP4Linear(cfg.hidden_size, self.num_kv_heads * head)
-        self.o_proj = FP4Linear(self.num_heads * head, cfg.hidden_size)
+        self.q_proj = make_linear(cfg, cfg.hidden_size, self.num_heads * head * 2)  # query plus output gate
+        self.k_proj = make_linear(cfg, cfg.hidden_size, self.num_kv_heads * head)
+        self.v_proj = make_linear(cfg, cfg.hidden_size, self.num_kv_heads * head)
+        self.o_proj = make_linear(cfg, self.num_heads * head, cfg.hidden_size)
         self.q_norm_weight = _frozen(head, dtype=dtype)
         self.k_norm_weight = _frozen(head, dtype=dtype)
 

@@ -48,7 +48,7 @@ class SimulatedCoresStep:
     ):
         block_layers, tp_degree = build_info["layers"], build_info["tp_degree"]
         num_blocks = num_blocks or cfg.num_hidden_layers // block_layers
-        block_cfg = replace(cfg, layer_types=cfg.layer_types[:block_layers])
+        block_cfg = replace(cfg, layer_types=cfg.layer_types[:block_layers], weight_format=build_info.get("weight_format", "fp4"))
         self.reducer = ThreadedAllReduce(tp_degree)
         self.ranks = []
         for rank in range(tp_degree):
@@ -60,7 +60,7 @@ class SimulatedCoresStep:
                 weights = checkpoint.load_rank_block(weights_dir, block, rank, block_layers)
                 # Packed FP4 and its scales stay as stored. The rest takes the model's dtype.
                 weights = {
-                    name: t if name.endswith(("weight_packed", "weight_scale")) else t.to(dtype)
+                    name: t if name.endswith(("weight_packed", "weight_scale", "weight_fp8")) else t.to(dtype)
                     for name, t in weights.items()
                 }
                 missing, unexpected = model.load_state_dict(weights, strict=False, assign=True)
