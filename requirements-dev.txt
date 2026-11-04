@@ -1,0 +1,12 @@
+# Reference packages for the CPU tests. Not needed to compile or run.
+torch==2.9.*
+transformers==5.22.1
+safetensors
+tokenizers
+numpy
+pytest
+accelerate
+# Runtime needs of compressed-tensors, which is installed separately with --no-deps.
+loguru
+pydantic
+psutil
