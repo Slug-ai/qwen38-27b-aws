@@ -93,3 +93,5 @@ Goal: tokens per second across all sequences. Latency per token doesn't matter.
 - Memory limits at max length 512: batch 32 fits and batch 40 doesn't. With lm_head on the chip, batch 20 fits and batch 24 doesn't.
 - `pkill` isn't always enough for a process holding the chip: a run can sit there holding both cores, and the next run fails with `Logical Neuron Core(s) not available`. Use `pkill -9`.
 - With BF16 gated delta state, lm_head on the chip and max length 512, batch 32 fits and batch 36 doesn't: it fails allocating collective rings.
+- The Tensor Engine runs the FP8 kernel in BF16. The compiler adds a cast from FP8 to BF16 on the Vector Engine for every weight tile (`src=fp8e5 dst=bfloat16` in the profile), so FP8 weights are cheap to widen rather than free. Moving those casts to other engines doesn't speed it up, so something else also limits it, possibly DMA.
+- `neuron-profile view --output-format json` gives per-instruction data. `opcode` and `operands` on each instruction show data types, which is how the cast was found. The first all-reduce in a block takes about 2 ms and the rest about 0.05 ms, for about 32 ms per step. The cause isn't known.
