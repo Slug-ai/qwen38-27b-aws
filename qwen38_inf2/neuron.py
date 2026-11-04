@@ -1,5 +1,6 @@
 """Compile and run `Qwen38Step` on Neuron. Requires the Neuron SDK, so import this only in that environment."""
 
+import json
 from pathlib import Path
 
 import torch
@@ -15,6 +16,7 @@ from .model import Qwen38Step
 
 DTYPE = torch.bfloat16
 MODEL_FILE = "nxd_model.pt"
+BUILD_INFO_FILE = "build_info.json"
 # NxD's defaults plus an explicit target. Inf2 shares NeuronCore-v2 codegen with Trn1.
 DEFAULT_COMPILER_ARGS = "--enable-saturate-infinity --auto-cast=none --model-type=transformer -O1"
 
@@ -52,7 +54,13 @@ def build(
 
     path = output_dir / MODEL_FILE
     nxd_model.save(str(path))
+    info = {"max_seq_len": max_seq_len, "tp_degree": tp_degree, "target": target, "layers": cfg.num_hidden_layers}
+    (output_dir / BUILD_INFO_FILE).write_text(json.dumps(info, indent=2))
     return path
+
+
+def read_build_info(model_dir: str | Path) -> dict:
+    return json.loads((Path(model_dir) / BUILD_INFO_FILE).read_text())
 
 
 def shard_path(weights_dir: str | Path, rank: int) -> Path:
@@ -71,9 +79,10 @@ def write_rank_weights(source, cfg: TextConfig, weights_dir: str | Path, tp_degr
 class NeuronStep:
     """The compiled graph, with the same call signature as `Qwen38Step` for `greedy_generate`."""
 
-    def __init__(self, model_dir: str | Path, weights_dir: str | Path, tp_degree: int = 2):
+    def __init__(self, model_dir: str | Path, weights_dir: str | Path):
         self.model = NxDModel.load(str(Path(model_dir) / MODEL_FILE))
-        self.model.set_weights([load_file(shard_path(weights_dir, rank)) for rank in range(tp_degree)])
+        ranks = range(read_build_info(model_dir)["tp_degree"])
+        self.model.set_weights([load_file(shard_path(weights_dir, rank)) for rank in ranks])
         self.model.to_neuron()
 
     def __call__(self, **inputs: torch.Tensor) -> torch.Tensor:

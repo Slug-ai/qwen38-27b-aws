@@ -32,6 +32,12 @@ def identity_all_reduce(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
+def silu(x: torch.Tensor) -> torch.Tensor:
+    """Spelled out because torch-neuronx rewrites `F.silu` to a Neuron-only custom call. XLA on CPU
+    cannot run that, and without it the whole graph can be checked with no Neuron hardware."""
+    return x * torch.sigmoid(x)
+
+
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     h = x.float()
     h = h * torch.rsqrt((h * h).mean(-1, keepdim=True) + eps)
@@ -89,7 +95,7 @@ class MLP(nn.Module):
         self.all_reduce = all_reduce
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.all_reduce(self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x)))
+        return self.all_reduce(self.down_proj(silu(self.gate_proj(x)) * self.up_proj(x)))
 
 
 class GatedDeltaNetStep(nn.Module):
@@ -132,7 +138,7 @@ class GatedDeltaNetStep(nn.Module):
         qkv = self.in_proj_qkv(x).transpose(1, 2)
         window = torch.cat((self.conv_state * keep_state.to(dtype), qkv), dim=-1)
         self.conv_state = window[:, :, 1:]
-        mixed = F.silu((window * self.conv_weight).sum(dim=-1))
+        mixed = silu((window * self.conv_weight).sum(dim=-1))
 
         query = mixed[:, : self.key_dim].reshape(1, self.num_k_heads, k_head)
         key = mixed[:, self.key_dim : 2 * self.key_dim].reshape(1, self.num_k_heads, k_head)
@@ -159,7 +165,7 @@ class GatedDeltaNetStep(nn.Module):
         h = out.float()
         h = h * torch.rsqrt((h * h).mean(-1, keepdim=True) + self.cfg.rms_norm_eps)
         h = self.norm_weight * h.to(dtype)
-        h = (h * F.silu(z.float())).to(dtype)
+        h = (h * silu(z.float())).to(dtype)
         return self.all_reduce(self.out_proj(h.reshape(1, 1, self.value_dim)))
 
 

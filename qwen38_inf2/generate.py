@@ -11,6 +11,15 @@ import torch
 from .config import TextConfig
 from .model import MASKED_SCORE
 
+# From the checkpoint's generation_config.json: <|im_end|> and <|endoftext|>.
+EOS_TOKEN_IDS = (248046, 248044)
+
+
+def chat_prompt(user_message: str, thinking: bool = False) -> str:
+    """The checkpoint's chat template, for a single user message."""
+    opening = "<think>\n" if thinking else "<think>\n\n</think>\n\n"
+    return f"<|im_start|>user\n{user_message}<|im_end|>\n<|im_start|>assistant\n{opening}"
+
 
 def rotary_terms(cfg: TextConfig, position: int, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
     """cos and sin for one position. With text-only input the T/H/W grids coincide, so MRoPE is plain RoPE."""

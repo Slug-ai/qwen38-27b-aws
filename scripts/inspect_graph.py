@@ -16,6 +16,7 @@ from pathlib import Path
 from torch_neuronx.proto import metaneff_pb2
 from torch_neuronx.pyhlo import hlo_pb2
 
+from qwen38_inf2 import checkpoint
 from qwen38_inf2.config import LINEAR, TextConfig, tiny_config
 
 STATE_SUFFIXES = (".conv_state", ".recurrent_state", ".k_cache", ".v_cache")
@@ -43,6 +44,8 @@ def inspect(workdir: Path, cfg: TextConfig) -> tuple[dict, list[str]]:
 
     entry = next(c for c in module.computations if c.id == module.entry_computation_id)
     ops = collections.Counter(i.opcode for i in entry.instructions)
+    # Forbidden ops can hide inside called computations, so those get scanned too.
+    all_ops = {i.opcode for c in module.computations for i in c.instructions}
     type_names = metaneff_pb2.MetaTensor.Type.Name
     dtype_names = metaneff_pb2.MetaTensor.DataType.Name
 
@@ -79,7 +82,7 @@ def inspect(workdir: Path, cfg: TextConfig) -> tuple[dict, list[str]]:
         problems.append(f"expected {want['fp4_matrices']} packed uint8 weights, found {weight_dtypes['UINT8']}")
     if user_keys != USER_INPUTS:
         problems.append(f"user inputs differ from the graph contract: {sorted(user_keys ^ USER_INPUTS)}")
-    bad_ops = sorted(FORBIDDEN_OPS & set(ops))
+    bad_ops = sorted(FORBIDDEN_OPS & all_ops)
     if bad_ops:
         problems.append(f"unexpected ops: {bad_ops}")
 
@@ -93,11 +96,37 @@ def inspect(workdir: Path, cfg: TextConfig) -> tuple[dict, list[str]]:
     return report, problems
 
 
+def check_checkpoint_fits(workdir: Path, cfg: TextConfig, header_path: Path, tp_degree: int) -> list[str]:
+    """Every rank's cut of the real checkpoint must match the compiled graph's weights exactly."""
+    meta = metaneff_pb2.MetaNeff()
+    meta.ParseFromString((workdir / "metaneff.pb").read_bytes())
+    dtype_names = metaneff_pb2.MetaTensor.DataType.Name
+    graph = {
+        t.checkpoint_key.decode(): (list(t.shape), dtype_names(t.data_type))
+        for t in meta.input_tensors
+        if metaneff_pb2.MetaTensor.Type.Name(t.type) == "INPUT_WEIGHT"
+    }
+    source = checkpoint.ShapeSource(json.loads(header_path.read_text()))
+    torch_names = {"torch.uint8": "UINT8", "torch.bfloat16": "BFLOAT16"}
+    problems = []
+    for rank in range(tp_degree):
+        weights = checkpoint.rank_weights(source, cfg, rank, tp_degree)
+        if set(weights) != set(graph):
+            problems.append(f"rank {rank} weight names differ: {sorted(set(weights) ^ set(graph))[:5]}")
+        for name in set(weights) & set(graph):
+            got = (list(weights[name].shape), torch_names[str(weights[name].dtype)])
+            if got != graph[name]:
+                problems.append(f"rank {rank} {name}: checkpoint {got}, graph {graph[name]}")
+    return problems
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("workdir", type=Path, help="The timestamped directory under compiler-work/decode.")
     parser.add_argument("--config", help="Model config.json. Omit for the tiny model.")
     parser.add_argument("--layers", type=int, help="The --layers value used when compiling.")
+    parser.add_argument("--header", type=Path, help="Checkpoint header JSON, to check the weights fit this graph.")
+    parser.add_argument("--tp-degree", type=int, default=2)
     args = parser.parse_args()
 
     cfg = TextConfig.from_file(args.config) if args.config else tiny_config()
@@ -105,6 +134,8 @@ def main():
         cfg = replace(cfg, layer_types=cfg.layer_types[: args.layers])
 
     report, problems = inspect(args.workdir, cfg)
+    if args.header:
+        problems += check_checkpoint_fits(args.workdir, cfg, args.header, args.tp_degree)
     print(json.dumps(report, indent=1))
     for problem in problems:
         print(f"PROBLEM: {problem}")
