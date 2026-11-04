@@ -43,7 +43,7 @@ The AMI ships an older SDK than the one our graphs were compiled with:
 ## Python on Amazon Linux 2023
 
 - torch-xla 2.9.0 is tagged `manylinux_2_28` but binds `hypot` and `hypotf` to GLIBC_2.35, and this AMI has glibc 2.34. `import torch_xla` fails with ``version `GLIBC_2.35' not found``, including in the AMI's own `/opt/aws_neuronx_venv_pytorch_2_9`.
-- Fix: `python scripts/patch_xla_glibc.py .venv/lib/python3.12/site-packages/_XLAC*.so`. `patchelf --clear-symbol-version` alone isn't enough, because the loader also checks the version-needs table.
+- Fix: `python scripts/patch_xla_glibc.py .venv/lib/python3.12/site-packages/_XLAC*.so`. It also marks the version requirement weak, because from how the loader works `patchelf --clear-symbol-version` alone shouldn't be enough. That wasn't tried.
 - First imports are slow (27 s here, and much longer for very large files) because the AMI's disk loads from its snapshot on first read.
 - Environment that imports cleanly, using the pins in `docker/requirements-neuron.txt`:
   ```bash
@@ -52,4 +52,9 @@ The AMI ships an older SDK than the one our graphs were compiled with:
     --extra-index-url https://download.pytorch.org/whl/cpu \
     --extra-index-url https://pip.repos.neuron.amazonaws.com -r docker/requirements-neuron.txt
   ```
-- The checkpoint downloads from Hugging Face at about 60 MB/s here, so 19 GB takes about 6 minutes. Download it on the instance rather than uploading from a laptop.
+- The checkpoint downloads from Hugging Face at about 20 MB/s here, so 19 GB takes about 15 minutes. Start it first, in the background.
+
+## First results on the chip
+
+- `decode` passes: 512 of 512 values exact, 15 s including imports. Graphs compiled with the SDK 2.28.1 compiler load and run with the 2.28.1 runtime on the AMI's older 2.25.4 driver.
+- `kernel-devel` for the AMI's running kernel isn't in the repos, so the driver wasn't upgraded. So far it hasn't mattered.
