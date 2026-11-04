@@ -20,12 +20,15 @@ One change per row, each measured on the real chip with `scripts/batch_generate.
 | 8 | 16-layer blocks, so 4 loaded graphs instead of 16, which frees memory for rows | 40 | 0.24 | 0.05 | 74.29 | 124.58 | yes, 38 of 38 |
 | 9 | Largest batch that fits this build. Batch 48 runs out of memory | 44 | 0.26 | 0.06 | 77.42 | 129.82 | yes, 38 of 38, see below |
 | 10 | `lm_head` stored as FP8, which halves it, with the host rechecking the top 4 groups exactly | 56 | 0.29 | 0.07 | 88.72 | 148.92 | yes, 38 of 38, see below |
+| 11 | Scratchpad pages of 128 MB instead of the runtime's default, which frees 256 MB per core | 60 | 0.30 | 0.03 | 99.64 | 167.39 | yes, 38 of 38, see below |
 
 Rows 1 to 4 allow 2048 tokens of prompt plus output, and from row 5 it's 512. Batch 24 at 2048 ran out of chip memory.
 
 Chip s/step counts the 16 blocks, and the chip part of `lm_head` counts as host time. In row 6, with every row generating, the run reached 81.2 tok/s over 13 steps.
 
 Row 7 changes numbers, not just speed. Compared with row 6's build on the same prompts, 36 of 40 sequences are identical, and 1219 of 1280 tokens come before a sequence's first difference. Row 8 gives exactly the same comparison, but row 9 falls to 33 of 40 sequences and 1178 tokens, so batch size affects results as well as the BF16 state. Row 10 gives the same comparison as row 9, so FP8 lm_head with the host's recheck changed no token choices in those sequences. Greedy text can split at a near tie. Whether output quality changes hasn't been measured. With every row generating, row 7 reached 110.0 tok/s over 14 steps.
+
+Row 11's host time fell with no host code change, probably because the checkpoint's lm_head rows were already in the disk cache from earlier runs, so part of its gain isn't from the scratchpad. A long-running server would also see the warm number. With every row generating, row 11 reached 172.1 tok/s over 12 steps.
 
 Raw results are in [throughput/](throughput/). `git log docs/throughput.md` gives the commit for each row.
 

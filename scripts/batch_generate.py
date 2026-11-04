@@ -8,6 +8,7 @@ through every row first, so a wrong graph can't look fast.
 
 import argparse
 import json
+import os
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -108,6 +109,8 @@ def screen(step, cfg, batch_size: int, max_seq_len: int, blocks: int, steps: int
 
 
 def main():
+    # The runtime reads this when it starts. The default page size reserves far more scratchpad than these graphs need.
+    os.environ.setdefault("NEURON_SCRATCHPAD_PAGE_SIZE", "128")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--compiled", required=True)
