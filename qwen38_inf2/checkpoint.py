@@ -73,6 +73,12 @@ class TensorSource:
         start, end = entry["data_offsets"]
         return self._decode(self._read(self._base + start, end - start), entry["dtype"], entry["shape"])
 
+    def touch(self, name: str) -> None:
+        """Read a tensor once, so it is in the disk cache and later reads of single rows don't wait on the disk."""
+        start, end = self.header[name]["data_offsets"]
+        for first in range(start, end, 1 << 26):
+            np.frombuffer(self._read(self._base + first, min(1 << 26, end - first)), dtype=np.uint8).max()
+
     def get_rows(self, name: str, row_ids: list[int] | torch.Tensor) -> torch.Tensor:
         """Read selected rows of a matrix. Lets a test use a few embeddings without 2.5 GB of table."""
         entry = self.header[name]

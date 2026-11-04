@@ -110,7 +110,7 @@ def screen(step, cfg, batch_size: int, max_seq_len: int, blocks: int, steps: int
 
 def main():
     # The runtime reads this when it starts. The default page size reserves far more scratchpad than these graphs need.
-    os.environ.setdefault("NEURON_SCRATCHPAD_PAGE_SIZE", "128")
+    os.environ.setdefault("NEURON_SCRATCHPAD_PAGE_SIZE", "64")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--compiled", required=True)
@@ -164,6 +164,13 @@ def main():
     if args.screen_blocks:
         screen(inner, cfg, batch_size, info["max_seq_len"], args.screen_blocks)
         return
+
+    if args.head:
+        # Loading the weights pushes these tables out of the disk cache, and each step reads scattered rows of them.
+        started = time.perf_counter()
+        source.touch(checkpoint.LM_HEAD)
+        source.touch(checkpoint.EMBED_TOKENS)
+        print(f"read lm_head and embeddings into the disk cache in {time.perf_counter() - started:.1f}s", flush=True)
 
     saved_tokens = check_saved_tokens(inner, head, cfg, golden, batch_size, info["max_seq_len"])
     print(f"saved test passage: {saved_tokens}", flush=True)
