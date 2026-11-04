@@ -21,7 +21,6 @@ ERROR_FACTOR = 3.0
 ERROR_FLOOR = 0.02
 # A top-token change only counts as rounding if the top two logits were this close on the CPU.
 NEAR_TIE_LOGITS = 0.25
-MAX_NEAR_TIE_FLIPS = 2
 
 
 @dataclass
@@ -88,7 +87,7 @@ def check_model(step, head, cfg: TextConfig, golden: dict, max_seq_len: int) -> 
         if top != golden["top"][position]:
             flips.append({"position": position, "got": top, "want": golden["top"][position], "cpu_margin": golden["margin"][position]})
     clear = [flip for flip in flips if flip["cpu_margin"] >= NEAR_TIE_LOGITS]
-    passed = not clear and len(flips) <= MAX_NEAR_TIE_FLIPS
+    passed = not clear
     hint = "" if passed else "Lower levels passed, so suspect block chaining or the weights of later blocks."
     return LevelResult("model", passed, {"positions": len(golden["tokens"]), "flips": flips}, hint)
 

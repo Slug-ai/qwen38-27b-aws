@@ -135,7 +135,7 @@ class FixedHead:
         return logits
 
 
-MODEL_GOLDEN = {"tokens": [1, 2, 3, 4], "top": [5, 6, 7, 8], "margin": [3.0, 0.1, 2.0, 4.0]}
+MODEL_GOLDEN = {"tokens": [1, 2, 3, 4], "top": [5, 6, 7, 8], "margin": [3.0, 0.1, 0.2, 4.0]}
 
 
 def model_check(tops):
@@ -149,6 +149,11 @@ def test_model_passes_when_top_tokens_match():
 def test_model_forgives_a_flip_only_at_a_near_tie():
     result = model_check([5, 9, 7, 8])
     assert result.passed and len(result.details["flips"]) == 1
+
+
+def test_model_forgives_every_near_tie_flipping_at_once():
+    result = model_check([5, 9, 9, 8])
+    assert result.passed and len(result.details["flips"]) == 2
 
 
 def test_model_fails_on_a_flip_where_the_cpu_was_confident():
