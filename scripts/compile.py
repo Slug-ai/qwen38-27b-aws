@@ -18,6 +18,7 @@ def main():
     parser.add_argument("--target", default="inf2")
     parser.add_argument("--compiler-args", default="")
     parser.add_argument("--output", required=True)
+    parser.add_argument("--workdir", help="Compiler scratch and logs. Defaults to <output>/compiler-work.")
     args = parser.parse_args()
 
     if args.tiny == bool(args.config):
@@ -27,7 +28,8 @@ def main():
         cfg = _truncated(cfg, args.layers)
 
     started = time.time()
-    path = build(cfg, args.max_seq_len, args.output, args.tp_degree, args.target, args.compiler_args)
+    workdir = args.workdir or f"{args.output}/compiler-work"
+    path = build(cfg, args.max_seq_len, args.output, args.tp_degree, args.target, args.compiler_args, workdir)
     print(f"compiled {cfg.num_hidden_layers} layers for {args.target} in {time.time() - started:.0f}s: {path}")
 
 

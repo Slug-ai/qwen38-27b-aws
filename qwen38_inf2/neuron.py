@@ -39,6 +39,8 @@ def build(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     compiler_args = f"{DEFAULT_COMPILER_ARGS} --target {target} {extra_compiler_args}".strip()
+    # The compiler changes into this directory before opening its log, so it must be absolute.
+    workdir = str(Path(workdir).resolve()) if workdir else None
 
     with NxDParallelState(world_size=tp_degree, tensor_model_parallel_size=tp_degree):
         model = Qwen38Step(
@@ -46,7 +48,7 @@ def build(
         )
         builder = ModelBuilder(model)
         builder.trace(kwargs=example_inputs(cfg, max_seq_len), tag="decode")
-        nxd_model = builder.compile(compiler_args=compiler_args, compiler_workdir=workdir and str(workdir))
+        nxd_model = builder.compile(compiler_args=compiler_args, compiler_workdir=workdir)
 
     path = output_dir / MODEL_FILE
     nxd_model.save(str(path))

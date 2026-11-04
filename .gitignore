@@ -7,3 +7,5 @@ artifacts/
 weights/
 *.neff
 *.safetensors
+.neuron-env/
+log-neuron-cc.txt
