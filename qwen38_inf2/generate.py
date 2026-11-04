@@ -51,6 +51,12 @@ def step_inputs(cfg: TextConfig, position: int, max_seq_len: int, dtype: torch.d
     }
 
 
+def batch_step_inputs(cfg: TextConfig, positions: Sequence[int], max_seq_len: int, dtype: torch.dtype) -> dict[str, torch.Tensor]:
+    """`step_inputs` with one row per sequence, each at its own position."""
+    rows = [step_inputs(cfg, position, max_seq_len, dtype) for position in positions]
+    return {name: torch.cat([row[name] for row in rows]) for name in rows[0]}
+
+
 class HostHead:
     """Embedding lookup, final norm and lm_head, kept off the device to save 5 GB of its memory.
 
@@ -72,8 +78,16 @@ class HostHead:
     def embed(self, token_id: int, dtype: torch.dtype) -> torch.Tensor:
         return self.source.get_rows(checkpoint.EMBED_TOKENS, [token_id]).reshape(1, 1, -1).to(dtype)
 
+    def embed_batch(self, token_ids: Sequence[int], dtype: torch.dtype) -> torch.Tensor:
+        return self.source.get_rows(checkpoint.EMBED_TOKENS, list(token_ids)).unsqueeze(1).to(dtype)
+
     def logits(self, hidden: torch.Tensor) -> torch.Tensor:
         return rms_norm(hidden.float(), self.norm_weight, self.eps).reshape(-1) @ self.lm_head.T
+
+    def next_tokens(self, hidden: torch.Tensor) -> list[int]:
+        """Greedy next token for each row of ``[rows, 1, hidden]``."""
+        norm = rms_norm(hidden.float(), self.norm_weight, self.eps).squeeze(1)
+        return torch.argmax(norm @ self.lm_head.T, dim=-1).tolist()
 
 
 class BlockChain:
@@ -115,3 +129,51 @@ def greedy_generate(
             return
         hidden = step(inputs_embeds=head.embed(next_id, dtype), **step_inputs(cfg, position, max_seq_len, dtype))
         position += 1
+
+
+def batched_greedy_generate(
+    step: Callable[..., torch.Tensor],
+    head: HostHead,
+    cfg: TextConfig,
+    prompts: Sequence[Sequence[int]],
+    batch_size: int,
+    max_new_tokens: int,
+    max_seq_len: int,
+    eos_token_ids: Sequence[int] = (),
+    dtype: torch.dtype = torch.bfloat16,
+) -> Iterator[tuple[int, int]]:
+    """Run many prompts through a fixed batch, and yield (prompt index, token id) as tokens are chosen.
+
+    A row that finishes takes the next waiting prompt on the following step. Its first token clears the
+    row's state, and an idle row just rewrites position 0 of its own cache, so rows never affect each other.
+    """
+    if any(not prompt for prompt in prompts):
+        raise ValueError("a prompt is empty")
+    waiting = list(range(len(prompts)))[::-1]
+    rows: list[dict | None] = [None] * batch_size
+
+    while waiting or any(rows):
+        for r in range(batch_size):
+            if rows[r] is None and waiting:
+                index = waiting.pop()
+                rows[r] = {"index": index, "ids": list(prompts[index]), "position": 0, "new": 0}
+
+        positions = [row["position"] if row else 0 for row in rows]
+        token_ids = [row["ids"][row["position"]] if row else 0 for row in rows]
+        hidden = step(inputs_embeds=head.embed_batch(token_ids, dtype), **batch_step_inputs(cfg, positions, max_seq_len, dtype))
+
+        # Only rows that have fed their last known token need lm_head, which is the costly part on the host.
+        ready = []
+        for r, row in enumerate(rows):
+            if row:
+                row["position"] += 1
+                if row["position"] == len(row["ids"]):
+                    ready.append(r)
+        if ready:
+            for r, token_id in zip(ready, head.next_tokens(hidden[ready])):
+                row = rows[r]
+                row["ids"].append(token_id)
+                row["new"] += 1
+                yield row["index"], token_id
+                if token_id in eos_token_ids or row["new"] >= max_new_tokens or row["position"] >= max_seq_len:
+                    rows[r] = None

@@ -67,3 +67,11 @@ The AMI ships an older SDK than the one our graphs were compiled with:
 - Real generation: `What is the capital of France? Answer in one short sentence, then name one famous landmark there.` gave `The capital of France is Paris, and one famous landmark there is the Eiffel Tower.`
 - Plain block speed: 4.13 s per token on the chip, 0.18 s on the host, 0.232 tokens/s. The pre-chip estimate of about 1.5 tokens/s was about 6 times too high.
 - Host memory peaks at about 10.4 GB of 15 GB with everything loaded, so `inf2.xlarge` is enough.
+
+## Throughput
+
+Goal: tokens per second across all sequences. Latency per token doesn't matter.
+
+- Layout-optimized block (`--optimize-layout`): 3.74 s per token on the chip, against 4.13 s plain.
+- FP4 decode is the bottleneck: a real matrix decodes at 3.59 G values/s, and each core decodes 12.16 G values per token, so about 3.4 s of 3.74 s. Matrix math is very small in comparison.
+- So batching comes first: all rows of a batch share one decode.

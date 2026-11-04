@@ -15,6 +15,7 @@ def main():
     parser.add_argument("--layers", type=int, help="Compile only the first N layers. 4 is one repeating block, loaded 16 times at run time.")
     parser.add_argument("--max-seq-len", type=int, default=2048)
     parser.add_argument("--tp-degree", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=1, help="Sequences run together per step. Decoding is shared by all of them.")
     parser.add_argument("--target", default="inf2")
     parser.add_argument("--compiler-args", default="")
     parser.add_argument("--optimize-layout", action="store_true", help="Use NxD's weight layout optimization.")
@@ -30,7 +31,7 @@ def main():
 
     started = time.time()
     workdir = args.workdir or f"{args.output}/compiler-work"
-    path = build(cfg, args.max_seq_len, args.output, args.tp_degree, args.target, args.compiler_args, workdir, args.optimize_layout)
+    path = build(cfg, args.max_seq_len, args.output, args.tp_degree, args.target, args.compiler_args, workdir, args.optimize_layout, args.batch_size)
     print(f"compiled {cfg.num_hidden_layers} layers for {args.target} in {time.time() - started:.0f}s: {path}")
 
 

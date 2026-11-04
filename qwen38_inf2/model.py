@@ -2,10 +2,12 @@
 
 Mirrors `transformers.models.qwen3_5.modeling_qwen3_5` with these changes for NeuronCore-v2:
 
-* Static shapes. One graph runs one token (batch 1, sequence 1). A prompt is fed token by token, so
-  there is no prefill graph and no chunked gated-delta solve (`torch.linalg.solve_triangular` and
-  its unrolled form do not suit this target). Token-by-token is the recurrent form of the same rule.
-* Weights stay MXFP4 and are decoded in the graph by `FP4Linear`.
+* Static shapes. One graph runs one token for each row of a fixed batch, and each row is an independent
+  sequence at its own position. A prompt is fed token by token, so there is no prefill graph and no
+  chunked gated-delta solve (`torch.linalg.solve_triangular` and its unrolled form do not suit this
+  target). Token-by-token is the recurrent form of the same rule.
+* Weights stay MXFP4 and are decoded in the graph by `FP4Linear`. Decoding is about 90% of the time per
+  step and is shared by every row, so throughput grows with batch size until chip memory runs out.
 * Caches are registered buffers that are reassigned on each step. The Neuron tracer turns that into
   on-device state. It does not detect `Tensor.copy_`, so do not use that here.
 * Tensor parallelism. Each rank owns a contiguous slice of heads, and each head's computation is
@@ -102,7 +104,7 @@ class MLP(nn.Module):
 class GatedDeltaNetStep(nn.Module):
     """One token of the gated delta rule (`torch_recurrent_gated_delta_rule` with a causal conv)."""
 
-    def __init__(self, cfg: TextConfig, tp_degree: int, dtype: torch.dtype, all_reduce: Callable):
+    def __init__(self, cfg: TextConfig, tp_degree: int, dtype: torch.dtype, all_reduce: Callable, batch_size: int = 1):
         super().__init__()
         self.cfg = cfg
         self.all_reduce = all_reduce
@@ -123,40 +125,41 @@ class GatedDeltaNetStep(nn.Module):
         self.dt_bias = _frozen(self.num_v_heads, dtype=dtype)
         self.norm_weight = _frozen(cfg.linear_value_head_dim, dtype=dtype)
 
-        self.register_buffer("conv_state", torch.zeros(1, conv_dim, cfg.linear_conv_kernel_dim - 1, dtype=dtype))
+        self.register_buffer("conv_state", torch.zeros(batch_size, conv_dim, cfg.linear_conv_kernel_dim - 1, dtype=dtype))
         # The reference keeps this in float32 regardless of model dtype.
         self.register_buffer(
             "recurrent_state",
-            torch.zeros(1, self.num_v_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim, dtype=torch.float32),
+            torch.zeros(batch_size, self.num_v_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim, dtype=torch.float32),
         )
 
     def forward(self, x: torch.Tensor, keep_state: torch.Tensor) -> torch.Tensor:
         dtype = x.dtype
+        batch = x.shape[0]
         k_head, v_head = self.cfg.linear_key_head_dim, self.cfg.linear_value_head_dim
 
         # A depthwise causal conv over one new sample is a weighted sum of a sliding window, so no
         # conv op is needed. Newest sample is last, matching F.conv1d's kernel order.
         qkv = self.in_proj_qkv(x).transpose(1, 2)
-        window = torch.cat((self.conv_state * keep_state.to(dtype), qkv), dim=-1)
+        window = torch.cat((self.conv_state * keep_state.reshape(batch, 1, 1).to(dtype), qkv), dim=-1)
         self.conv_state = window[:, :, 1:]
         mixed = silu((window * self.conv_weight).sum(dim=-1))
 
-        query = mixed[:, : self.key_dim].reshape(1, self.num_k_heads, k_head)
-        key = mixed[:, self.key_dim : 2 * self.key_dim].reshape(1, self.num_k_heads, k_head)
-        value = mixed[:, 2 * self.key_dim :].reshape(1, self.num_v_heads, v_head)
+        query = mixed[:, : self.key_dim].reshape(batch, self.num_k_heads, k_head)
+        key = mixed[:, self.key_dim : 2 * self.key_dim].reshape(batch, self.num_k_heads, k_head)
+        value = mixed[:, 2 * self.key_dim :].reshape(batch, self.num_v_heads, v_head)
         query = repeat_interleave(query, self.cfg.linear_key_repeat, dim=1)
         key = repeat_interleave(key, self.cfg.linear_key_repeat, dim=1)
 
-        z = self.in_proj_z(x).reshape(1, self.num_v_heads, v_head)
-        beta = F.linear(x, self.in_proj_b).sigmoid().reshape(1, self.num_v_heads, 1).float()
-        a = F.linear(x, self.in_proj_a).reshape(1, self.num_v_heads).float()
+        z = self.in_proj_z(x).reshape(batch, self.num_v_heads, v_head)
+        beta = F.linear(x, self.in_proj_b).sigmoid().reshape(batch, self.num_v_heads, 1).float()
+        a = F.linear(x, self.in_proj_a).reshape(batch, self.num_v_heads).float()
         log_decay = -self.A_log.float().exp() * F.softplus(a + self.dt_bias.float())
 
         query = l2_norm(query.float()) / math.sqrt(k_head)
         key = l2_norm(key.float())
         value = value.float()
 
-        state = self.recurrent_state * keep_state * log_decay.exp()[..., None, None]
+        state = self.recurrent_state * keep_state.reshape(batch, 1, 1, 1) * log_decay.exp()[..., None, None]
         delta = (value - (state * key.unsqueeze(-1)).sum(dim=-2)) * beta
         state = state + key.unsqueeze(-1) * delta.unsqueeze(-2)
         self.recurrent_state = state
@@ -167,11 +170,13 @@ class GatedDeltaNetStep(nn.Module):
         h = h * torch.rsqrt((h * h).mean(-1, keepdim=True) + self.cfg.rms_norm_eps)
         h = self.norm_weight * h.to(dtype)
         h = (h * silu(z.float())).to(dtype)
-        return self.all_reduce(self.out_proj(h.reshape(1, 1, self.value_dim)))
+        return self.all_reduce(self.out_proj(h.reshape(batch, 1, self.value_dim)))
 
 
 class FullAttentionStep(nn.Module):
-    def __init__(self, cfg: TextConfig, tp_degree: int, max_seq_len: int, dtype: torch.dtype, all_reduce: Callable):
+    def __init__(
+        self, cfg: TextConfig, tp_degree: int, max_seq_len: int, dtype: torch.dtype, all_reduce: Callable, batch_size: int = 1
+    ):
         super().__init__()
         self.cfg = cfg
         self.all_reduce = all_reduce
@@ -186,19 +191,20 @@ class FullAttentionStep(nn.Module):
         self.q_norm_weight = _frozen(head, dtype=dtype)
         self.k_norm_weight = _frozen(head, dtype=dtype)
 
-        self.register_buffer("k_cache", torch.zeros(1, self.num_kv_heads, max_seq_len, head, dtype=dtype))
-        self.register_buffer("v_cache", torch.zeros(1, self.num_kv_heads, max_seq_len, head, dtype=dtype))
+        self.register_buffer("k_cache", torch.zeros(batch_size, self.num_kv_heads, max_seq_len, head, dtype=dtype))
+        self.register_buffer("v_cache", torch.zeros(batch_size, self.num_kv_heads, max_seq_len, head, dtype=dtype))
 
     def forward(self, x, cos, sin, write_mask, attn_mask) -> torch.Tensor:
         cfg = self.cfg
         head = cfg.head_dim
+        batch = x.shape[0]
 
-        q_and_gate = self.q_proj(x).reshape(1, 1, self.num_heads, head * 2)
+        q_and_gate = self.q_proj(x).reshape(batch, 1, self.num_heads, head * 2)
         query, gate = q_and_gate[..., :head], q_and_gate[..., head:]
         query = rms_norm(query, self.q_norm_weight, cfg.rms_norm_eps).transpose(1, 2)
-        key = self.k_proj(x).reshape(1, 1, self.num_kv_heads, head)
+        key = self.k_proj(x).reshape(batch, 1, self.num_kv_heads, head)
         key = rms_norm(key, self.k_norm_weight, cfg.rms_norm_eps).transpose(1, 2)
-        value = self.v_proj(x).reshape(1, 1, self.num_kv_heads, head).transpose(1, 2)
+        value = self.v_proj(x).reshape(batch, 1, self.num_kv_heads, head).transpose(1, 2)
         query, key = apply_rotary(query, key, cos, sin)
 
         write = write_mask > 0.5
@@ -210,19 +216,19 @@ class FullAttentionStep(nn.Module):
 
         scores = torch.matmul(query, keys.transpose(2, 3)) * head**-0.5
         weights = torch.softmax(scores.float() + attn_mask, dim=-1).to(query.dtype)
-        out = torch.matmul(weights, values).transpose(1, 2).reshape(1, 1, self.num_heads * head)
-        return self.all_reduce(self.o_proj(out * torch.sigmoid(gate.reshape(1, 1, self.num_heads * head))))
+        out = torch.matmul(weights, values).transpose(1, 2).reshape(batch, 1, self.num_heads * head)
+        return self.all_reduce(self.o_proj(out * torch.sigmoid(gate.reshape(batch, 1, self.num_heads * head))))
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, cfg, layer_type, tp_degree, max_seq_len, dtype, all_reduce):
+    def __init__(self, cfg, layer_type, tp_degree, max_seq_len, dtype, all_reduce, batch_size=1):
         super().__init__()
         self.cfg = cfg
         self.layer_type = layer_type
         if layer_type == LINEAR:
-            self.linear_attn = GatedDeltaNetStep(cfg, tp_degree, dtype, all_reduce)
+            self.linear_attn = GatedDeltaNetStep(cfg, tp_degree, dtype, all_reduce, batch_size)
         elif layer_type == FULL:
-            self.self_attn = FullAttentionStep(cfg, tp_degree, max_seq_len, dtype, all_reduce)
+            self.self_attn = FullAttentionStep(cfg, tp_degree, max_seq_len, dtype, all_reduce, batch_size)
         else:
             raise ValueError(f"Unknown layer type {layer_type}")
         self.mlp = MLP(cfg, tp_degree, all_reduce)
@@ -241,16 +247,16 @@ class DecoderLayer(nn.Module):
 
 
 class Qwen38Step(nn.Module):
-    """The compiled graph: a run of decoder layers, for one token.
+    """The compiled graph: a run of decoder layers, for one token per row.
 
     `cfg.layer_types` may be the whole model or one repeating block of it (see `generate.BlockChain`).
 
     Inputs (all built by `generate.step_inputs`):
-        inputs_embeds: ``[1, 1, hidden]``, from the embedding table or the previous block.
-        cos, sin: rotary terms for this position, ``[1, 1, rotary_dim]``.
-        write_mask: float32 ``[1, 1, max_seq_len, 1]``, 1 at this position.
-        attn_mask: float32 ``[1, 1, 1, max_seq_len]``, 0 where filled and `MASKED_SCORE` elsewhere.
-        keep_state: float32 ``[1]``, 0 on a sequence's first token to clear recurrent state.
+        inputs_embeds: ``[batch, 1, hidden]``, from the embedding table or the previous block.
+        cos, sin: rotary terms for each row's position, ``[batch, 1, rotary_dim]``.
+        write_mask: float32 ``[batch, 1, max_seq_len, 1]``, 1 at the row's position.
+        attn_mask: float32 ``[batch, 1, 1, max_seq_len]``, 0 where filled and `MASKED_SCORE` elsewhere.
+        keep_state: float32 ``[batch]``, 0 on a sequence's first token to clear recurrent state.
     """
 
     def __init__(
@@ -260,12 +266,14 @@ class Qwen38Step(nn.Module):
         tp_degree: int = 1,
         dtype: torch.dtype = torch.bfloat16,
         all_reduce: Callable = identity_all_reduce,
+        batch_size: int = 1,
     ):
         super().__init__()
         cfg.validate_tp(tp_degree)
         self.cfg = cfg
         self.layers = nn.ModuleList(
-            DecoderLayer(cfg, layer_type, tp_degree, max_seq_len, dtype, all_reduce) for layer_type in cfg.layer_types
+            DecoderLayer(cfg, layer_type, tp_degree, max_seq_len, dtype, all_reduce, batch_size)
+            for layer_type in cfg.layer_types
         )
 
     def forward(self, inputs_embeds, cos, sin, write_mask, attn_mask, keep_state):

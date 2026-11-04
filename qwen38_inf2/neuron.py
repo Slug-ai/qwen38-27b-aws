@@ -10,7 +10,7 @@ from neuronx_distributed.trace.nxd_model import NxDModel
 
 from . import checkpoint
 from .config import TextConfig
-from .generate import BlockChain, step_inputs
+from .generate import BlockChain, batch_step_inputs
 from .model import Qwen38Step
 
 DTYPE = torch.bfloat16
@@ -19,10 +19,10 @@ MODEL_FILE = "nxd_model.pt"
 DEFAULT_COMPILER_ARGS = "--enable-saturate-infinity --auto-cast=none --model-type=transformer -O1"
 
 
-def example_inputs(cfg: TextConfig, max_seq_len: int) -> dict[str, torch.Tensor]:
+def example_inputs(cfg: TextConfig, max_seq_len: int, batch_size: int = 1) -> dict[str, torch.Tensor]:
     return {
-        "inputs_embeds": torch.zeros(1, 1, cfg.hidden_size, dtype=DTYPE),
-        **step_inputs(cfg, 0, max_seq_len, DTYPE),
+        "inputs_embeds": torch.zeros(batch_size, 1, cfg.hidden_size, dtype=DTYPE),
+        **batch_step_inputs(cfg, [0] * batch_size, max_seq_len, DTYPE),
     }
 
 
@@ -69,15 +69,21 @@ def build(
     extra_compiler_args: str = "",
     workdir: str | Path | None = None,
     optimize_layout: bool = False,
+    batch_size: int = 1,
 ) -> Path:
-    """Compile the single-token graph for the layers in `cfg`."""
+    """Compile the one-token-per-row graph for the layers in `cfg`."""
     return compile_graph(
         lambda: Qwen38Step(
-            cfg, max_seq_len, tp_degree=tp_degree, dtype=DTYPE, all_reduce=reduce_from_tensor_model_parallel_region
+            cfg,
+            max_seq_len,
+            tp_degree=tp_degree,
+            dtype=DTYPE,
+            all_reduce=reduce_from_tensor_model_parallel_region,
+            batch_size=batch_size,
         ),
-        example_inputs(cfg, max_seq_len),
+        example_inputs(cfg, max_seq_len, batch_size),
         output_dir,
-        {"max_seq_len": max_seq_len, "layers": cfg.num_hidden_layers},
+        {"max_seq_len": max_seq_len, "layers": cfg.num_hidden_layers, "batch_size": batch_size},
         tp_degree,
         target,
         extra_compiler_args,

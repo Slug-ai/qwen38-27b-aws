@@ -9,7 +9,7 @@ import torch
 from qwen38_inf2 import checkpoint
 from qwen38_inf2.config import tiny_config
 from qwen38_inf2.cpu_sim import SimulatedCoresStep, ThreadedAllReduce
-from qwen38_inf2.generate import BlockChain, HostHead, greedy_generate, step_inputs
+from qwen38_inf2.generate import BlockChain, HostHead, batched_greedy_generate, greedy_generate, step_inputs
 from qwen38_inf2.model import Qwen38Step
 
 from .reference import build_reference
@@ -187,6 +187,57 @@ def test_simulated_cores_from_weight_files_match_hf_generate(tmp_path):
             input_ids=ids, attention_mask=torch.ones_like(ids), max_new_tokens=12, do_sample=False,
             top_k=None, top_p=None, temperature=None, pad_token_id=0, eos_token_id=None,
         )[0, len(PROMPT):].tolist()
+    assert got == want
+
+
+def test_batch_rows_match_separate_runs_and_refill_cleanly():
+    """Rows at different positions must not affect each other, including a row reused for a new prompt."""
+    cfg = tiny_config()
+    _, tensors = build_reference(cfg)
+    head = host_head(tensors)
+    dtype = torch.float32
+    prompts = [PROMPT, [9, 9, 9, 1, 2], [4], PROMPT[::-1], [77, 78, 79]]
+    new_tokens = [6, 9, 3, 7, 5]
+
+    single = load_model(tensors, cfg, dtype)
+    with torch.no_grad():
+        want = {
+            i: list(greedy_generate(single, head, cfg, prompt, new_tokens[i], MAX_SEQ_LEN, dtype=dtype))
+            for i, prompt in enumerate(prompts)
+        }
+
+        batch_size = 2
+        model = Qwen38Step(cfg, MAX_SEQ_LEN, dtype=dtype, batch_size=batch_size).eval()
+        weights = checkpoint.rank_weights(checkpoint.DictSource(tensors), cfg, 0, 1, dtype)
+        model.load_state_dict(weights, strict=False)
+
+        got = {i: [] for i in range(len(prompts))}
+        # A stop token per prompt isn't available here, so every row runs to the longest count and is compared up to its own.
+        for index, token_id in batched_greedy_generate(model, head, cfg, prompts, batch_size, max(new_tokens), MAX_SEQ_LEN, dtype=dtype):
+            got[index].append(token_id)
+
+    for i, tokens in want.items():
+        assert got[i][: len(tokens)] == tokens
+
+
+def test_batched_graph_matches_two_simulated_cores(tmp_path):
+    """The batched path through per-core files, chained blocks and the two-core sum."""
+    cfg = tiny_config(num_blocks=3)
+    _, tensors = build_reference(cfg)
+    source = checkpoint.DictSource(tensors)
+    checkpoint.write_rank_weights(source, cfg, tmp_path, 4, 2)
+    dtype = torch.float32
+    head = host_head(tensors)
+    prompts = [PROMPT, [9, 9, 9, 1, 2], [4]]
+
+    one = SimulatedCoresStep(tmp_path, cfg, {"layers": 4, "tp_degree": 2, "max_seq_len": MAX_SEQ_LEN}, dtype)
+    want = {i: list(greedy_generate(one, head, cfg, p, 6, MAX_SEQ_LEN, dtype=dtype)) for i, p in enumerate(prompts)}
+
+    info = {"layers": 4, "tp_degree": 2, "max_seq_len": MAX_SEQ_LEN, "batch_size": 3}
+    batched = SimulatedCoresStep(tmp_path, cfg, info, dtype)
+    got = {i: [] for i in range(len(prompts))}
+    for index, token_id in batched_greedy_generate(batched, head, cfg, prompts, 3, 6, MAX_SEQ_LEN, dtype=dtype):
+        got[index].append(token_id)
     assert got == want
 
 

@@ -55,7 +55,7 @@ class SimulatedCoresStep:
             blocks = []
             for block in range(num_blocks):
                 model = Qwen38Step(
-                    block_cfg, build_info["max_seq_len"], tp_degree, dtype, self.reducer.bind(rank)
+                    block_cfg, build_info["max_seq_len"], tp_degree, dtype, self.reducer.bind(rank), build_info.get("batch_size", 1)
                 ).eval()
                 weights = checkpoint.load_rank_block(weights_dir, block, rank, block_layers)
                 # Packed FP4 and its scales stay as stored. The rest takes the model's dtype.
