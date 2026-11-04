@@ -5,9 +5,11 @@ from dataclasses import replace
 
 import pytest
 import torch
+from safetensors.torch import save_file
 
 from qwen38_inf2 import checkpoint
 from qwen38_inf2.config import tiny_config
+from qwen38_inf2.cpu_sim import SimulatedCoresStep, ThreadedAllReduce
 from qwen38_inf2.generate import BlockChain, HostHead, greedy_generate, step_inputs
 from qwen38_inf2.model import Qwen38Step
 
@@ -135,30 +137,6 @@ def test_block_weights_reject_a_non_repeating_layout():
         checkpoint.block_weights(checkpoint.DictSource(tensors), cfg, 1, 2, 0, 1)  # layers 2, 3 are linear, full
 
 
-class ThreadedAllReduce:
-    """Two ranks running in lock-step threads, summing tensors like the real collective."""
-
-    def __init__(self, world_size):
-        self.world_size = world_size
-        self.barrier = threading.Barrier(world_size, action=self._finish)
-        self.values = {}
-        self.result = None
-        self.rank_of = {}
-        self.count = 0
-
-    def _finish(self):
-        self.result = sum(self.values.values())
-        self.values = {}
-        self.count += 1
-
-    def bind(self, rank):
-        def all_reduce(x):
-            self.values[rank] = x
-            self.barrier.wait()
-            return self.result
-        return all_reduce
-
-
 @pytest.mark.parametrize("tp_degree", [2])
 def test_tensor_parallel_ranks_match_single_rank(tp_degree):
     cfg = tiny_config()
@@ -190,6 +168,30 @@ def test_tensor_parallel_ranks_match_single_rank(tp_degree):
     for rank in range(tp_degree):
         for got, expected in zip(results[rank], want):
             assert (got - expected).abs().max() < 1e-5
+
+
+def test_simulated_cores_from_weight_files_match_hf_generate(tmp_path):
+    """The whole offline path: per-core files on disk, chained blocks, two threads, greedy loop."""
+    cfg = tiny_config(num_blocks=3)
+    reference, tensors = build_reference(cfg)
+    source = checkpoint.DictSource(tensors)
+    block_layers, tp_degree = 4, 2
+    for block in range(cfg.num_hidden_layers // block_layers):
+        for rank in range(tp_degree):
+            weights = checkpoint.block_weights(source, cfg, block, block_layers, rank, tp_degree)
+            save_file({k: v.contiguous() for k, v in weights.items()}, checkpoint.shard_path(tmp_path, block, rank))
+    info = {"layers": block_layers, "tp_degree": tp_degree, "max_seq_len": MAX_SEQ_LEN}
+
+    step = SimulatedCoresStep(tmp_path, cfg, info, torch.float32)
+    got = list(greedy_generate(step, host_head(tensors), cfg, PROMPT, 12, MAX_SEQ_LEN, dtype=torch.float32))
+
+    with torch.no_grad():
+        ids = torch.tensor([PROMPT])
+        want = reference.generate(
+            input_ids=ids, attention_mask=torch.ones_like(ids), max_new_tokens=12, do_sample=False,
+            top_k=None, top_p=None, temperature=None, pad_token_id=0, eos_token_id=None,
+        )[0, len(PROMPT):].tolist()
+    assert got == want
 
 
 def test_all_text_tensors_are_consumed():

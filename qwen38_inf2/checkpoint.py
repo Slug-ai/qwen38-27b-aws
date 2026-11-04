@@ -18,6 +18,7 @@ import torch
 from . import fp4
 from .config import FULL, LINEAR, TextConfig
 
+BUILD_INFO_FILE = "build_info.json"
 TEXT_PREFIX = "model.language_model."
 LM_HEAD = "lm_head.weight"
 EMBED_TOKENS = TEXT_PREFIX + "embed_tokens.weight"
@@ -236,6 +237,14 @@ class RecordingSource:
     def get(self, name: str) -> torch.Tensor:
         self.read.add(name)
         return self.source.get(name)
+
+
+def shard_path(weights_dir: str | Path, block: int, rank: int) -> Path:
+    return Path(weights_dir) / f"block{block:02d}_tp{rank}.safetensors"
+
+
+def read_build_info(model_dir: str | Path) -> dict:
+    return json.loads((Path(model_dir) / BUILD_INFO_FILE).read_text())
 
 
 class ShapeSource:

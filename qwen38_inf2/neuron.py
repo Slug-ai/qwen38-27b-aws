@@ -16,7 +16,6 @@ from .model import Qwen38Step
 
 DTYPE = torch.bfloat16
 MODEL_FILE = "nxd_model.pt"
-BUILD_INFO_FILE = "build_info.json"
 # NxD's defaults plus an explicit target. Inf2 shares NeuronCore-v2 codegen with Trn1.
 DEFAULT_COMPILER_ARGS = "--enable-saturate-infinity --auto-cast=none --model-type=transformer -O1"
 
@@ -55,16 +54,8 @@ def build(
     path = output_dir / MODEL_FILE
     nxd_model.save(str(path))
     info = {"max_seq_len": max_seq_len, "tp_degree": tp_degree, "target": target, "layers": cfg.num_hidden_layers}
-    (output_dir / BUILD_INFO_FILE).write_text(json.dumps(info, indent=2))
+    (output_dir / checkpoint.BUILD_INFO_FILE).write_text(json.dumps(info, indent=2))
     return path
-
-
-def read_build_info(model_dir: str | Path) -> dict:
-    return json.loads((Path(model_dir) / BUILD_INFO_FILE).read_text())
-
-
-def shard_path(weights_dir: str | Path, block: int, rank: int) -> Path:
-    return Path(weights_dir) / f"block{block:02d}_tp{rank}.safetensors"
 
 
 def write_rank_weights(source, cfg: TextConfig, weights_dir: str | Path, block_layers: int, tp_degree: int = 2) -> None:
@@ -73,18 +64,18 @@ def write_rank_weights(source, cfg: TextConfig, weights_dir: str | Path, block_l
     for block in range(cfg.num_hidden_layers // block_layers):
         for rank in range(tp_degree):
             weights = checkpoint.block_weights(source, cfg, block, block_layers, rank, tp_degree, DTYPE)
-            save_file({k: v.contiguous() for k, v in weights.items()}, shard_path(weights_dir, block, rank))
+            save_file({k: v.contiguous() for k, v in weights.items()}, checkpoint.shard_path(weights_dir, block, rank))
 
 
 class NeuronStep(BlockChain):
     """The compiled block, loaded once per repeat with that repeat's weights and its own caches."""
 
     def __init__(self, model_dir: str | Path, weights_dir: str | Path, cfg: TextConfig):
-        info = read_build_info(model_dir)
+        info = checkpoint.read_build_info(model_dir)
         blocks = []
         for block in range(cfg.num_hidden_layers // info["layers"]):
             model = NxDModel.load(str(Path(model_dir) / MODEL_FILE))
-            model.set_weights([load_file(shard_path(weights_dir, block, rank)) for rank in range(info["tp_degree"])])
+            model.set_weights([load_file(checkpoint.shard_path(weights_dir, block, rank)) for rank in range(info["tp_degree"])])
             model.to_neuron()
             blocks.append(_named_call(model))
         super().__init__(blocks)
