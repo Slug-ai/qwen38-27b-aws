@@ -75,9 +75,11 @@ def test_decode_passes_when_exact_and_fails_on_a_single_wrong_value():
 
 def test_decode_probe_covers_every_byte_and_nibble_order():
     weights, expected = probes.decode_probe_data()
-    assert sorted(weights["weight_packed"].flatten().tolist()) == list(range(256))
+    # Both zeros share one code, so the 16 nibbles give 15 codes and 15 * 15 distinct bytes.
+    assert len(set(weights["weight_packed"].flatten().tolist())) == 225
     assert len(set(weights["weight_scale"].float().flatten().tolist())) > 8
-    assert torch.equal(fp4.decode_in_graph(weights["weight_packed"], weights["weight_scale"]), expected)
+    even, odd = fp4.decode_planes(weights["weight_packed"], weights["weight_scale"])
+    assert torch.equal(even, expected[:, ::2]) and torch.equal(odd, expected[:, 1::2])
 
 
 def test_tokens_pass_on_healthy_results(token_golden):

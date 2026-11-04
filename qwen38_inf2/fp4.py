@@ -10,13 +10,19 @@ Checkpoint format, as written by compressed-tensors `mxfp4-pack-quantized`:
   ``[0, 0.5, 1, 1.5, 2, 3, 4, 6]``.
 
 NeuronCore-v2 has no FP4 type (native MX compute is Trn3 only), and 27B parameters at BF16 do not
-fit on one 32 GB Inf2 chip. So weights stay packed on the device and `decode_in_graph` expands them
+fit on one 32 GB Inf2 chip. So weights stay packed on the device and `decode_planes` expands them
 to BF16 inside the compiled graph.
 
-`decode_in_graph` deliberately uses only float add, multiply, floor and clamp. It needs no integer
-ops and no gather, so it does not depend on those lowering well for this target. Every intermediate
-has at most 8 significant bits, which BF16 represents exactly, so the result is exact.
+Decoding is most of the time per step on a chip, so `decode_planes` is built for speed. Weights are
+rewritten once, by `to_sign_free`, so a nibble needs no sign handling. Nibbles are split with a shift and
+a mask, because that is far faster than floor on this chip, and the even and odd columns stay in separate
+matrices, because interleaving them costs time. Every intermediate has at most 8 significant bits, which
+BF16 represents exactly, so the result is exact.
+
+`decode_in_graph` is the slower decode of the checkpoint's own encoding, kept as a reference.
 """
+
+import math
 
 import torch
 
@@ -64,6 +70,69 @@ def decode_in_graph(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     groups = scale.shape[1]
     group_scale = scale.unsqueeze(-1).expand(rows, groups, GROUP_SIZE).reshape(rows, groups * GROUP_SIZE)
     return value * group_scale
+
+
+def to_sign_free(packed: torch.Tensor) -> torch.Tensor:
+    """Rewrite each nibble as a code from 0 to 14, for values -6 to 6. Run once when weights are prepared.
+
+    Negative zero becomes zero, which changes nothing in a matmul.
+    """
+    return _sign_free_nibble(packed & 15) | (_sign_free_nibble(packed >> 4) << 4)
+
+
+def _sign_free_nibble(nibble: torch.Tensor) -> torch.Tensor:
+    return torch.where(nibble < 8, nibble + 7, 15 - nibble)
+
+
+def _code_to_value(code: torch.Tensor) -> torch.Tensor:
+    v = code - 7.0
+    outer = v - torch.clamp(v, -4.0, 4.0)
+    return 0.5 * (v + outer) + (outer - torch.clamp(outer, -2.0, 2.0))
+
+
+def decode_planes(packed: torch.Tensor, scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expand `to_sign_free` bytes to BF16, returning the even and the odd columns as separate matrices."""
+    rows, groups = scale.shape
+    half = GROUP_SIZE // 2
+    plane_scale = scale.unsqueeze(-1).expand(rows, groups, half).reshape(rows, groups * half)
+    even = _code_to_value((packed & 15).to(torch.bfloat16)) * plane_scale
+    odd = _code_to_value((packed >> 4).to(torch.bfloat16)) * plane_scale
+    return even, odd
+
+
+def _fp8_e5m2_byte(value: float) -> int:
+    """FP8 e5m2 byte for a value: 1 sign bit, 5 exponent bits with bias 15, 2 mantissa bits, rounded to nearest."""
+    sign = 0x80 if value < 0 else 0
+    magnitude = abs(value)
+    if magnitude == 0:
+        return 0
+    exponent = math.floor(math.log2(magnitude))
+    if exponent < -14:
+        return sign | round(magnitude / 2.0**-16)  # subnormal, in steps of 2**-16
+    mantissa = round((magnitude / 2.0**exponent - 1.0) * 4)
+    if mantissa == 4:
+        exponent, mantissa = exponent + 1, 0
+    return sign | ((exponent + 15) << 2) | mantissa
+
+
+def to_fp8(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Expand checkpoint bytes and exponents to one FP8 e5m2 byte per element, ``[rows, cols]``. Run on the host.
+
+    FP8 holds a value with 1 mantissa bit exactly. In the real checkpoint that covers all but 0.0003% of
+    scale groups, and the rest hold weights under 1e-4 that round to the nearest step of 2**-16.
+    """
+    table = torch.tensor(
+        [
+            [_fp8_e5m2_byte(sign * magnitude * 2.0 ** (byte - E8M0_BIAS)) for sign in (1, -1) for magnitude in E2M1_MAGNITUDES]
+            for byte in range(E8M0_BIAS + 1)  # The checkpoint's largest scale is 1. A larger one fails loudly below.
+        ],
+        dtype=torch.uint8,
+    )
+    rows, half_cols = packed.shape
+    groups = scale.shape[1]
+    expanded = scale.long().unsqueeze(-1).expand(rows, groups, GROUP_SIZE).reshape(rows, groups * GROUP_SIZE)
+    nibbles = torch.stack((packed & 15, packed >> 4), dim=-1).reshape(rows, half_cols * 2).long()
+    return table[expanded, nibbles]
 
 
 def encode_host(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

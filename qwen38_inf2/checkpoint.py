@@ -150,7 +150,7 @@ def _qkv_rows(t: torch.Tensor, cfg: TextConfig, rank: int, tp_degree: int) -> to
 def _fp4_weights(source, hf_name: str, name: str, cut) -> dict[str, torch.Tensor]:
     """Cut one FP4 matrix. Scale bytes become BF16 here so the device never computes 2**e."""
     return {
-        f"{name}.weight_packed": cut(source.get(f"{hf_name}.weight_packed")),
+        f"{name}.weight_packed": fp4.to_sign_free(cut(source.get(f"{hf_name}.weight_packed"))),
         f"{name}.weight_scale": fp4.scale_to_float(cut(source.get(f"{hf_name}.weight_scale"))),
     }
 

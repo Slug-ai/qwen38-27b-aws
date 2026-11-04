@@ -72,7 +72,7 @@ def inspect(workdir: Path, cfg: TextConfig) -> tuple[dict, list[str]]:
     got = {
         "states": len(aliased),
         "all_reduce": ops.get("all-reduce", 0),
-        "fp4_matrices": ops.get("floor", 0),
+        "fp4_matrices": ops.get("and", 0),  # one nibble mask per FP4 matrix
     }
     problems = [f"{name}: expected {want[name]}, found {got[name]}" for name in want if want[name] != got[name]]
     not_cache = sorted(k for k in aliased if not k.endswith(STATE_SUFFIXES))

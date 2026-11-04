@@ -70,7 +70,7 @@ def run_level(level, args, cfg, backend, state):
     if level == "decode":
         golden = load_file(golden_dir / "decode.safetensors")
         expected = {"expected": golden["expected"]}
-        weights = {name: golden[name] for name in ("weight_packed", "weight_scale")}
+        weights, _ = probes.decode_probe_data()
         return chip_check.check_decode(backend.decode(weights), expected)
     if level == "matrix":
         golden = load_file(golden_dir / "matrix.safetensors")

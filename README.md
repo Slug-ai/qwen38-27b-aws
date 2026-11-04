@@ -2,11 +2,11 @@
 
 Runs the text part of [RedHatAI/Qwen3.8-27B-MXFP4](https://huggingface.co/RedHatAI/Qwen3.8-27B-MXFP4) on one AWS Inferentia2 chip (two NeuronCores) with FP4 weights and greedy decoding.
 
-**Status: not yet run on a chip.** Everything below "On the instance" is untested until we have AWS access. See [What has been checked](#what-has-been-checked).
+**Status: runs end to end on a real `inf2.xlarge`.** Currently 5.78 generated tokens/s at batch 32, measured. See [the throughput log](docs/throughput.md) and [the field notes](docs/field_notes.md), which cover setup on the Amazon Linux Neuron AMI.
 
 ## How it works
 
-- **FP4 on a chip without FP4.** NeuronCore-v2 has no FP4 type (native MX compute is Trn3 only). Weights stay packed on the device and the graph expands them to BF16 for each matmul, using only float add, multiply, floor and clamp. This is what makes the model fit:
+- **FP4 on a chip without FP4.** NeuronCore-v2 has no FP4 type (native MX compute is Trn3 only). Weights stay packed on the device and the graph expands them to BF16 for each matmul. This is what makes the model fit, and it's also most of the time per step:
 
   | | Per NeuronCore (16 GB available) |
   |---|---|
@@ -24,7 +24,7 @@ Runs the text part of [RedHatAI/Qwen3.8-27B-MXFP4](https://huggingface.co/RedHat
 
 ### Differences from the checkpoint's intended serving
 
-Only the weights are FP4. Activations and the KV cache run at BF16, while the checkpoint was calibrated for FP4 activations and an FP8 cache. This should be at least as accurate, but it has not been measured. Throughput is unknown until it runs on a chip, and only batch size 1 is supported.
+Only the weights are FP4. Activations and the KV cache run at BF16, while the checkpoint was calibrated for FP4 activations and an FP8 cache. This should be at least as accurate, but it has not been measured.
 
 ## Compile (no chip needed)
 
@@ -199,6 +199,6 @@ PYTHONPATH=. .venv/bin/python scripts/verify_real_weights.py
 | Compiled graph structure | All caches persist as device state, all collectives present, every FP4 matrix decoded, no custom calls |
 | Chip check script end to end on CPU, real weights, `model`, `greedy` and `speed` levels | All three pass. CPU results compared with themselves, so this only shows the script runs |
 
-**Not checked, because these need a chip:** whether the compiled graph computes the right values, whether 16 loaded copies of the block run together, weight loading and host RAM use on an instance, throughput, and the install steps above.
+**On a real chip:** every level of `scripts/chip_check.py` passes on batch-1 graphs, and each row of [the throughput log](docs/throughput.md) runs real batches with a correctness check. The `chip_check.py` levels haven't been rerun since the decode changed, and they take batch-1 graphs. The Ubuntu install steps above are untested, since the instance used Amazon Linux.
 
 The NKI simulator can't help here, because it runs NKI kernels and not compiled graphs. This repo doesn't use NKI so far. A kernel is the likely next step if in-graph FP4 decode turns out to be too slow.

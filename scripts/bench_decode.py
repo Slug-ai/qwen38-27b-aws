@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Compile and time FP4 decode variants on a real matrix, on one NeuronCore.
 
-Decoding is most of the time per step, so these numbers decide which decode the model uses. Each variant
-returns F.linear of the same matrix, and the output must match the current decode.
+Decoding is most of the time per step, so these numbers decide which decode the model uses. This is the
+fastest test there is, at under a minute for each variant. Each variant does the same matmul, and its output
+must match the current decode. Results so far on a real matrix: floor and interleave, 3.59 G values/s. Split
+without interleave, 3.70. Shift and mask, 5.97. Sign-free codes as well, 7.87. Table lookups, 3.7 to 4.2.
+-O2 changes nothing.
 """
 
 import argparse
@@ -14,137 +17,58 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from qwen38_inf2 import fp4, probes
+from qwen38_inf2 import checkpoint, fp4, probes
 from qwen38_inf2.neuron import DTYPE, compile_graph, load_graph
 
 ROWS, COLS = probes.MATRIX_OUT_FEATURES, probes.MATRIX_IN_FEATURES
 
 
-def _frozen(*shape, dtype):
-    return nn.Parameter(torch.zeros(*shape, dtype=dtype), requires_grad=False)
+class Planes(probes.FP4Linear):
+    """The decode the model uses today. New candidates go next to this one and must beat it."""
 
 
-class Base(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.weight_packed = _frozen(ROWS, COLS // 2, dtype=torch.uint8)
-        self.weight_scale = _frozen(ROWS, COLS // fp4.GROUP_SIZE, dtype=torch.bfloat16)
+class NoDivide(probes.FP4Linear):
+    """`packed >> 4` lowers to an integer divide, so mask the high nibble and scale it in float."""
 
-    def half_scale(self):
+    def forward(self, x):
         rows, groups = self.weight_scale.shape
         half = fp4.GROUP_SIZE // 2
-        return self.weight_scale.unsqueeze(-1).expand(rows, groups, half).reshape(rows, groups * half)
+        scale = self.weight_scale.unsqueeze(-1).expand(rows, groups, half).reshape(rows, groups * half)
+        even = fp4._code_to_value((self.weight_packed & 15).to(torch.bfloat16)) * scale
+        odd = fp4._code_to_value((self.weight_packed & 240).to(torch.bfloat16) * 0.0625) * scale
+        return F.linear(x[..., ::2], even) + F.linear(x[..., 1::2], odd)
 
 
-def magnitude(mag):
-    return 0.5 * (mag + torch.clamp(mag - 4.0, 0.0, 3.0)) + torch.clamp(mag - 6.0, 0.0, 1.0)
+class Fp8Direct(nn.Module):
+    """No decode at all: weights live in memory as FP8 and go straight to the Tensor Engine."""
 
-
-def signed(nibble):
-    sign_bit = torch.clamp(nibble - 7.0, 0.0, 1.0)
-    return magnitude(nibble - 8.0 * sign_bit) * (1.0 - 2.0 * sign_bit)
-
-
-class Current(Base):
-    """What the model uses today: split, interleave, then decode."""
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.weight_fp8 = nn.Parameter(torch.zeros(in_features, out_features, dtype=torch.uint8), requires_grad=False)
 
     def forward(self, x):
-        return F.linear(x, fp4.decode_in_graph(self.weight_packed, self.weight_scale).to(x.dtype))
+        from qwen38_inf2.kernels import fp8_linear
+
+        batch = x.shape[0]
+        return fp8_linear(x.reshape(batch, -1).transpose(0, 1), self.weight_fp8).unsqueeze(1)
 
 
-class Split(Base):
-    """Even and odd columns stay separate, so there is no interleave, and the matmul is done in two halves."""
-
-    def forward(self, x):
-        byte = self.weight_packed.to(torch.bfloat16)
-        high = torch.floor(byte / 16.0)
-        low = byte - high * 16.0
-        scale = self.half_scale()
-        return F.linear(x[..., ::2], signed(low) * scale) + F.linear(x[..., 1::2], signed(high) * scale)
+VARIANTS = {"planes": Planes, "no_divide": NoDivide, "fp8_direct": Fp8Direct}
 
 
-class SplitBits(Base):
-    """As Split, separating nibbles with integer shift and mask rather than floor."""
-
-    def forward(self, x):
-        low = (self.weight_packed & 15).to(torch.bfloat16)
-        high = (self.weight_packed >> 4).to(torch.bfloat16)
-        scale = self.half_scale()
-        return F.linear(x[..., ::2], signed(low) * scale) + F.linear(x[..., 1::2], signed(high) * scale)
-
-
-class Reencoded(Base):
-    """As Split, with bytes rewritten when weights are prepared so a nibble is sign-free: value code v = n - 7."""
-
-    def forward(self, x):
-        byte = self.weight_packed.to(torch.bfloat16)
-        high = torch.floor(byte / 16.0)
-        low = byte - high * 16.0
-        scale = self.half_scale()
-        return F.linear(x[..., ::2], odd_value(low - 7.0) * scale) + F.linear(x[..., 1::2], odd_value(high - 7.0) * scale)
-
-
-def odd_value(v):
-    outer = v - torch.clamp(v, -4.0, 4.0)
-    return 0.5 * (v + outer) + (outer - torch.clamp(outer, -2.0, 2.0))
-
-
-def reencode(packed):
-    """Map each nibble n to a sign-free code, where -6 to 6 become 0 to 14. Negative zero becomes zero."""
-    table = torch.tensor([7, 8, 9, 10, 11, 12, 13, 14, 7, 6, 5, 4, 3, 2, 1, 0], dtype=torch.uint8)
-    return table[(packed & 15).long()] | (table[(packed >> 4).long()] << 4)
-
-
-class ReencodedBits(Base):
-    """Sign-free codes, separated with shift and mask."""
-
-    def forward(self, x):
-        low = (self.weight_packed & 15).to(torch.bfloat16)
-        high = (self.weight_packed >> 4).to(torch.bfloat16)
-        scale = self.half_scale()
-        return F.linear(x[..., ::2], odd_value(low - 7.0) * scale) + F.linear(x[..., 1::2], odd_value(high - 7.0) * scale)
-
-
-NIBBLE_VALUES = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
-
-
-class GatherNibble(Base):
-    """A 16-entry table lookup for each nibble."""
-
-    def forward(self, x):
-        table = torch.tensor(NIBBLE_VALUES, dtype=torch.bfloat16, device=x.device)
-        scale = self.half_scale()
-        low = table[(self.weight_packed & 15).int()]
-        high = table[(self.weight_packed >> 4).int()]
-        return F.linear(x[..., ::2], low * scale) + F.linear(x[..., 1::2], high * scale)
-
-
-class GatherByte(Base):
-    """Two 256-entry table lookups on the byte, with no shift, mask or arithmetic."""
-
-    def forward(self, x):
-        low_table = torch.tensor([NIBBLE_VALUES[b & 15] for b in range(256)], dtype=torch.bfloat16, device=x.device)
-        high_table = torch.tensor([NIBBLE_VALUES[b >> 4] for b in range(256)], dtype=torch.bfloat16, device=x.device)
-        scale = self.half_scale()
-        index = self.weight_packed.int()
-        return F.linear(x[..., ::2], low_table[index] * scale) + F.linear(x[..., 1::2], high_table[index] * scale)
-
-
-VARIANTS = {
-    "current": Current,
-    "split": Split,
-    "split_bits": SplitBits,
-    "reencoded": Reencoded,
-    "reencoded_bits": ReencodedBits,
-    "gather_nibble": GatherNibble,
-    "gather_byte": GatherByte,
-}
-REENCODED = {"reencoded", "reencoded_bits"}
+def fp8_weights(model_dir: str) -> dict[str, torch.Tensor]:
+    """The probe matrix as FP8, from the checkpoint's own bytes, in the layout the kernel reads."""
+    source = checkpoint.TensorSource(f"{model_dir}/model.safetensors")
+    name = f"{checkpoint.TEXT_PREFIX}{probes.MATRIX_NAME}"
+    packed = source.get(f"{name}.weight_packed")[:ROWS]
+    scale = source.get(f"{name}.weight_scale")[:ROWS]
+    return {"weight_fp8": fp4.to_fp8(packed, scale).transpose(0, 1).clone()}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--weights", default="weights")
+    parser.add_argument("--model-dir", default="model")
     parser.add_argument("--output", type=Path, default=Path("artifacts/bench"))
     parser.add_argument("--variants", nargs="+", default=list(VARIANTS), choices=list(VARIANTS))
     parser.add_argument("--compiler-args", default="")
@@ -153,16 +77,19 @@ def main():
     parser.add_argument("--run-only", action="store_true")
     args = parser.parse_args()
 
-    weights = probes.matrix_probe_weights(args.weights)
-    x = torch.linspace(-1, 1, COLS).reshape(1, 1, COLS).to(DTYPE)
-    expected = F.linear(x.float(), fp4.decode_in_graph(weights["weight_packed"], weights["weight_scale"]).float())
+    weights, x, expected = None, None, None
+    if not args.compile_only:
+        weights = probes.matrix_probe_weights(args.weights)
+        x = torch.linspace(-1, 1, COLS).reshape(1, 1, COLS).to(DTYPE)
+        even, odd = fp4.decode_planes(weights["weight_packed"], weights["weight_scale"])
+        expected = F.linear(x[..., ::2].float(), even.float()) + F.linear(x[..., 1::2].float(), odd.float())
 
     for name in args.variants:
         directory = args.output / f"{name}{args.tag}"
         if not args.run_only:
             started = time.time()
             compile_graph(
-                VARIANTS[name],
+                lambda variant=VARIANTS[name]: variant(COLS, ROWS),
                 {"x": torch.zeros(1, 1, COLS, dtype=DTYPE)},
                 directory,
                 {},
@@ -173,10 +100,7 @@ def main():
             print(f"{name}: compiled in {time.time() - started:.0f}s", flush=True)
         if args.compile_only:
             continue
-        data = dict(weights)
-        if name in REENCODED:
-            data["weight_packed"] = reencode(data["weight_packed"])
-        run = load_graph(directory, [data])
+        run = load_graph(directory, [fp8_weights(args.model_dir)] if name == "fp8_direct" else [weights])
         times = []
         for _ in range(14):
             started = time.perf_counter()

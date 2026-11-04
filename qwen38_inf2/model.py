@@ -85,7 +85,8 @@ class FP4Linear(nn.Module):
         self.weight_scale = _frozen(out_features, in_features // fp4.GROUP_SIZE, dtype=torch.bfloat16)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, fp4.decode_in_graph(self.weight_packed, self.weight_scale).to(x.dtype))
+        even, odd = fp4.decode_planes(self.weight_packed, self.weight_scale)
+        return F.linear(x[..., ::2], even.to(x.dtype)) + F.linear(x[..., 1::2], odd.to(x.dtype))
 
 
 class MLP(nn.Module):

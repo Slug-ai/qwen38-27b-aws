@@ -26,7 +26,8 @@ class DecodeProbe(nn.Module):
         self.weight_scale = nn.Parameter(torch.zeros(DECODE_ROWS, DECODE_GROUPS, dtype=torch.bfloat16), requires_grad=False)
 
     def forward(self, gain: torch.Tensor) -> torch.Tensor:
-        return fp4.decode_in_graph(self.weight_packed, self.weight_scale) * gain
+        even, odd = fp4.decode_planes(self.weight_packed, self.weight_scale)
+        return torch.stack((even, odd), dim=-1).reshape(even.shape[0], -1) * gain
 
 
 def decode_probe_data() -> tuple[dict[str, torch.Tensor], torch.Tensor]:
@@ -34,7 +35,7 @@ def decode_probe_data() -> tuple[dict[str, torch.Tensor], torch.Tensor]:
     packed = torch.arange(256, dtype=torch.uint8).reshape(DECODE_ROWS, -1)
     # The real checkpoint's scales seen so far span bytes 117 to 122. Go well past that on both sides.
     exponents = torch.linspace(90, 150, DECODE_ROWS * DECODE_GROUPS).to(torch.uint8).reshape(DECODE_ROWS, DECODE_GROUPS)
-    weights = {"weight_packed": packed, "weight_scale": fp4.scale_to_float(exponents)}
+    weights = {"weight_packed": fp4.to_sign_free(packed), "weight_scale": fp4.scale_to_float(exponents)}
     return weights, fp4.decode_host(packed, exponents)
 
 

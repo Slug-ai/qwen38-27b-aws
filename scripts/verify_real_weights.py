@@ -51,8 +51,8 @@ def memoize_fp4_decode(layer: torch.nn.Module) -> None:
     """Decode each matrix once with the in-graph decoder. Re-decoding per token would be wasted CPU time."""
     for module in layer.modules():
         if isinstance(module, FP4Linear):
-            weight = fp4.decode_in_graph(module.weight_packed, module.weight_scale).to(DTYPE)
-            module.forward = lambda x, w=weight: F.linear(x, w)
+            even, odd = fp4.decode_planes(module.weight_packed, module.weight_scale)
+            module.forward = lambda x, e=even.to(DTYPE), o=odd.to(DTYPE): F.linear(x[..., ::2], e) + F.linear(x[..., 1::2], o)
 
 
 def build_layer(cfg, index, weights, max_seq_len, tp_degree=1, all_reduce=identity_all_reduce):

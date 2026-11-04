@@ -79,3 +79,6 @@ Goal: tokens per second across all sequences. Latency per token doesn't matter.
 - Batch 32 on the chip: 4.10 s per step on the chip and 0.65 s on the host, so decode really is shared. On 32 short prompts with 32 new tokens each, including prompt steps and idle rows: 2.97 generated tokens/s. All repeated prompts gave the same output across rows. Only ever quote measured throughput, from `scripts/batch_generate.py`, not a figure projected from one step.
 - Separating nibbles with shift and mask instead of `floor` raises decode from 3.59 to 5.97 G values/s on a real matrix (`scripts/bench_decode.py`). Avoiding the interleave alone barely helps: 3.70.
 - Measured numbers live in [throughput.md](throughput.md). A short run undercounts batching if it's only one batch, because rows that finish early sit idle at the end.
+- The compiler's memory total overstates what a run needs: batch 32 with the new decode is estimated at 17.0 GB per core, and all 16 blocks load and run.
+- `packed >> 4` on uint8 compiles to an integer divide, not a shift.
+- Testing tiers: `scripts/bench_decode.py` on one real matrix takes under a minute. `scripts/batch_generate.py --screen-blocks 1` times one real block at the real batch, and isn't a throughput result. The full `scripts/batch_generate.py` run gives the number that goes in [throughput.md](throughput.md).
