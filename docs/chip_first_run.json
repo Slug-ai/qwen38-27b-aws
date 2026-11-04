@@ -1,0 +1,49 @@
+[
+  {
+    "name": "model",
+    "passed": true,
+    "details": {
+      "positions": 38,
+      "flips": []
+    },
+    "hint": ""
+  },
+  {
+    "name": "greedy",
+    "passed": true,
+    "details": {
+      "got": [
+        11751,
+        13,
+        198,
+        760,
+        6511,
+        314,
+        9564,
+        369
+      ],
+      "want": [
+        11751,
+        13,
+        198,
+        760,
+        6511,
+        314,
+        9564,
+        369
+      ]
+    },
+    "hint": ""
+  },
+  {
+    "name": "speed",
+    "passed": true,
+    "details": {
+      "first_step_seconds": 4.1314307859997825,
+      "chip_seconds_per_token": 4.131154086000151,
+      "host_seconds_per_token": 0.17668332900029782,
+      "tokens_per_second": 0.23213503752900938
+    },
+    "hint": ""
+  }
+]

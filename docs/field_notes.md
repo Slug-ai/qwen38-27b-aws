@@ -63,3 +63,7 @@ The AMI ships an older SDK than the one our graphs were compiled with:
 - A process can't run one-core and two-core graphs together. The runtime sets its world size from the first graph it loads, and a later two-core graph fails with `NRT_INVALID in nrt_load()`, `World size of neff 2 is greater than world size of global communicator 1`. Run `decode` and `matrix` separately from `layer` onward.
 - `CCOM WARN NET/OFI ... is EFA enabled?` is harmless on a single chip.
 - `prepare_weights.py` took 3 minutes.
+- All 16 blocks run end to end on `inf2.xlarge`. `model`, `greedy` and `speed` pass ([results](chip_first_run.json)): same top token as the CPU at 38 of 38 positions and the same 8 greedy tokens.
+- Real generation: `What is the capital of France? Answer in one short sentence, then name one famous landmark there.` gave `The capital of France is Paris, and one famous landmark there is the Eiffel Tower.`
+- Plain block speed: 4.13 s per token on the chip, 0.18 s on the host, 0.232 tokens/s. The pre-chip estimate of about 1.5 tokens/s was about 6 times too high.
+- Host memory peaks at about 10.4 GB of 15 GB with everything loaded, so `inf2.xlarge` is enough.
