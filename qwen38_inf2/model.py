@@ -149,10 +149,10 @@ class GatedDeltaNetStep(nn.Module):
         self.norm_weight = _frozen(cfg.linear_value_head_dim, dtype=dtype)
 
         self.register_buffer("conv_state", torch.zeros(batch_size, conv_dim, cfg.linear_conv_kernel_dim - 1, dtype=dtype))
-        # The reference keeps this in float32 regardless of model dtype.
+        self.state_dtype = {"float32": torch.float32, "bf16": torch.bfloat16}[cfg.recurrent_state_format]
         self.register_buffer(
             "recurrent_state",
-            torch.zeros(batch_size, self.num_v_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim, dtype=torch.float32),
+            torch.zeros(batch_size, self.num_v_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim, dtype=self.state_dtype),
         )
 
     def forward(self, x: torch.Tensor, keep_state: torch.Tensor) -> torch.Tensor:
@@ -182,10 +182,10 @@ class GatedDeltaNetStep(nn.Module):
         key = l2_norm(key.float())
         value = value.float()
 
-        state = self.recurrent_state * keep_state.reshape(batch, 1, 1, 1) * log_decay.exp()[..., None, None]
+        state = self.recurrent_state.float() * keep_state.reshape(batch, 1, 1, 1) * log_decay.exp()[..., None, None]
         delta = (value - (state * key.unsqueeze(-1)).sum(dim=-2)) * beta
         state = state + key.unsqueeze(-1) * delta.unsqueeze(-2)
-        self.recurrent_state = state
+        self.recurrent_state = state.to(self.state_dtype)
         out = (state * query.unsqueeze(-1)).sum(dim=-2).to(dtype)
 
         # Gated RMS norm, per value head.

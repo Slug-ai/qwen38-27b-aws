@@ -77,6 +77,23 @@ def check_saved_tokens(step, head, cfg, golden: dict, batch_size: int, max_seq_l
     return {"positions": len(golden["tokens"]), "wrong": wrong, "near_tie_flips": near_ties, "positions_where_rows_disagree": rows_disagree}
 
 
+def compare_tokens(outputs: dict, reference: dict) -> dict:
+    """How far each sequence stays identical to a reference build. One near tie changes every later token."""
+    common = [index for index in outputs if str(index) in reference]
+    prefixes = []
+    for index in common:
+        want = reference[str(index)]
+        matching = next((i for i, (a, b) in enumerate(zip(outputs[index], want)) if a != b), min(len(outputs[index]), len(want)))
+        prefixes.append(matching)
+    total = sum(len(reference[str(index)]) for index in common)
+    return {
+        "sequences": len(common),
+        "identical_sequences": sum(outputs[index] == reference[str(index)] for index in common),
+        "tokens_before_first_difference": sum(prefixes),
+        "tokens_compared": total,
+    }
+
+
 def screen(step, cfg, batch_size: int, max_seq_len: int, blocks: int, steps: int = 12) -> None:
     """A quick look at a new graph. Only part of the model runs, so its output means nothing, and it's not throughput."""
     embeds = torch.zeros(batch_size, 1, cfg.hidden_size, dtype=torch.bfloat16)
@@ -101,6 +118,8 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--golden", type=Path, default=Path("tests/golden/model.json"), help="Saved greedy result, checked in row 0.")
     parser.add_argument("--output", type=Path, help="Write the results as JSON here.")
+    parser.add_argument("--save-tokens", type=Path, help="Write every sequence's generated tokens as JSON, to compare builds.")
+    parser.add_argument("--compare-tokens", type=Path, help="Compare generated tokens with a file from --save-tokens.")
     parser.add_argument("--show", type=int, default=8, help="How many outputs to print.")
     parser.add_argument("--simulate", action="store_true", help="Run on CPU instead of a chip.")
     parser.add_argument("--screen-blocks", type=int, help="Time this many real blocks at the real batch size, then stop. Takes a minute, and gives no throughput result.")
@@ -191,6 +210,10 @@ def main():
         "saved_test_passage": saved_tokens,
         "load_seconds": load_seconds,
     }
+    if args.save_tokens:
+        args.save_tokens.write_text(json.dumps({str(index): tokens for index, tokens in outputs.items()}))
+    if args.compare_tokens:
+        results["compared_with_reference"] = compare_tokens(outputs, json.loads(args.compare_tokens.read_text()))
     print()
     print(json.dumps(results, indent=1))
     if args.output:

@@ -287,6 +287,19 @@ def test_chip_head_picks_the_same_tokens_as_the_host(tp_degree):
         assert (logits.max(1, keepdim=True).values - chosen).max() < 0.02
 
 
+def test_bf16_recurrent_state_stays_close_to_float32():
+    cfg = tiny_config()
+    reference, tensors = build_reference(cfg)
+    head = host_head(tensors)
+    with torch.no_grad():
+        want = torch.stack([head.logits(h) for h in run_tokens(load_model(tensors, cfg, torch.float32), cfg, head, PROMPT, torch.float32)])
+        bf16_cfg = replace(cfg, recurrent_state_format="bf16")
+        model = load_model(tensors, bf16_cfg, torch.float32)
+        assert all(layer.linear_attn.recurrent_state.dtype == torch.bfloat16 for layer in model.layers[:3])
+        got = torch.stack([head.logits(h) for h in run_tokens(model, bf16_cfg, head, PROMPT, torch.float32)])
+    assert (got - want).abs().max() < 0.02
+
+
 def test_all_text_tensors_are_consumed():
     cfg = tiny_config()
     _, tensors = build_reference(cfg)

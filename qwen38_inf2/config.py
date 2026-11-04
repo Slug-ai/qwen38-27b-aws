@@ -28,6 +28,8 @@ class TextConfig:
     # How FP4 weights are held on the device: "fp4" stays packed and is decoded in the graph every step,
     # "fp8" takes about 1.8 times the memory and is read straight by the Tensor Engine.
     weight_format: str = "fp4"
+    # The reference keeps gated delta state in float32. BF16 halves it, and it is the largest cost per row.
+    recurrent_state_format: str = "float32"
 
     @property
     def num_hidden_layers(self) -> int:

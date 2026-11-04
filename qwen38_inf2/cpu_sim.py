@@ -48,7 +48,12 @@ class SimulatedCoresStep:
     ):
         block_layers, tp_degree = build_info["layers"], build_info["tp_degree"]
         num_blocks = num_blocks or cfg.num_hidden_layers // block_layers
-        block_cfg = replace(cfg, layer_types=cfg.layer_types[:block_layers], weight_format=build_info.get("weight_format", "fp4"))
+        block_cfg = replace(
+            cfg,
+            layer_types=cfg.layer_types[:block_layers],
+            weight_format=build_info.get("weight_format", "fp4"),
+            recurrent_state_format=build_info.get("recurrent_state_format", "float32"),
+        )
         self.reducer = ThreadedAllReduce(tp_degree)
         self.ranks = []
         for rank in range(tp_degree):

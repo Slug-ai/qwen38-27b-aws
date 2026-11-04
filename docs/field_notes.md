@@ -92,3 +92,4 @@ Goal: tokens per second across all sequences. Latency per token doesn't matter.
 - The FP8 kernel scales almost flat with batch on one matrix: 0.62 ms at batch 1 and 1.00 ms at batch 128. Memory is what limits batch.
 - Memory limits at max length 512: batch 32 fits and batch 40 doesn't. With lm_head on the chip, batch 20 fits and batch 24 doesn't.
 - `pkill` isn't always enough for a process holding the chip: a run can sit there holding both cores, and the next run fails with `Logical Neuron Core(s) not available`. Use `pkill -9`.
+- With BF16 gated delta state, lm_head on the chip and max length 512, batch 32 fits and batch 36 doesn't: it fails allocating collective rings.
