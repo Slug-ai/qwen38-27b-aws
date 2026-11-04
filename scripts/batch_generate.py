@@ -2,7 +2,8 @@
 """The throughput benchmark: real distinct prompts through a real full batch, on Inf2 or with --simulate on CPU.
 
 The headline is tokens actually produced divided by wall time, including prompt steps and any idle rows.
-Nothing is projected from a single step. Row 0 runs the saved greedy prompt, so a wrong graph can't look fast.
+Nothing is projected from a single step. Row 0 runs the saved greedy prompt, and a saved 38-token passage runs
+through every row first, so a wrong graph can't look fast.
 """
 
 import argparse
@@ -15,8 +16,9 @@ import torch
 from tokenizers import Tokenizer
 
 from qwen38_inf2 import checkpoint
+from qwen38_inf2.chip_check import NEAR_TIE_LOGITS
 from qwen38_inf2.config import TextConfig
-from qwen38_inf2.generate import EOS_TOKEN_IDS, HostHead, batch_step_inputs, batched_greedy_generate, chat_prompt
+from qwen38_inf2.generate import EOS_TOKEN_IDS, ChipHead, HostHead, batch_step_inputs, batched_greedy_generate, chat_prompt
 
 TOPICS = (
     "lighthouses, volcanoes, honeybees, glaciers, compilers, bicycles, coral reefs, origami, telescopes, chess, "
@@ -57,6 +59,24 @@ class TimedStep:
         return hidden
 
 
+def check_saved_tokens(step, head, cfg, golden: dict, batch_size: int, max_seq_len: int) -> dict:
+    """Run the saved test passage through every row and compare the top token at each position with the CPU's.
+
+    Every row must agree, and a top token may only differ where the CPU's top two logits were nearly tied.
+    """
+    wrong, near_ties, rows_disagree = 0, 0, 0
+    for position, token_id in enumerate(golden["tokens"]):
+        inputs = batch_step_inputs(cfg, [position] * batch_size, max_seq_len, torch.bfloat16)
+        tops = head.next_tokens(step(inputs_embeds=head.embed_batch([token_id] * batch_size, torch.bfloat16), **inputs))
+        rows_disagree += len(set(tops)) > 1
+        if tops[0] != golden["top"][position]:
+            if golden["margin"][position] < NEAR_TIE_LOGITS:
+                near_ties += 1
+            else:
+                wrong += 1
+    return {"positions": len(golden["tokens"]), "wrong": wrong, "near_tie_flips": near_ties, "positions_where_rows_disagree": rows_disagree}
+
+
 def screen(step, cfg, batch_size: int, max_seq_len: int, blocks: int, steps: int = 12) -> None:
     """A quick look at a new graph. Only part of the model runs, so its output means nothing, and it's not throughput."""
     embeds = torch.zeros(batch_size, 1, cfg.hidden_size, dtype=torch.bfloat16)
@@ -75,6 +95,7 @@ def main():
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--compiled", required=True)
     parser.add_argument("--weights", required=True)
+    parser.add_argument("--head", help="Compiled lm_head for the chip. Its weights go in --weights too. Omit to run lm_head on the host.")
     parser.add_argument("--prompts-file", type=Path, help="One prompt per line. Defaults to the fixed benchmark set.")
     parser.add_argument("--sequences", type=int, help="Total sequences to run. Defaults to two full batches.")
     parser.add_argument("--max-new-tokens", type=int, default=32)
@@ -99,7 +120,13 @@ def main():
         tokenizer.encode(chat_prompt(line), add_special_tokens=False).ids for line in lines[: sequences - 1]
     ]
 
-    head = HostHead(checkpoint.TensorSource(f"{args.model_dir}/model.safetensors"), cfg.rms_norm_eps)
+    source = checkpoint.TensorSource(f"{args.model_dir}/model.safetensors")
+    if args.head:
+        from qwen38_inf2.neuron import load_head_graph
+
+        head = ChipHead(source, cfg.rms_norm_eps, load_head_graph(args.head, args.weights), batch_size)
+    else:
+        head = HostHead(source, cfg.rms_norm_eps)
     started = time.perf_counter()
     if args.simulate:
         from qwen38_inf2.cpu_sim import SimulatedCoresStep
@@ -115,6 +142,9 @@ def main():
     if args.screen_blocks:
         screen(inner, cfg, batch_size, info["max_seq_len"], args.screen_blocks)
         return
+
+    saved_tokens = check_saved_tokens(inner, head, cfg, golden, batch_size, info["max_seq_len"])
+    print(f"saved test passage: {saved_tokens}", flush=True)
 
     step = TimedStep(inner)
     outputs = defaultdict(list)
@@ -158,6 +188,7 @@ def main():
         "tokens_per_second_when_every_row_generated": batch_size * len(full_steps) / full_seconds if full_steps else None,
         "golden_row_matches": golden_ok,
         "golden_row_tokens": outputs[0][: len(want)],
+        "saved_test_passage": saved_tokens,
         "load_seconds": load_seconds,
     }
     print()

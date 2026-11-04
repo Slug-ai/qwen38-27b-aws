@@ -6,7 +6,9 @@ fastest test there is, at under a minute for each variant. Each variant does the
 must match the current decode. Results so far on a real matrix: floor and interleave, 3.59 G values/s. Split
 without interleave, 3.70. Shift and mask, 5.97. Sign-free codes as well, 7.87. Table lookups, 3.7 to 4.2.
 Masking the high nibble rather than the integer divide that `>> 4` compiles to, 7.89, so no gain. -O2 changes
-nothing. No decode at all, with FP8 weights read by a kernel, 72.9.
+nothing. No decode at all, with FP8 weights read by a kernel, 72.9. At batch 32 that kernel does 59, and loading
+each output tile's weights with one static DMA does 44.5, so it stays with one load per matmul. Its time from batch
+1 to 128 only goes from 0.62 ms to 1.00 ms.
 """
 
 import argparse
@@ -77,7 +79,7 @@ def main():
             print(f"{name}: compiled in {time.time() - started:.0f}s", flush=True)
         if args.compile_only:
             continue
-        run = load_graph(directory, [fp8_weights(args.model_dir)] if name == "fp8_direct" else [weights])
+        run = load_graph(directory, [fp8_weights(args.model_dir)] if name.startswith("fp8") else [weights])
         times = []
         for _ in range(14):
             started = time.perf_counter()

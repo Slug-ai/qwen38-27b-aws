@@ -254,6 +254,32 @@ def write_rank_weights(source, cfg: TextConfig, weights_dir: str | Path, block_l
             save_file({k: v.contiguous() for k, v in weights.items()}, shard_path(weights_dir, block, rank))
 
 
+def head_weights(source, rank: int, tp_degree: int) -> dict[str, torch.Tensor]:
+    """Final norm and this core's slice of lm_head, ``[hidden, tokens]`` as the Tensor Engine contracts it."""
+    start, end = _slice_range(source.shape(LM_HEAD)[0], rank, tp_degree)
+    gate = torch.zeros(tp_degree, dtype=torch.float32)
+    gate[rank] = 1.0
+    return {
+        "norm_weight": source.get(FINAL_NORM).to(torch.bfloat16),
+        "lm_head": source.get_row_range(LM_HEAD, start, end - start).to(torch.bfloat16).transpose(0, 1).contiguous(),
+        "rank_gate": gate,
+    }
+
+
+def head_path(weights_dir: str | Path, rank: int) -> Path:
+    return Path(weights_dir) / f"head_tp{rank}.safetensors"
+
+
+def write_head_weights(source, weights_dir: str | Path, tp_degree: int = 2) -> None:
+    Path(weights_dir).mkdir(parents=True, exist_ok=True)
+    for rank in range(tp_degree):
+        save_file(head_weights(source, rank, tp_degree), head_path(weights_dir, rank))
+
+
+def load_head_weights(weights_dir: str | Path, rank: int) -> dict[str, torch.Tensor]:
+    return load_file(head_path(weights_dir, rank))
+
+
 def load_rank_block(weights_dir: str | Path, block: int, rank: int, layers: int | None = None) -> dict[str, torch.Tensor]:
     """One block's weights for one core, optionally keeping only its first `layers` layers."""
     weights = load_file(shard_path(weights_dir, block, rank))

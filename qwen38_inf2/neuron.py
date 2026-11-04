@@ -11,7 +11,7 @@ from neuronx_distributed.trace.nxd_model import NxDModel
 from . import checkpoint
 from .config import TextConfig
 from .generate import BlockChain, batch_step_inputs
-from .model import Qwen38Step
+from .model import HeadStep, Qwen38Step
 
 DTYPE = torch.bfloat16
 MODEL_FILE = "nxd_model.pt"
@@ -90,6 +90,25 @@ def build(
         workdir,
         optimize_layout,
     )
+
+
+def build_head(cfg: TextConfig, batch_size: int, output_dir: str | Path, tp_degree: int = 2, target: str = "inf2", workdir=None) -> Path:
+    """Compile lm_head for the chip. It is one graph, loaded once, separate from the blocks."""
+    return compile_graph(
+        lambda: HeadStep(cfg, tp_degree, batch_size, reduce_from_tensor_model_parallel_region),
+        {"hidden": torch.zeros(batch_size, 1, cfg.hidden_size, dtype=DTYPE)},
+        output_dir,
+        {"batch_size": batch_size, "group_rows": 32},
+        tp_degree,
+        target,
+        "",
+        workdir,
+    )
+
+
+def load_head_graph(model_dir: str | Path, weights_dir: str | Path):
+    tp_degree = checkpoint.read_build_info(model_dir)["tp_degree"]
+    return load_graph(model_dir, [checkpoint.load_head_weights(weights_dir, rank) for rank in range(tp_degree)])
 
 
 def preflight(model_dir: str | Path, inputs: dict[str, torch.Tensor], weight_headers: list[dict] = ()) -> list[str]:

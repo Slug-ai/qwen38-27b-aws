@@ -88,3 +88,7 @@ Goal: tokens per second across all sequences. Latency per token doesn't matter.
 - A sequence's text can differ slightly between builds, because rounding differs and greedy decoding follows near ties. The saved greedy row still matches.
 - Real chip memory, from the table a failed load prints: a core fills at 15.94 GB. The scratchpad is shared across all loaded blocks (512 MB at batch 24), which is why the compiler's total runs high. Each loaded block also costs about 57 MB, mostly collective rings (39 MB) and code (9 MB), so about 0.9 GB across 16 blocks. Batch 24 at max length 2048 fails on the last blocks, and batch 32 at 512 fits.
 - With the FP8 kernel, chip time barely grows with batch: 0.21 s per step at batch 16 and 0.24 s at batch 32.
+- lm_head on the chip: 16 of 16 tokens match the host's, in 13.5 ms against 859 ms at batch 16, of which the chip graph is 8 ms. The chip returns the largest logit in each group of 32 tokens, and the host rechecks the top 4 groups from the checkpoint, so the host needs no 5 GB copy of lm_head.
+- The FP8 kernel scales almost flat with batch on one matrix: 0.62 ms at batch 1 and 1.00 ms at batch 128. Memory is what limits batch.
+- Memory limits at max length 512: batch 32 fits and batch 40 doesn't. With lm_head on the chip, batch 20 fits and batch 24 doesn't.
+- `pkill` isn't always enough for a process holding the chip: a run can sit there holding both cores, and the next run fails with `Logical Neuron Core(s) not available`. Use `pkill -9`.

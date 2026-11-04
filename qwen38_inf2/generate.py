@@ -90,6 +90,50 @@ class HostHead:
         return torch.argmax(norm @ self.lm_head.T, dim=-1).tolist()
 
 
+class ChipHead:
+    """lm_head on the chip, which is far faster than the host at a large batch and needs no host copy of it.
+
+    The chip reports the largest logit in each group of tokens, and the host picks the exact token inside
+    the best few groups. The chip's input is rounded to BF16, so its best group alone could lose a near tie.
+    `run_graph` is the compiled `HeadStep`, or anything else with the same call.
+    """
+
+    def __init__(
+        self, source, eps: float, run_graph: Callable[..., torch.Tensor], batch_size: int, group_rows: int = 32, recheck_groups: int = 4
+    ):
+        self.source = source
+        self.eps = eps
+        self.run_graph = run_graph
+        self.batch_size = batch_size
+        self.group_rows = group_rows
+        self.recheck_groups = recheck_groups
+        self.norm_weight = source.get(checkpoint.FINAL_NORM)
+
+    def embed_batch(self, token_ids: Sequence[int], dtype: torch.dtype) -> torch.Tensor:
+        return self.source.get_rows(checkpoint.EMBED_TOKENS, list(token_ids)).unsqueeze(1).to(dtype)
+
+    def next_tokens(self, hidden: torch.Tensor) -> list[int]:
+        """Greedy next token for each row of ``[rows, 1, hidden]``. Fewer rows than the batch are padded for the graph."""
+        rows = hidden.shape[0]
+        full = torch.zeros(self.batch_size, 1, hidden.shape[-1], dtype=hidden.dtype)
+        full[:rows] = hidden
+        maxima = self.run_graph(hidden=full)[:rows].float()
+        best_groups = maxima.topk(min(self.recheck_groups, maxima.shape[-1]), dim=-1).indices.tolist()
+        norm = rms_norm(hidden.float(), self.norm_weight, self.eps).squeeze(1)
+        total = self.source.shape(checkpoint.LM_HEAD)[0]
+        tokens = []
+        for row, groups in enumerate(best_groups):
+            best_token, best_logit = -1, -torch.inf
+            for group in groups:
+                first = group * self.group_rows
+                candidates = self.source.get_row_range(checkpoint.LM_HEAD, first, min(self.group_rows, total - first)).float()
+                logit, index = (candidates @ norm[row]).max(dim=0)
+                if logit > best_logit:
+                    best_token, best_logit = first + int(index), logit
+            tokens.append(best_token)
+        return tokens
+
+
 class BlockChain:
     """Run compiled blocks of layers in sequence, as one step."""
 

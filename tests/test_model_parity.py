@@ -1,6 +1,7 @@
 """The single-token graph must reproduce the Hugging Face model on the same FP4 weights."""
 
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
 import pytest
@@ -9,8 +10,8 @@ import torch
 from qwen38_inf2 import checkpoint
 from qwen38_inf2.config import tiny_config
 from qwen38_inf2.cpu_sim import SimulatedCoresStep, ThreadedAllReduce
-from qwen38_inf2.generate import BlockChain, HostHead, batched_greedy_generate, greedy_generate, step_inputs
-from qwen38_inf2.model import Qwen38Step
+from qwen38_inf2.generate import BlockChain, ChipHead, HostHead, batched_greedy_generate, greedy_generate, step_inputs
+from qwen38_inf2.model import HeadStep, Qwen38Step, rms_norm
 
 from .reference import build_reference
 
@@ -251,6 +252,39 @@ def test_fp8_weights_match_the_reference():
         got = torch.stack([head.logits(h) for h in run_tokens(model, cfg, head, PROMPT, torch.float32)])
     assert (got - want).abs().max() < 1e-4
     assert torch.equal(got.argmax(-1), want.argmax(-1))
+
+
+@pytest.mark.parametrize("tp_degree", [1, 2])
+def test_chip_head_picks_the_same_tokens_as_the_host(tp_degree):
+    cfg = tiny_config()
+    _, tensors = build_reference(cfg)
+    source = checkpoint.DictSource(tensors)
+    host = host_head(tensors)
+    torch.manual_seed(1)
+    hidden = torch.randn(5, 1, cfg.hidden_size)
+    want = host.next_tokens(hidden)
+
+    reducer = ThreadedAllReduce(tp_degree)
+    graphs = []
+    for rank in range(tp_degree):
+        graph = HeadStep(cfg, tp_degree, batch_size=8, all_reduce=reducer.bind(rank), group_rows=8).eval()
+        graph.load_state_dict(checkpoint.head_weights(source, rank, tp_degree))
+        graphs.append(graph)
+
+    def run_graph(hidden):
+        with ThreadPoolExecutor(tp_degree) as pool:
+            return list(pool.map(lambda g: g(hidden), graphs))[0]
+
+    with torch.no_grad():
+        chip = ChipHead(source, cfg.rms_norm_eps, run_graph, batch_size=8, group_rows=8)
+        assert chip.next_tokens(hidden) == want
+        assert chip.next_tokens(hidden[:2]) == want[:2]
+        # The chip rounds its input to BF16, so a tiny model's nearly flat logits must still give a near-best token.
+        rounded = hidden.to(torch.bfloat16)
+        norm = rms_norm(rounded.float(), host.norm_weight, cfg.rms_norm_eps).squeeze(1)
+        logits = norm @ host.lm_head.T
+        chosen = logits.gather(1, torch.tensor(chip.next_tokens(rounded)).unsqueeze(1))
+        assert (logits.max(1, keepdim=True).values - chosen).max() < 0.02
 
 
 def test_all_text_tensors_are_consumed():

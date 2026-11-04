@@ -7,7 +7,7 @@ Vision and MTP tensors are never read. In total this is about 6.9 GB per core fo
 import argparse
 from dataclasses import replace
 
-from qwen38_inf2.checkpoint import TensorSource, read_build_info, write_rank_weights
+from qwen38_inf2.checkpoint import TensorSource, read_build_info, write_head_weights, write_rank_weights
 from qwen38_inf2.config import TextConfig
 
 
@@ -16,7 +16,13 @@ def main():
     parser.add_argument("--model-dir", required=True, help="Directory holding model.safetensors and config.json.")
     parser.add_argument("--compiled", required=True, help="Output directory of scripts/compile.py.")
     parser.add_argument("--output", required=True)
+    parser.add_argument("--head-only", action="store_true", help="Write only the weights for lm_head on the chip, about 1.3 GB per core.")
     args = parser.parse_args()
+
+    if args.head_only:
+        write_head_weights(TensorSource(f"{args.model_dir}/model.safetensors"), args.output, read_build_info(args.compiled)["tp_degree"])
+        print(f"wrote head weights to {args.output}")
+        return
 
     cfg = TextConfig.from_file(f"{args.model_dir}/config.json")
     info = read_build_info(args.compiled)

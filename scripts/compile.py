@@ -6,7 +6,7 @@ import time
 from dataclasses import replace
 
 from qwen38_inf2.config import TextConfig, tiny_config
-from qwen38_inf2.neuron import build
+from qwen38_inf2.neuron import build, build_head
 
 
 def main():
@@ -22,6 +22,7 @@ def main():
     parser.add_argument("--compiler-args", default="")
     parser.add_argument("--optimize-layout", action="store_true", help="Use NxD's weight layout optimization.")
     parser.add_argument("--output", required=True)
+    parser.add_argument("--head", action="store_true", help="Compile lm_head for the chip instead of decoder layers. Uses --batch-size.")
     parser.add_argument("--workdir", help="Compiler scratch and logs. Defaults to <output>/compiler-work.")
     args = parser.parse_args()
 
@@ -34,6 +35,11 @@ def main():
 
     started = time.time()
     workdir = args.workdir or f"{args.output}/compiler-work"
+    if args.head:
+        path = build_head(cfg, args.batch_size, args.output, args.tp_degree, args.target, workdir)
+        print(f"compiled lm_head for {args.target} in {time.time() - started:.0f}s: {path}")
+        return
+
     path = build(cfg, args.max_seq_len, args.output, args.tp_degree, args.target, args.compiler_args, workdir, args.optimize_layout, args.batch_size)
     print(f"compiled {cfg.num_hidden_layers} layers for {args.target} in {time.time() - started:.0f}s: {path}")
 

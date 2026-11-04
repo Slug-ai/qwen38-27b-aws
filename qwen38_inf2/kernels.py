@@ -43,4 +43,42 @@ def fp8_linear_body(x: nl.ndarray, weight: nl.ndarray) -> nl.ndarray:
     return out
 
 
+def lm_head_group_maxima_body(x: nl.ndarray, weight: nl.ndarray, group_rows: int) -> nl.ndarray:
+    """The largest logit in each group of `group_rows` tokens, for every row of a batch.
+
+    The host then only has to look inside one group, so it needs no copy of lm_head.
+
+    Args:
+        x: BF16 ``[hidden, batch]``, already normalized.
+        weight: BF16 ``[hidden, tokens]``.
+
+    Returns:
+        float32 ``[batch, ceil(tokens / group_rows)]``.
+    """
+    hidden, batch = x.shape
+    _, tokens = weight.shape
+    out = nl.ndarray((batch, (tokens + group_rows - 1) // group_rows), dtype=nl.float32, buffer=nl.shared_hbm)
+    contract_tiles = _tiles(hidden, CONTRACT_TILE)
+
+    x_tiles = []
+    for start, size in contract_tiles:
+        x_tiles.append(nl.load(x[start : start + size, :]))
+
+    # A multiple of group_rows, so no group straddles two tiles.
+    for out_start, out_size in _tiles(tokens, OUTPUT_TILE - OUTPUT_TILE % group_rows):
+        psum = nl.zeros((nl.par_dim(batch), out_size), nl.float32, buffer=nl.psum)
+        for x_tile, (start, size) in zip(x_tiles, contract_tiles):
+            psum += nisa.nc_matmul(x_tile, nl.load(weight[start : start + size, out_start : out_start + out_size]))
+        logits = nl.ndarray((nl.par_dim(batch), out_size), dtype=nl.float32, buffer=nl.sbuf)
+        logits[:, :] = nisa.tensor_copy(psum, engine=nisa.vector_engine)
+        groups = _tiles(out_size, group_rows)
+        maxima = nl.ndarray((nl.par_dim(batch), len(groups)), dtype=nl.float32, buffer=nl.sbuf)
+        for index, (start, size) in enumerate(groups):
+            maxima[:, index : index + 1] = nisa.tensor_reduce(nl.maximum, logits[:, start : start + size], axis=[1], keepdims=True)
+        first = out_start // group_rows
+        nl.store(out[:, first : first + len(groups)], maxima)
+    return out
+
+
 fp8_linear = nki.jit(fp8_linear_body)
+lm_head_group_maxima = nki.jit(lm_head_group_maxima_body)

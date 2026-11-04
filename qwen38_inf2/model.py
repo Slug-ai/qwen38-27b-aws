@@ -243,6 +243,35 @@ class FullAttentionStep(nn.Module):
         return self.all_reduce(self.o_proj(out * torch.sigmoid(gate.reshape(batch, 1, self.num_heads * head))))
 
 
+class HeadStep(nn.Module):
+    """Final norm and lm_head on the chip: the largest logit in each group of tokens, for every row.
+
+    Each core holds a slice of the tokens. `rank_gate` is 1 for this core's own slot, so the sum across
+    cores lays the two slices side by side in token order.
+    """
+
+    def __init__(self, cfg: TextConfig, tp_degree: int = 1, batch_size: int = 1, all_reduce: Callable = identity_all_reduce, group_rows: int = 32):
+        super().__init__()
+        self.cfg = cfg
+        self.tp_degree = tp_degree
+        self.group_rows = group_rows
+        self.all_reduce = all_reduce
+        self.norm_weight = _frozen(cfg.hidden_size, dtype=torch.bfloat16)
+        self.lm_head = _frozen(cfg.hidden_size, cfg.vocab_size // tp_degree, dtype=torch.bfloat16)
+        self.rank_gate = _frozen(tp_degree, dtype=torch.float32)
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        x = rms_norm(hidden, self.norm_weight, self.cfg.rms_norm_eps).reshape(hidden.shape[0], -1)
+        if x.device.type == "cpu":
+            logits = x.float() @ self.lm_head.float()
+            maxima = torch.stack([group.amax(dim=-1) for group in logits.split(self.group_rows, dim=-1)], dim=-1)
+        else:
+            from .kernels import lm_head_group_maxima
+
+            maxima = lm_head_group_maxima(x.transpose(0, 1), self.lm_head, self.group_rows)
+        return self.all_reduce(torch.cat([maxima * self.rank_gate[rank] for rank in range(self.tp_degree)], dim=-1))
+
+
 class DecoderLayer(nn.Module):
     def __init__(self, cfg, layer_type, tp_degree, max_seq_len, dtype, all_reduce, batch_size=1):
         super().__init__()
