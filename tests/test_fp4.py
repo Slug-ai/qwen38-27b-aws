@@ -47,6 +47,19 @@ def test_fp8_rounds_the_rarest_scales_by_under_one_step():
         assert error.max() <= 2.0**-17, f"too far at exponent {exponent}"
 
 
+def test_float_to_fp8_matches_the_exact_encoder():
+    torch.manual_seed(0)
+    values = torch.cat(
+        (
+            torch.tensor([0.0, 0.5, 1.0, 1.5, -1.5, 3.0, 6.0, -6.0, 2.0**-14, 2.0**-15, 2.0**-16, 2.0**-18, 1.875, 3.9, -0.34]),
+            torch.randn(2000) * 0.1,
+        )
+    )
+    want = torch.tensor([fp4._fp8_e5m2_byte(v) for v in values.tolist()], dtype=torch.uint8)
+    assert torch.equal(fp4.float_to_fp8(values), want)
+    assert (fp4.fp8_to_float(fp4.float_to_fp8(values)) - values).abs().max() < 0.13 * values.abs().max()
+
+
 def test_matches_compressed_tensors():
     """compressed-tensors wrote this checkpoint, so its decoder defines correct."""
     torch.manual_seed(0)

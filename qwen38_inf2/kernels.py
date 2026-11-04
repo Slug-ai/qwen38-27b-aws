@@ -50,7 +50,7 @@ def lm_head_group_maxima_body(x: nl.ndarray, weight: nl.ndarray, group_rows: int
 
     Args:
         x: BF16 ``[hidden, batch]``, already normalized.
-        weight: BF16 ``[hidden, tokens]``.
+        weight: ``[hidden, tokens]``, BF16 or else uint8 holding FP8 e5m2 bytes.
 
     Returns:
         float32 ``[batch, ceil(tokens / group_rows)]``.
@@ -68,7 +68,8 @@ def lm_head_group_maxima_body(x: nl.ndarray, weight: nl.ndarray, group_rows: int
     for out_start, out_size in _tiles(tokens, OUTPUT_TILE - OUTPUT_TILE % group_rows):
         psum = nl.zeros((nl.par_dim(batch), out_size), nl.float32, buffer=nl.psum)
         for x_tile, (start, size) in zip(x_tiles, contract_tiles):
-            psum += nisa.nc_matmul(x_tile, nl.load(weight[start : start + size, out_start : out_start + out_size]))
+            moving = nl.load(weight[start : start + size, out_start : out_start + out_size])
+            psum += nisa.nc_matmul(x_tile, moving if weight.dtype == nl.bfloat16 else moving.view(nl.float8_e5m2))
         logits = nl.ndarray((nl.par_dim(batch), out_size), dtype=nl.float32, buffer=nl.sbuf)
         logits[:, :] = nisa.tensor_copy(psum, engine=nisa.vector_engine)
         groups = _tiles(out_size, group_rows)

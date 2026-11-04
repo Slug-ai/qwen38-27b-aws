@@ -254,14 +254,26 @@ def write_rank_weights(source, cfg: TextConfig, weights_dir: str | Path, block_l
             save_file({k: v.contiguous() for k, v in weights.items()}, shard_path(weights_dir, block, rank))
 
 
-def head_weights(source, rank: int, tp_degree: int) -> dict[str, torch.Tensor]:
+HEAD_CHUNK_ROWS = 16384
+
+
+def head_weights(source, rank: int, tp_degree: int, head_format: str = "bf16") -> dict[str, torch.Tensor]:
     """Final norm and this core's slice of lm_head, ``[hidden, tokens]`` as the Tensor Engine contracts it."""
     start, end = _slice_range(source.shape(LM_HEAD)[0], rank, tp_degree)
     gate = torch.zeros(tp_degree, dtype=torch.float32)
     gate[rank] = 1.0
+    if head_format == "fp8":
+        # In pieces, because converting it all at once needs more RAM than an inf2.xlarge has.
+        pieces = [
+            fp4.float_to_fp8(source.get_row_range(LM_HEAD, first, min(HEAD_CHUNK_ROWS, end - first)))
+            for first in range(start, end, HEAD_CHUNK_ROWS)
+        ]
+        lm_head = torch.cat(pieces)
+    else:
+        lm_head = source.get_row_range(LM_HEAD, start, end - start).to(torch.bfloat16)
     return {
         "norm_weight": source.get(FINAL_NORM).to(torch.bfloat16),
-        "lm_head": source.get_row_range(LM_HEAD, start, end - start).to(torch.bfloat16).transpose(0, 1).contiguous(),
+        "lm_head": lm_head.transpose(0, 1).contiguous(),
         "rank_gate": gate,
     }
 
@@ -270,10 +282,10 @@ def head_path(weights_dir: str | Path, rank: int) -> Path:
     return Path(weights_dir) / f"head_tp{rank}.safetensors"
 
 
-def write_head_weights(source, weights_dir: str | Path, tp_degree: int = 2) -> None:
+def write_head_weights(source, weights_dir: str | Path, tp_degree: int = 2, head_format: str = "bf16") -> None:
     Path(weights_dir).mkdir(parents=True, exist_ok=True)
     for rank in range(tp_degree):
-        save_file(head_weights(source, rank, tp_degree), head_path(weights_dir, rank))
+        save_file({k: v.contiguous() for k, v in head_weights(source, rank, tp_degree, head_format).items()}, head_path(weights_dir, rank))
 
 
 def load_head_weights(weights_dir: str | Path, rank: int) -> dict[str, torch.Tensor]:

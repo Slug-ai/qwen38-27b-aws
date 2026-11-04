@@ -98,13 +98,15 @@ def build(
     )
 
 
-def build_head(cfg: TextConfig, batch_size: int, output_dir: str | Path, tp_degree: int = 2, target: str = "inf2", workdir=None) -> Path:
+def build_head(
+    cfg: TextConfig, batch_size: int, output_dir: str | Path, tp_degree: int = 2, target: str = "inf2", workdir=None, head_format: str = "bf16"
+) -> Path:
     """Compile lm_head for the chip. It is one graph, loaded once, separate from the blocks."""
     return compile_graph(
-        lambda: HeadStep(cfg, tp_degree, batch_size, reduce_from_tensor_model_parallel_region),
+        lambda: HeadStep(cfg, tp_degree, batch_size, reduce_from_tensor_model_parallel_region, head_format=head_format),
         {"hidden": torch.zeros(batch_size, 1, cfg.hidden_size, dtype=DTYPE)},
         output_dir,
-        {"batch_size": batch_size, "group_rows": 32},
+        {"batch_size": batch_size, "group_rows": 32, "head_format": head_format},
         tp_degree,
         target,
         "",

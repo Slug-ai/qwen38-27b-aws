@@ -24,6 +24,7 @@ def main():
     parser.add_argument("--optimize-layout", action="store_true", help="Use NxD's weight layout optimization.")
     parser.add_argument("--output", required=True)
     parser.add_argument("--head", action="store_true", help="Compile lm_head for the chip instead of decoder layers. Uses --batch-size.")
+    parser.add_argument("--head-format", choices=("bf16", "fp8"), default="bf16", help="fp8 halves lm_head's memory, and the host rechecks its picks.")
     parser.add_argument("--workdir", help="Compiler scratch and logs. Defaults to <output>/compiler-work.")
     args = parser.parse_args()
 
@@ -37,7 +38,7 @@ def main():
     started = time.time()
     workdir = args.workdir or f"{args.output}/compiler-work"
     if args.head:
-        path = build_head(cfg, args.batch_size, args.output, args.tp_degree, args.target, workdir)
+        path = build_head(cfg, args.batch_size, args.output, args.tp_degree, args.target, workdir, args.head_format)
         print(f"compiled lm_head for {args.target} in {time.time() - started:.0f}s: {path}")
         return
 

@@ -254,8 +254,9 @@ def test_fp8_weights_match_the_reference():
     assert torch.equal(got.argmax(-1), want.argmax(-1))
 
 
+@pytest.mark.parametrize("head_format", ["bf16", "fp8"])
 @pytest.mark.parametrize("tp_degree", [1, 2])
-def test_chip_head_picks_the_same_tokens_as_the_host(tp_degree):
+def test_chip_head_picks_the_same_tokens_as_the_host(tp_degree, head_format):
     cfg = tiny_config()
     _, tensors = build_reference(cfg)
     source = checkpoint.DictSource(tensors)
@@ -267,8 +268,8 @@ def test_chip_head_picks_the_same_tokens_as_the_host(tp_degree):
     reducer = ThreadedAllReduce(tp_degree)
     graphs = []
     for rank in range(tp_degree):
-        graph = HeadStep(cfg, tp_degree, batch_size=8, all_reduce=reducer.bind(rank), group_rows=8).eval()
-        graph.load_state_dict(checkpoint.head_weights(source, rank, tp_degree))
+        graph = HeadStep(cfg, tp_degree, batch_size=8, all_reduce=reducer.bind(rank), group_rows=8, head_format=head_format).eval()
+        graph.load_state_dict(checkpoint.head_weights(source, rank, tp_degree, head_format))
         graphs.append(graph)
 
     def run_graph(hidden):

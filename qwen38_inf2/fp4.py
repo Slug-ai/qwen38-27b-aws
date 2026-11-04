@@ -140,6 +140,20 @@ def to_fp8(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return table[expanded * 16 + nibbles]
 
 
+def float_to_fp8(x: torch.Tensor) -> torch.Tensor:
+    """Round floats to FP8 e5m2 bytes, in the same way as `_fp8_e5m2_byte`, for any tensor. Run on the host."""
+    x = x.float()
+    magnitude = x.abs()
+    mantissa, exponent = torch.frexp(magnitude)
+    steps = torch.round(mantissa * 8.0).int()  # frexp's mantissa is in [0.5, 1), and 2 stored bits make steps of 1/8
+    exponent = exponent + (steps == 8).int()
+    steps = torch.where(steps == 8, torch.full_like(steps, 4), steps)
+    normal = ((exponent - 1 + 15) << 2) | (steps - 4)
+    subnormal = torch.round(magnitude / 2.0**-16).int()
+    bits = torch.where(magnitude < 2.0**-14, subnormal, normal)
+    return (bits | ((x < 0).int() << 7) * (bits != 0).int()).to(torch.uint8)
+
+
 def fp8_to_float(byte: torch.Tensor) -> torch.Tensor:
     """Read FP8 e5m2 bytes as float32 by their bit fields. For the CPU path. The chip reads them directly."""
     b = byte.int()

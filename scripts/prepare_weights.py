@@ -16,11 +16,12 @@ def main():
     parser.add_argument("--model-dir", required=True, help="Directory holding model.safetensors and config.json.")
     parser.add_argument("--compiled", required=True, help="Output directory of scripts/compile.py.")
     parser.add_argument("--output", required=True)
-    parser.add_argument("--head-only", action="store_true", help="Write only the weights for lm_head on the chip, about 1.3 GB per core.")
+    parser.add_argument("--head-only", action="store_true", help="Write only the weights for lm_head on the chip, 1.3 GB per core, or 0.6 GB for FP8.")
     args = parser.parse_args()
 
     if args.head_only:
-        write_head_weights(TensorSource(f"{args.model_dir}/model.safetensors"), args.output, read_build_info(args.compiled)["tp_degree"])
+        info = read_build_info(args.compiled)
+        write_head_weights(TensorSource(f"{args.model_dir}/model.safetensors"), args.output, info["tp_degree"], info.get("head_format", "bf16"))
         print(f"wrote head weights to {args.output}")
         return
 
