@@ -31,6 +31,7 @@ _DTYPES = {
     "F16": (torch.float16, 2),
     "F32": (torch.float32, 4),
 }
+_NUMPY_DTYPES = {"BF16": np.uint16, "U8": np.uint8, "F16": np.float16, "F32": np.float32}
 
 
 class TensorSource:
@@ -44,13 +45,13 @@ class TensorSource:
             with open(self.location, "rb") as f:
                 self._mmap = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
         header_len = struct.unpack("<Q", self._read(0, 8))[0]
-        self.header = json.loads(self._read(8, header_len))
+        self.header = json.loads(bytes(self._read(8, header_len)))
         self.header.pop("__metadata__", None)
         self._base = 8 + header_len
 
-    def _read(self, offset: int, size: int) -> bytes:
+    def _read(self, offset: int, size: int) -> bytes | memoryview:
         if not self.is_remote:
-            return self._mmap[offset : offset + size]
+            return memoryview(self._mmap)[offset : offset + size]
         headers = {"Range": f"bytes={offset}-{offset + size - 1}"}
         with urllib.request.urlopen(urllib.request.Request(self.location, headers=headers)) as response:
             return response.read()
@@ -80,14 +81,19 @@ class TensorSource:
         parts = [self._read(self._base + start + int(r) * row_bytes, row_bytes) for r in row_ids]
         return self._decode(b"".join(parts), dtype, [len(parts), cols])
 
+    def get_row_range(self, name: str, first: int, count: int) -> torch.Tensor:
+        """Read contiguous rows of a matrix, so large tables can be processed in pieces."""
+        entry = self.header[name]
+        cols = entry["shape"][1]
+        row_bytes = cols * _DTYPES[entry["dtype"]][1]
+        offset = self._base + entry["data_offsets"][0] + first * row_bytes
+        return self._decode(self._read(offset, count * row_bytes), entry["dtype"], [count, cols])
+
     @staticmethod
-    def _decode(data: bytes, dtype: str, shape: list[int]) -> torch.Tensor:
-        torch_dtype, width = _DTYPES[dtype]
-        if torch_dtype == torch.bfloat16:
-            array = np.frombuffer(data, dtype=np.uint16).copy()
-            return torch.from_numpy(array.astype(np.int32)).to(torch.uint16).view(torch.bfloat16).reshape(shape)
-        array = np.frombuffer(data, dtype={1: np.uint8, 2: np.float16, 4: np.float32}[width]).copy()
-        return torch.from_numpy(array).reshape(shape)
+    def _decode(data: bytes | memoryview, dtype: str, shape: list[int]) -> torch.Tensor:
+        array = np.frombuffer(data, dtype=_NUMPY_DTYPES[dtype]).copy()
+        tensor = torch.from_numpy(array)
+        return (tensor.view(torch.bfloat16) if dtype == "BF16" else tensor).reshape(shape)
 
 
 class DictSource:
@@ -107,6 +113,9 @@ class DictSource:
 
     def get_rows(self, name: str, row_ids) -> torch.Tensor:
         return self.tensors[name][torch.as_tensor(row_ids, dtype=torch.long)]
+
+    def get_row_range(self, name: str, first: int, count: int) -> torch.Tensor:
+        return self.tensors[name][first : first + count]
 
 
 def _slice_range(total: int, rank: int, tp_degree: int) -> tuple[int, int]:

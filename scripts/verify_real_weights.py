@@ -120,21 +120,14 @@ def top_predictions(source, hidden: torch.Tensor, chunk_rows: int = 32768) -> to
     best_value = torch.full((hidden.shape[0],), -torch.inf)
     best_index = torch.zeros(hidden.shape[0], dtype=torch.long)
     for start in range(0, rows, chunk_rows):
-        ids = list(range(start, min(start + chunk_rows, rows)))
-        block = _read_row_block(source, checkpoint.LM_HEAD, ids[0], len(ids)).float()
+        count = min(chunk_rows, rows - start)
+        block = source.get_row_range(checkpoint.LM_HEAD, start, count).float()
         logits = hidden @ block.T
         value, index = logits.max(dim=-1)
         better = value > best_value
         best_value = torch.where(better, value, best_value)
         best_index = torch.where(better, index + start, best_index)
     return best_index
-
-
-def _read_row_block(source, name, first_row, count):
-    entry = source.header[name]
-    cols = entry["shape"][1]
-    offset = source._base + entry["data_offsets"][0] + first_row * cols * 2
-    return source._decode(source._read(offset, count * cols * 2), "BF16", [count, cols])
 
 
 def check_tp(cfg, source, index, hidden, inputs, want, tp_degree=2):

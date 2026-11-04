@@ -8,6 +8,7 @@ from collections.abc import Callable, Iterator, Sequence
 
 import torch
 
+from . import checkpoint
 from .config import TextConfig
 from .model import MASKED_SCORE, rms_norm
 
@@ -51,17 +52,25 @@ def step_inputs(cfg: TextConfig, position: int, max_seq_len: int, dtype: torch.d
 
 
 class HostHead:
-    """Embedding lookup, final norm and lm_head, kept off the device to save 5 GB of its memory."""
+    """Embedding lookup, final norm and lm_head, kept off the device to save 5 GB of its memory.
 
-    def __init__(self, embed_tokens: torch.Tensor, norm_weight: torch.Tensor, lm_head: torch.Tensor, eps: float):
-        self.embed_tokens = embed_tokens
-        self.norm_weight = norm_weight
+    Built to fit a small host such as inf2.xlarge (16 GiB). Embeddings are read a row at a time from
+    the mapped checkpoint, and lm_head is widened in pieces, so peak RAM is about 5 GB.
+    """
+
+    def __init__(self, source, eps: float, chunk_rows: int = 32768):
+        self.source = source
         self.eps = eps
-        # float32 because CPU BF16 matmul is far slower. This costs host RAM, not device memory.
-        self.lm_head = lm_head.float()
+        self.norm_weight = source.get(checkpoint.FINAL_NORM)
+        rows, cols = source.shape(checkpoint.LM_HEAD)
+        # float32 because CPU BF16 matmul is far slower.
+        self.lm_head = torch.empty(rows, cols, dtype=torch.float32)
+        for first in range(0, rows, chunk_rows):
+            count = min(chunk_rows, rows - first)
+            self.lm_head[first : first + count] = source.get_row_range(checkpoint.LM_HEAD, first, count).float()
 
     def embed(self, token_id: int, dtype: torch.dtype) -> torch.Tensor:
-        return self.embed_tokens[token_id].reshape(1, 1, -1).to(dtype)
+        return self.source.get_rows(checkpoint.EMBED_TOKENS, [token_id]).reshape(1, 1, -1).to(dtype)
 
     def logits(self, hidden: torch.Tensor) -> torch.Tensor:
         return rms_norm(hidden.float(), self.norm_weight, self.eps).reshape(-1) @ self.lm_head.T

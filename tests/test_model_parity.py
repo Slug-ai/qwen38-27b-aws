@@ -36,9 +36,17 @@ def run_tokens(model, cfg, head, token_ids, dtype):
 
 
 def host_head(tensors):
-    return HostHead(
-        tensors[checkpoint.EMBED_TOKENS], tensors[checkpoint.FINAL_NORM], tensors[checkpoint.LM_HEAD], tiny_config().rms_norm_eps
-    )
+    return HostHead(checkpoint.DictSource(tensors), tiny_config().rms_norm_eps, chunk_rows=50)
+
+
+def test_host_head_never_loads_the_full_tables():
+    """Whole-table reads of embed_tokens or lm_head would not fit a 16 GiB inf2.xlarge host."""
+    _, tensors = build_reference(tiny_config())
+    source = checkpoint.RecordingSource(checkpoint.DictSource(tensors))
+    head = HostHead(source, tiny_config().rms_norm_eps, chunk_rows=50)
+    head.embed(3, torch.float32)
+    assert not {checkpoint.EMBED_TOKENS, checkpoint.LM_HEAD} & source.read
+    assert torch.equal(head.lm_head, tensors[checkpoint.LM_HEAD].float())
 
 
 def reference_and_ours(cfg, dtype):

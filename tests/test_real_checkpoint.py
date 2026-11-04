@@ -76,3 +76,19 @@ def test_two_rank_weights_fit_a_single_inf2_chip(cfg, header):
     per_rank = [checkpoint.device_bytes_per_rank(checkpoint.rank_weights(source, cfg, r, 2)) for r in range(2)]
     assert per_rank[0] == per_rank[1]
     assert 6.5 * GB < per_rank[0] < 8 * GB, per_rank
+
+
+def test_local_file_reads_match_the_tensors_written(tmp_path):
+    """Round trip through the on-disk format, for each dtype and read path the host uses."""
+    from safetensors.torch import save_file
+
+    bf16 = torch.arange(24, dtype=torch.float32).reshape(6, 4).to(torch.bfloat16) / 3
+    packed = torch.arange(12, dtype=torch.uint8).reshape(3, 4)
+    path = tmp_path / "t.safetensors"
+    save_file({"m": bf16, "p": packed}, path)
+
+    source = checkpoint.TensorSource(path)
+    assert torch.equal(source.get("m"), bf16) and source.get("m").dtype == torch.bfloat16
+    assert torch.equal(source.get("p"), packed) and source.get("p").dtype == torch.uint8
+    assert torch.equal(source.get_rows("m", [4, 1]), bf16[[4, 1]])
+    assert torch.equal(source.get_row_range("m", 2, 3), bf16[2:5])

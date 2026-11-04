@@ -30,12 +30,7 @@ def main():
     prompt_ids = tokenizer.encode(text, add_special_tokens=False).ids
 
     source = checkpoint.TensorSource(f"{args.model_dir}/model.safetensors")
-    head = HostHead(
-        source.get(checkpoint.EMBED_TOKENS),
-        source.get(checkpoint.FINAL_NORM),
-        source.get(checkpoint.LM_HEAD),
-        cfg.rms_norm_eps,
-    )
+    head = HostHead(source, cfg.rms_norm_eps)
 
     started = time.perf_counter()
     step = NeuronStep(args.compiled, args.weights, cfg)
