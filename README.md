@@ -19,7 +19,7 @@ Runs the text part of [RedHatAI/Qwen3.8-27B-MXFP4](https://huggingface.co/RedHat
 - **Two cores.** Each core owns a slice of the attention heads. Only the output projections need a collective, so there are two all-reduces per layer.
 - **One graph, one token.** A prompt is fed token by token through the same graph, in the recurrent form of the gated delta rule. There is no prefill graph or chunked solve.
 - **One block, loaded 16 times.** The model is 16 repeats of the same 4 layers (3 gated delta, 1 full attention). We compile one block and load it once per repeat with that repeat's weights and caches. A single 64-layer graph would need about 184 GB of RAM and about 2.9 hours to compile, projected from measured compiles of 4 and 8 layers.
-- **Host side.** Embeddings, the final norm, lm_head and the greedy loop run on the host, which saves 5 GB of device memory.
+- **Host side.** Embeddings, the final norm, lm_head and the greedy loop run on the host, which saves 5 GB of device memory. The cost is time: lm_head took about 0.16 s per generated token at 4 threads on an x86 Xeon W-1270 and 0.03 s on an M4 Pro. It hasn't been timed on an Inf2 host.
 - **SDK pinned to Neuron 2.28.1.** From 2.29 on, NxD Inference and NKI 0.3 kernels dropped Inf2. This repo uses NxD and the compiler directly, not NxD Inference.
 
 ### Differences from the checkpoint's intended serving
@@ -197,6 +197,7 @@ PYTHONPATH=. .venv/bin/python scripts/verify_real_weights.py
 | BF16 vs float32 hidden states on real weights, one layer and one block | Differ by under 1% |
 | Chip check script, fed deliberately broken results | Catches wrong decode, wrong math, NaN, confident token flips and state lost between tokens |
 | Compiled graph structure | All caches persist as device state, all collectives present, every FP4 matrix decoded, no custom calls |
+| Chip check script end to end on CPU, real weights, `model`, `greedy` and `speed` levels | All three pass. CPU results compared with themselves, so this only shows the script runs |
 
 **Not checked, because these need a chip:** whether the compiled graph computes the right values, whether 16 loaded copies of the block run together, weight loading and host RAM use on an instance, throughput, and the install steps above.
 
