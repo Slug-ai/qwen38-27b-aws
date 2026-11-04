@@ -106,6 +106,7 @@ def main():
     print(f"host per step:        {(wall - step.seconds) / step.count:.3f}s")
     print(f"wall time:            {wall:.1f}s")
     print(f"generated tokens/s:   {generated / wall:.2f}")
+    print(f"with every row generating: {batch_size * step.count / wall:.2f} tokens/s")
     print(f"all tokens/s:         {(generated + fed) / wall:.2f}")
     print(f"prompts with differing outputs across rows: {mismatched}")
 
