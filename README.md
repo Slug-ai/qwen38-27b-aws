@@ -1,6 +1,6 @@
 # qwen38-27b-aws
 
-Runs the text part of [RedHatAI/Qwen3.8-27B-MXFP4](https://huggingface.co/RedHatAI/Qwen3.8-27B-MXFP4) on one AWS Inferentia2 chip (two NeuronCores) with FP4 weights and greedy decoding.
+Runs the text part of [RedHatAI/Qwen3.8-27B-MXFP4](https://huggingface.co/RedHatAI/Qwen3.8-27B-MXFP4) on one AWS Inferentia2 chip (two NeuronCores), with its FP4 weights converted to FP8 and greedy decoding.
 
 **Status: runs end to end on a real `inf2.xlarge`.** Currently 108.32 generated tokens/s at batch 62 with a maximum of 512 tokens per sequence, measured. See [the throughput log](docs/throughput.md) and [the field notes](docs/field_notes.md), which cover setup on the Amazon Linux Neuron AMI.
 
@@ -8,29 +8,68 @@ Runs the text part of [RedHatAI/Qwen3.8-27B-MXFP4](https://huggingface.co/RedHat
 
 ## How it works
 
-- **FP4 on a chip without FP4.** NeuronCore-v2 has no FP4 type (native MX compute is Trn3 only). Weights stay packed on the device and the graph expands them to BF16 for each matmul. This is what makes the model fit, and it's also most of the time per step:
+This describes the build measured in [the throughput log](docs/throughput.md), which also gives the effect of each change.
 
-  | | Per NeuronCore (16 GB available) |
+- **FP8 weights on a chip without FP4.** NeuronCore-v2 has no FP4 type (native MX compute is Trn3 only), and the weights would take about 22.7 GiB per core at BF16. So they are converted once, when prepared, to one FP8 byte per value. Two NKI kernels ([kernels.py](qwen38_inf2/kernels.py)) have the Tensor Engine read those bytes with a cheap cast to BF16, so no decode runs on the chip. FP8 holds all but 0.0003% of scale groups exactly, and the rest are weights under 1e-4 that round to the nearest FP8 value.
+- **Memory limits the batch.** Chip time per step fits about 0.118 s + 0.0031 s per row, so more rows keep helping until memory runs out. A core fills at 15.94 GiB, which the runtime's memory table labels GB:
+
+  | | Per NeuronCore, at batch 62 |
   |---|---|
-  | Packed FP4 weights | 6.87 GB |
-  | Same weights decoded to BF16 | about 24 GB |
-  | KV cache at 2048 tokens | 0.07 GB |
-  | Gated delta state | 0.08 GB |
+  | FP8 weights | 11.35 GiB |
+  | FP8 `lm_head` | 0.59 GiB |
+  | Gated delta state, BF16 | 2.26 GiB |
+  | KV cache, 512 tokens | 0.97 GiB |
+  | Code, collective rings and scratchpad | about 0.6 GiB |
+  | Total | about 15.8 GiB |
+
+  The code and rings row comes from the runtime's table at batch 64, which doesn't fit. The other rows come from file sizes and tensor shapes.
 
 - **Text only.** The vision tower, MTP head and KV-cache FP8 scales are never read.
-- **Two cores.** Each core owns a slice of the attention heads. Only the output projections need a collective, so there are two all-reduces per layer.
-- **One graph, one token.** A prompt is fed token by token through the same graph, in the recurrent form of the gated delta rule. There is no prefill graph or chunked solve.
-- **One block, loaded 16 times.** The model is 16 repeats of the same 4 layers (3 gated delta, 1 full attention). We compile one block and load it once per repeat with that repeat's weights and caches. A single 64-layer graph would need about 184 GB of RAM and about 2.9 hours to compile, projected from measured compiles of 4 and 8 layers.
-- **Host side.** Embeddings and the greedy loop run on the host. `scripts/batch_generate.py --head` runs lm_head on the chip, which is far faster at a batch. Without it, the final norm and lm_head run on the host too, which saves 2.5 GB of device memory. The cost is time: lm_head took about 0.16 s per generated token at 4 threads on an x86 Xeon W-1270 and 0.03 s on an M4 Pro. It hasn't been timed on an Inf2 host.
-- **SDK pinned to Neuron 2.28.1.** From 2.29 on, NxD Inference and NKI 0.3 kernels dropped Inf2. This repo uses NxD and the compiler directly, not NxD Inference.
+- **Two cores.** Each core owns a slice of the attention heads. Only the output projections need a collective, so there are two all-reduces per layer. Each core also holds half of `lm_head`'s tokens, and one more all-reduce joins the two halves of its output.
+- **One graph, one token per row.** Each row of the fixed batch is an independent sequence at its own position. A prompt is fed token by token through the same graph, in the recurrent form of the gated delta rule, so there is no prefill graph or chunked solve. A row that finishes takes the next waiting prompt. Prompt plus output is limited to 512 tokens, because a shorter KV cache leaves room for more rows.
+- **16 layers at a time, loaded 4 times.** The model is 16 repeats of the same 4 layers (3 gated delta, 1 full attention). We compile 16 layers once and load that graph 4 times, each with its own weights and caches. Each loaded graph costs chip memory for code and collective rings, so 4 graphs leave more room for rows than 16 did. Larger graphs aren't practical on `inf2.xlarge`. Both cores' weights sit in host RAM together while a graph loads, which is about 24 GB for a whole-model graph against 15 GB of RAM, and preparing 32-layer weights was killed for running out of memory.
+- **`lm_head` on the chip, checked on the host.** A kernel returns the largest logit in each group of 32 tokens, using an FP8 copy of `lm_head`. The host then reads the top 4 groups from the checkpoint and picks the exact token, so it needs no 5 GB copy of `lm_head`, and the FP8 copy only has to keep the right group in the top 4.
+- **Host side.** Embeddings and the greedy loop run on the host, reading embeddings from the mapped checkpoint. `scripts/batch_generate.py` reads `lm_head` and the embeddings once after loading, in about 32 s, because otherwise each step waits on the disk. It also sets 64 MB scratchpad pages, which reserve less chip memory than the runtime's default.
+- **SDK pinned to Neuron 2.28.1.** From 2.29 on, NxD Inference and NKI 0.3 kernels dropped Inf2. This repo uses NxD, the compiler and the SDK's `neuronxcc.nki`, not NxD Inference.
+
+Two earlier designs are still available. `--weight-format fp4`, the default in `scripts/compile.py`, keeps weights packed at 6.4 GiB per core and decodes them in the graph every step. It took 2.25 s per step on the chip at batch 32, against 0.21 s at batch 16 with FP8. Leaving out `--head` runs the final norm and `lm_head` on the host, which holds a 5 GB copy in host RAM and took 0.80 s per step at batch 32, against 0.04 s at batch 20 with `--head`.
 
 ### Differences from the checkpoint's intended serving
 
-Only the weights are FP4. Activations and the KV cache run at BF16, while the checkpoint was calibrated for FP4 activations and an FP8 cache. This should be at least as accurate, but it has not been measured.
+Weights are FP8, converted from the checkpoint's FP4. Activations and the KV cache run at BF16, while the checkpoint was calibrated for FP4 activations and an FP8 cache. Gated delta state also runs at BF16, where the reference uses float32.
+
+These choices change some outputs. Against an earlier float32-state build at batch 20, 33 of 40 sequences are identical, and part of that difference comes from batch size. On 324 tokens of well-known English text, BF16 and float32 state both get the real next token at 315 of 323 positions and pick the same token at 323 of 324 (`scripts/quality_check.py`). Famous text is an easy test, so this rules out large damage but not subtle damage. Nothing has been compared with FP4 activations and an FP8 cache.
+
+## Run the measured build
+
+These commands produced the 108.32 tok/s result. The rest of this README covers the batch-1 FP4 graph used for first bring-up, which is what `scripts/generate.py` and `scripts/chip_check.py` take, and it explains how to set up the compiler, checkpoint and instance used here.
+
+Compile the layers and `lm_head`. Run at the same time on a 16-thread machine, these took about 4 and 5.5 minutes:
+
+```bash
+python scripts/compile.py --config tests/fixtures/config.json --layers 16 --max-seq-len 512 --batch-size 62 \
+  --weight-format fp8 --recurrent-state bf16 --optimize-layout --output artifacts/block16_b62
+python scripts/compile.py --config tests/fixtures/config.json --head --head-format fp8 --batch-size 62 --output artifacts/head_b62
+```
+
+Prepare the weights, which takes about 26 GB of disk on top of the 19 GB checkpoint:
+
+```bash
+python scripts/prepare_weights.py --model-dir model --compiled artifacts/block16_b62 --output weights_fp8
+python scripts/prepare_weights.py --model-dir model --compiled artifacts/head_b62 --output weights_fp8 --head-only
+```
+
+Run the benchmark on the instance. Loading takes about 3 minutes:
+
+```bash
+python scripts/batch_generate.py --model-dir model --compiled artifacts/block16_b62 --head artifacts/head_b62 --weights weights_fp8
+```
+
+For your own prompts, add `--prompts-file prompts.txt --sequences N`, with one prompt per line. Row 0 always runs the saved greedy prompt, so `N` can be at most the number of lines plus one. `--show` sets how many outputs are printed.
 
 ## Compile (no chip needed)
 
-Compiling one block takes about 10 minutes and peaks at 11.4 GB of RAM. The output is about 37 MB and can be copied to the instance. Pick either route.
+Compiling one 4-layer FP4 block takes about 10 minutes and peaks at 11.4 GB of RAM. The output is about 37 MB and can be copied to the instance. A single 64-layer FP4 graph would need about 184 GB of RAM and about 2.9 hours to compile, projected from measured compiles of 4 and 8 layers. Pick either route.
 
 Docker, on any machine (on Apple Silicon it runs under Rosetta, which is slower):
 
@@ -181,6 +220,8 @@ PYTHONPATH=. .venv/bin/python scripts/verify_real_weights.py
 
 ## What has been checked
 
+Most of these checks predate FP8 weights, and they cover the model and the FP4 path. Each run of the measured build has its own correctness check, described in [the throughput log](docs/throughput.md).
+
 | Check | Result |
 |---|---|
 | FP4 decode vs compressed-tensors, the code that wrote the checkpoint | Exact, for every byte value and a range of exponents |
@@ -198,9 +239,9 @@ PYTHONPATH=. .venv/bin/python scripts/verify_real_weights.py
 | Compile for `--target inf2` on two cores, real layer sizes | 4 and 8 layers compile, plain. The 4-layer block also compiles with `--optimize-layout` |
 | BF16 vs float32 hidden states on real weights, one layer and one block | Differ by under 1% |
 | Chip check script, fed deliberately broken results | Catches wrong decode, wrong math, NaN, confident token flips and state lost between tokens |
-| Compiled graph structure | All caches persist as device state, all collectives present, every FP4 matrix decoded, no custom calls |
+| Compiled FP4 graph structure | All caches persist as device state, all collectives present, every FP4 matrix decoded, no custom calls |
 | Chip check script end to end on CPU, real weights, `model`, `greedy` and `speed` levels | All three pass. CPU results compared with themselves, so this only shows the script runs |
 
 **On a real chip:** every level of `scripts/chip_check.py` passes on batch-1 graphs, and each row of [the throughput log](docs/throughput.md) runs real batches with a correctness check. The `chip_check.py` levels haven't been rerun since the decode changed, and they take batch-1 graphs. The Ubuntu install steps above are untested, since the instance used Amazon Linux.
 
-The NKI simulator can't help here, because it runs NKI kernels and not compiled graphs. This repo doesn't use NKI so far. A kernel is the likely next step if in-graph FP4 decode turns out to be too slow.
+The NKI simulator can't check the whole model, because it runs NKI kernels and not compiled graphs.
