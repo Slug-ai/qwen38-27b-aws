@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
-"""Run many prompts through a batched graph and report throughput. Runs on Inf2, or with --simulate on CPU."""
+"""The throughput benchmark: real distinct prompts through a real full batch, on Inf2 or with --simulate on CPU.
+
+The headline is tokens actually produced divided by wall time, including prompt steps and any idle rows.
+Nothing is projected from a single step. Row 0 runs the saved greedy prompt, so a wrong graph can't look fast.
+"""
 
 import argparse
+import json
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -11,18 +16,27 @@ from tokenizers import Tokenizer
 
 from qwen38_inf2 import checkpoint
 from qwen38_inf2.config import TextConfig
-from qwen38_inf2.generate import EOS_TOKEN_IDS, HostHead, batched_greedy_generate, chat_prompt
+from qwen38_inf2.generate import EOS_TOKEN_IDS, HostHead, batch_step_inputs, batched_greedy_generate, chat_prompt
 
-DEFAULT_PROMPTS = [
-    "What is the capital of France? Answer in one short sentence, then name one famous landmark there.",
-    "Explain why the sky is blue in two sentences.",
-    "Write a haiku about a lighthouse in winter.",
-    "List three prime numbers greater than 100.",
-    "Give one tip for learning to play the piano.",
-    "What does a compiler do? Answer briefly.",
-    "Name the largest planet in the solar system and one of its moons.",
-    "Translate 'good morning, my friend' into Spanish.",
+TOPICS = (
+    "lighthouses, volcanoes, honeybees, glaciers, compilers, bicycles, coral reefs, origami, telescopes, chess, "
+    "sourdough bread, railways, the Roman Empire, tides, fireflies, the printing press, octopuses, jazz, windmills, "
+    "the Silk Road, photosynthesis, submarines, cartography, penguins, the steam engine, mushrooms, suspension bridges, "
+    "the Moon, quilting, black holes, river deltas, paper money, falconry, the immune system, stained glass, monsoons, "
+    "typewriters, tectonic plates, beekeeping, sundials"
+).split(", ")
+TEMPLATES = [
+    "Write two sentences about {}.",
+    "What is one surprising fact about {}?",
+    "Explain {} to a ten year old in one short paragraph.",
+    "Give three bullet points on the history of {}.",
+    "Write a short poem about {}.",
 ]
+
+
+def benchmark_prompts() -> list[str]:
+    """A fixed list of distinct prompts, so every change is measured on the same work."""
+    return [template.format(topic) for topic in TOPICS for template in TEMPLATES]
 
 
 class TimedStep:
@@ -32,13 +46,28 @@ class TimedStep:
         self.step = step
         self.seconds = 0.0
         self.count = 0
+        self.starts = []
 
     def __call__(self, **inputs):
         started = time.perf_counter()
+        self.starts.append(started)
         hidden = self.step(**inputs)
         self.seconds += time.perf_counter() - started
         self.count += 1
         return hidden
+
+
+def screen(step, cfg, batch_size: int, max_seq_len: int, blocks: int, steps: int = 12) -> None:
+    """A quick look at a new graph. Only part of the model runs, so its output means nothing, and it's not throughput."""
+    embeds = torch.zeros(batch_size, 1, cfg.hidden_size, dtype=torch.bfloat16)
+    times = []
+    for position in range(steps):
+        inputs = batch_step_inputs(cfg, [position] * batch_size, max_seq_len, torch.bfloat16)
+        started = time.perf_counter()
+        step(inputs_embeds=embeds, **inputs)
+        times.append(time.perf_counter() - started)
+    median = sorted(times)[steps // 2] / blocks
+    print(f"screening only: {median:.3f}s per block at batch {batch_size}, so about {16 * median:.2f}s on the chip per full step")
 
 
 def main():
@@ -46,23 +75,29 @@ def main():
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--compiled", required=True)
     parser.add_argument("--weights", required=True)
-    parser.add_argument("--prompts-file", type=Path, help="One prompt per line. Defaults to a small built-in set.")
-    parser.add_argument("--sequences", type=int, help="Total sequences to run, repeating the prompts. Defaults to one full batch.")
+    parser.add_argument("--prompts-file", type=Path, help="One prompt per line. Defaults to the fixed benchmark set.")
+    parser.add_argument("--sequences", type=int, help="Total sequences to run. Defaults to two full batches.")
     parser.add_argument("--max-new-tokens", type=int, default=32)
-    parser.add_argument("--raw", action="store_true", help="Don't apply the chat template.")
+    parser.add_argument("--golden", type=Path, default=Path("tests/golden/model.json"), help="Saved greedy result, checked in row 0.")
+    parser.add_argument("--output", type=Path, help="Write the results as JSON here.")
     parser.add_argument("--show", type=int, default=8, help="How many outputs to print.")
     parser.add_argument("--simulate", action="store_true", help="Run on CPU instead of a chip.")
+    parser.add_argument("--screen-blocks", type=int, help="Time this many real blocks at the real batch size, then stop. Takes a minute, and gives no throughput result.")
     args = parser.parse_args()
 
     cfg = TextConfig.from_file(f"{args.model_dir}/config.json")
     info = checkpoint.read_build_info(args.compiled)
     batch_size = info.get("batch_size", 1)
     tokenizer = Tokenizer.from_file(f"{args.model_dir}/tokenizer.json")
-    lines = args.prompts_file.read_text().splitlines() if args.prompts_file else DEFAULT_PROMPTS
-    texts = [line if args.raw else chat_prompt(line) for line in lines if line.strip()]
-    encoded = [tokenizer.encode(text, add_special_tokens=False).ids for text in texts]
-    sequences = args.sequences or batch_size
-    prompts = [encoded[i % len(encoded)] for i in range(sequences)]
+    lines = args.prompts_file.read_text().splitlines() if args.prompts_file else benchmark_prompts()
+    lines = [line for line in lines if line.strip()]
+    sequences = args.sequences or 2 * batch_size
+    if sequences > len(lines) + 1:
+        parser.error(f"only {len(lines)} distinct prompts for {sequences} sequences")
+    golden = json.loads(args.golden.read_text())
+    prompts = [golden["prompt"]] + [
+        tokenizer.encode(chat_prompt(line), add_special_tokens=False).ids for line in lines[: sequences - 1]
+    ]
 
     head = HostHead(checkpoint.TensorSource(f"{args.model_dir}/model.safetensors"), cfg.rms_norm_eps)
     started = time.perf_counter()
@@ -73,42 +108,62 @@ def main():
     else:
         from qwen38_inf2.neuron import NeuronStep
 
-        inner = NeuronStep(args.compiled, args.weights, cfg)
-    print(f"loaded {batch_size}-row graph in {time.perf_counter() - started:.1f}s", flush=True)
+        inner = NeuronStep(args.compiled, args.weights, cfg, args.screen_blocks)
+    load_seconds = time.perf_counter() - started
+    print(f"loaded {batch_size}-row graph in {load_seconds:.1f}s", flush=True)
+
+    if args.screen_blocks:
+        screen(inner, cfg, batch_size, info["max_seq_len"], args.screen_blocks)
+        return
 
     step = TimedStep(inner)
     outputs = defaultdict(list)
+    tokens_at_step = defaultdict(int)
     started = time.perf_counter()
     for index, token_id in batched_greedy_generate(
         step, head, cfg, prompts, batch_size, args.max_new_tokens, info["max_seq_len"], EOS_TOKEN_IDS
     ):
         outputs[index].append(token_id)
-    wall = time.perf_counter() - started
+        tokens_at_step[step.count - 1] += 1
+    finished = time.perf_counter()
+    wall = finished - started
 
-    for index in range(min(args.show, sequences)):
-        print(f"\n[{index}] input:  {lines[index % len(lines)]}")
+    want = golden["output"]
+    golden_ok = outputs[0][: len(want)] == want
+    for index in range(1, min(args.show + 1, sequences)):
+        print(f"\n[{index}] input:  {lines[index - 1]}")
         print(f"[{index}] output: {tokenizer.decode(outputs[index], skip_special_tokens=True)!r}")
 
-    # A prompt repeated across rows must give the same text every time, unless rows interfere.
-    same_prompt = defaultdict(set)
-    for index in range(sequences):
-        same_prompt[index % len(encoded)].add(tuple(outputs[index]))
-    mismatched = sum(len(variants) > 1 for variants in same_prompt.values())
+    # A stretch where every row produced a token is measured from those steps' real tokens and real time.
+    ends = step.starts[1:] + [finished]
+    full_steps = [i for i in range(step.count) if tokens_at_step[i] == batch_size]
+    full_seconds = sum(ends[i] - step.starts[i] for i in full_steps)
 
     generated = sum(len(tokens) for tokens in outputs.values())
     fed = sum(len(p) for p in prompts)
-    print(f"\nbatch size:           {batch_size}")
-    print(f"sequences:            {sequences}")
-    print(f"prompt tokens:        {fed}")
-    print(f"generated tokens:     {generated}")
-    print(f"steps:                {step.count}")
-    print(f"chip per step:        {step.seconds / step.count:.3f}s")
-    print(f"host per step:        {(wall - step.seconds) / step.count:.3f}s")
-    print(f"wall time:            {wall:.1f}s")
-    print(f"generated tokens/s:   {generated / wall:.2f}")
-    print(f"with every row generating: {batch_size * step.count / wall:.2f} tokens/s")
-    print(f"all tokens/s:         {(generated + fed) / wall:.2f}")
-    print(f"prompts with differing outputs across rows: {mismatched}")
+    results = {
+        "batch_size": batch_size,
+        "max_seq_len": info["max_seq_len"],
+        "sequences": sequences,
+        "distinct_prompts": len({tuple(p) for p in prompts}),
+        "prompt_tokens": fed,
+        "generated_tokens": generated,
+        "steps": step.count,
+        "chip_seconds_per_step": step.seconds / step.count,
+        "host_seconds_per_step": (wall - step.seconds) / step.count,
+        "wall_seconds": wall,
+        "generated_tokens_per_second": generated / wall,
+        "all_tokens_per_second": (generated + fed) / wall,
+        "steps_with_every_row_generating": len(full_steps),
+        "tokens_per_second_when_every_row_generated": batch_size * len(full_steps) / full_seconds if full_steps else None,
+        "golden_row_matches": golden_ok,
+        "golden_row_tokens": outputs[0][: len(want)],
+        "load_seconds": load_seconds,
+    }
+    print()
+    print(json.dumps(results, indent=1))
+    if args.output:
+        args.output.write_text(json.dumps(results, indent=1))
 
 
 if __name__ == "__main__":

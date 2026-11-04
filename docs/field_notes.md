@@ -76,5 +76,6 @@ Goal: tokens per second across all sequences. Latency per token doesn't matter.
 - FP4 decode is the bottleneck: a real matrix decodes at 3.59 G values/s, and each core decodes 12.16 G values per token, so about 3.4 s of 3.74 s. Matrix math is very small in comparison.
 - So batching comes first: all rows of a batch share one decode.
 - Batch 32 compiled in 5.5 minutes on `utcs-life` with `--optimize-layout`, and the compiler's estimate is 15.65 GB per core. It loads in 114 s.
-- Batch 32 on the chip: 4.10 s per step on the chip and 0.65 s on the host, so 6.7 tokens/s with every row generating, against about 0.25 at batch 1. Decode really is shared. On 32 short prompts with 32 new tokens each, including prompt steps and idle rows: 2.97 generated tokens/s. All repeated prompts gave the same output across rows.
+- Batch 32 on the chip: 4.10 s per step on the chip and 0.65 s on the host, so decode really is shared. On 32 short prompts with 32 new tokens each, including prompt steps and idle rows: 2.97 generated tokens/s. All repeated prompts gave the same output across rows. Only ever quote measured throughput, from `scripts/batch_generate.py`, not a figure projected from one step.
 - Separating nibbles with shift and mask instead of `floor` raises decode from 3.59 to 5.97 G values/s on a real matrix (`scripts/bench_decode.py`). Avoiding the interleave alone barely helps: 3.70.
+- Measured numbers live in [throughput.md](throughput.md). A short run undercounts batching if it's only one batch, because rows that finish early sit idle at the end.
