@@ -53,8 +53,21 @@ def step_inputs(cfg: TextConfig, position: int, max_seq_len: int, dtype: torch.d
 
 def batch_step_inputs(cfg: TextConfig, positions: Sequence[int], max_seq_len: int, dtype: torch.dtype) -> dict[str, torch.Tensor]:
     """`step_inputs` with one row per sequence, each at its own position."""
-    rows = [step_inputs(cfg, position, max_seq_len, dtype) for position in positions]
-    return {name: torch.cat([row[name] for row in rows]) for name in rows[0]}
+    position = torch.as_tensor(positions, dtype=torch.long)
+    if int(position.max()) >= max_seq_len:
+        raise ValueError(f"position {int(position.max())} is past the compiled max_seq_len of {max_seq_len}")
+    dim = cfg.rotary_dim
+    inv_freq = 1.0 / (cfg.rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    freqs = position.float().unsqueeze(-1) * inv_freq
+    slots = torch.arange(max_seq_len)
+    filled = slots.unsqueeze(0) <= position.unsqueeze(-1)
+    return {
+        "cos": freqs.cos().repeat(1, 2).unsqueeze(1).to(dtype),
+        "sin": freqs.sin().repeat(1, 2).unsqueeze(1).to(dtype),
+        "write_mask": (slots.unsqueeze(0) == position.unsqueeze(-1)).float().reshape(-1, 1, max_seq_len, 1),
+        "attn_mask": torch.where(filled, 0.0, MASKED_SCORE).float().reshape(-1, 1, 1, max_seq_len),
+        "keep_state": (position != 0).float(),
+    }
 
 
 class HostHead:
