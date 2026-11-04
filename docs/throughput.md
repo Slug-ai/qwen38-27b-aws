@@ -1,5 +1,7 @@
 # Throughput log
 
+**The goal is maximum throughput, not latency.** Time per token doesn't matter, so any trade that raises total tokens per second is worth making.
+
 One change per row, each measured on the real chip with `scripts/batch_generate.py`.
 
 **The benchmark:** `inf2.xlarge`, two full batches of distinct prompts (about 21 prompt tokens each), 32 new tokens per sequence, greedy. Row 0 runs the saved greedy prompt, and its output has to match, so a wrong graph can't look fast.

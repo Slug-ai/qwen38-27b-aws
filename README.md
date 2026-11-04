@@ -4,6 +4,8 @@ Runs the text part of [RedHatAI/Qwen3.8-27B-MXFP4](https://huggingface.co/RedHat
 
 **Status: runs end to end on a real `inf2.xlarge`.** Currently 5.78 generated tokens/s at batch 32, measured. See [the throughput log](docs/throughput.md) and [the field notes](docs/field_notes.md), which cover setup on the Amazon Linux Neuron AMI.
 
+**Goal: maximum throughput, not latency.** Every design choice is judged by total tokens per second across all sequences. Time per token doesn't matter, so large batches and slow steps are fine.
+
 ## How it works
 
 - **FP4 on a chip without FP4.** NeuronCore-v2 has no FP4 type (native MX compute is Trn3 only). Weights stay packed on the device and the graph expands them to BF16 for each matmul. This is what makes the model fit, and it's also most of the time per step:
