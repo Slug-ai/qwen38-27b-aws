@@ -22,7 +22,7 @@ from safetensors.torch import load_file
 
 from qwen38_inf2 import checkpoint, chip_check, probes
 from qwen38_inf2.config import TextConfig
-from qwen38_inf2.generate import HostHead, greedy_generate
+from qwen38_inf2.generate import HostHead, greedy_generate, step_inputs
 
 LEVELS = ["decode", "matrix", "layer", "block", "model", "greedy", "speed"]
 SPEED_TOKENS = 16
@@ -97,6 +97,33 @@ def run_level(level, args, cfg, backend, state):
     return chip_check.measure_speed(step, head, cfg, golden["prompt"], SPEED_TOKENS, args.max_seq_len)
 
 
+def run_preflight(args, cfg):
+    """Check every graph against its real call and every weight file, with no device. Returns True if clean."""
+    from qwen38_inf2 import neuron
+
+    dtype = chip_check.DTYPE
+    tokens = {"inputs_embeds": torch.zeros(1, 1, cfg.hidden_size, dtype=dtype), **step_inputs(cfg, 0, args.max_seq_len, dtype)}
+    num_blocks = cfg.num_hidden_layers // args.block_layers
+    block_files = [
+        [checkpoint.rank_block_header(args.weights, block, rank, args.block_layers) for rank in range(2)]
+        for block in range(num_blocks)
+    ]
+    checks = [
+        ("decode", args.levels_dir / "decode", {"gain": torch.ones(1, dtype=dtype)}, [[]]),
+        ("matrix", args.levels_dir / "matrix", {"x": torch.zeros(1, 1, probes.MATRIX_IN_FEATURES, dtype=dtype)}, [[]]),
+        ("layer", args.levels_dir / "layer", tokens, [[checkpoint.rank_block_header(args.weights, 0, r, 1) for r in range(2)]]),
+        ("block", args.compiled, tokens, block_files),
+    ]
+    clean = True
+    for name, model_dir, inputs, weight_sets in checks:
+        problems = sorted({p for headers in weight_sets for p in neuron.preflight(model_dir, inputs, headers)})
+        print(f"{name}: {'ok' if not problems else 'PROBLEMS'} ({len(weight_sets)} weight set(s) compared)", flush=True)
+        for problem in problems[:8]:
+            print(f"  {problem}")
+        clean = clean and not problems
+    return clean
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--backend", choices=("neuron", "cpu"), default="neuron")
@@ -109,10 +136,15 @@ def main():
     parser.add_argument("--max-seq-len", type=int, default=2048)
     parser.add_argument("--block-layers", type=int, default=4)
     parser.add_argument("--keep-going", action="store_true", help="Continue past a failed level.")
+    parser.add_argument("--preflight", action="store_true", help="Check graphs and weight files with no device, then stop.")
     parser.add_argument("--output", type=Path, help="Write results as JSON here.")
     args = parser.parse_args()
 
     cfg = TextConfig.from_file(args.model_dir / "config.json")
+    if args.preflight:
+        clean = run_preflight(args, cfg)
+        print("preflight", "passed" if clean else "FAILED")
+        sys.exit(0 if clean else 1)
     backend = (CpuBackend if args.backend == "cpu" else NeuronBackend)(args, cfg)
 
     results, state, failed = [], {}, False

@@ -17,10 +17,12 @@ from torch_neuronx.proto import metaneff_pb2
 from torch_neuronx.pyhlo import hlo_pb2
 
 from qwen38_inf2 import checkpoint
-from qwen38_inf2.config import LINEAR, TextConfig, tiny_config
+from qwen38_inf2.config import FULL, LINEAR, TextConfig, tiny_config
 
 STATE_SUFFIXES = (".conv_state", ".recurrent_state", ".k_cache", ".v_cache")
-USER_INPUTS = {"inputs_embeds", "cos", "sin", "write_mask", "attn_mask", "keep_state"}
+# The tracer drops inputs a graph never uses. Gated delta layers use neither rotary terms nor masks.
+FULL_ATTENTION_INPUTS = {"cos", "sin", "write_mask", "attn_mask"}
+GATED_DELTA_INPUTS = {"inputs_embeds", "keep_state"}
 # Ops that would mean the graph is not the one the model intends, or that lower poorly on this target.
 FORBIDDEN_OPS = {"gather", "scatter", "convolution", "while", "triangular-solve", "custom-call"}
 
@@ -80,8 +82,9 @@ def inspect(workdir: Path, cfg: TextConfig) -> tuple[dict, list[str]]:
         problems.append(f"non-cache tensors are linked as state: {not_cache[:5]}")
     if weight_dtypes["UINT8"] != want["fp4_matrices"]:
         problems.append(f"expected {want['fp4_matrices']} packed uint8 weights, found {weight_dtypes['UINT8']}")
-    if user_keys != USER_INPUTS:
-        problems.append(f"user inputs differ from the graph contract: {sorted(user_keys ^ USER_INPUTS)}")
+    wanted_inputs = GATED_DELTA_INPUTS | (FULL_ATTENTION_INPUTS if FULL in cfg.layer_types else set())
+    if user_keys != wanted_inputs:
+        problems.append(f"user inputs differ from the graph contract: {sorted(user_keys ^ wanted_inputs)}")
     bad_ops = sorted(FORBIDDEN_OPS & all_ops)
     if bad_ops:
         problems.append(f"unexpected ops: {bad_ops}")

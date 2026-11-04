@@ -86,6 +86,42 @@ def build(
     )
 
 
+def preflight(model_dir: str | Path, inputs: dict[str, torch.Tensor], weight_headers: list[dict] = ()) -> list[str]:
+    """Run everything NxD does before touching a device, and compare weight files with the graph.
+
+    Needs no Neuron hardware. `weight_headers` are safetensors headers, one per core, so no weights load.
+    Returns a list of problems. A problem found here would otherwise only show up on a chip.
+    """
+    from torch_neuronx.proto import metaneff_pb2
+
+    model = NxDModel.load(str(Path(model_dir) / MODEL_FILE))
+    ordered, names = model.convert_dict_to_ordered_list(inputs, 0)
+    key = model.router(ordered, names)[0]
+    flattened = model.flattener_map[key](ordered)
+    meta = model.get_metaneff(key)
+    tensor_type = metaneff_pb2.MetaTensor.Type.Name
+
+    problems = []
+    wanted = [t for t in meta.input_tensors if tensor_type(t.type) == "USER_INPUT"]
+    if len(flattened) != len(wanted):
+        problems.append(f"call passes {len(flattened)} tensors but the graph wants {len(wanted)}")
+    for got, tensor in zip(flattened, wanted):
+        if list(got.shape) != list(tensor.shape):
+            problems.append(f"{tensor.user_input_key.decode()}: shape {list(got.shape)}, graph wants {list(tensor.shape)}")
+
+    graph_weights = {t.checkpoint_key.decode(): t for t in meta.input_tensors if tensor_type(t.type) == "INPUT_WEIGHT"}
+    data_type = metaneff_pb2.MetaTensor.DataType.Name
+    dtypes = {"BF16": "BFLOAT16", "U8": "UINT8"}
+    for rank, header in enumerate(weight_headers):
+        if set(header) != set(graph_weights):
+            problems.append(f"core {rank} weight names differ: {sorted(set(header) ^ set(graph_weights))[:4]}")
+        for name in set(header) & set(graph_weights):
+            tensor = graph_weights[name]
+            if header[name]["shape"] != list(tensor.shape) or dtypes[header[name]["dtype"]] != data_type(tensor.data_type):
+                problems.append(f"core {rank} {name}: file {header[name]['shape']}, graph {list(tensor.shape)}")
+    return problems
+
+
 def load_graph(model_dir: str | Path, rank_weights: list[dict[str, torch.Tensor]]):
     """Load a compiled graph onto the chip and return a function that runs it."""
     model = NxDModel.load(str(Path(model_dir) / MODEL_FILE))

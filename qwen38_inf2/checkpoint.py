@@ -261,6 +261,14 @@ def load_rank_block(weights_dir: str | Path, block: int, rank: int, layers: int 
     return {name: tensor for name, tensor in weights.items() if int(name.split(".")[1]) < layers}
 
 
+def rank_block_header(weights_dir: str | Path, block: int, rank: int, layers: int | None = None) -> dict:
+    """Names, shapes and dtypes of one block's weights, read without loading them."""
+    header = TensorSource(shard_path(weights_dir, block, rank)).header
+    if layers is None:
+        return header
+    return {name: entry for name, entry in header.items() if int(name.split(".")[1]) < layers}
+
+
 def read_build_info(model_dir: str | Path) -> dict:
     return json.loads((Path(model_dir) / BUILD_INFO_FILE).read_text())
 

@@ -125,7 +125,13 @@ Compile the small graphs on the same machine as the block, then copy `artifacts/
 python scripts/compile_levels.py --config tests/fixtures/config.json --output artifacts/levels
 ```
 
-On the instance:
+On the instance, run the preflight first. It needs no device, so it also works in the Docker image. It runs NxD's argument routing for each graph and compares all 16 blocks of weight files with the graph:
+
+```bash
+python scripts/chip_check.py --preflight --model-dir model --weights weights --compiled artifacts/block4
+```
+
+Then run the check on the chip:
 
 ```bash
 python scripts/chip_check.py --model-dir model --weights weights --compiled artifacts/block4 --output chip_report.json
