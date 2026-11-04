@@ -216,3 +216,24 @@ class RecordingSource:
     def get(self, name: str) -> torch.Tensor:
         self.read.add(name)
         return self.source.get(name)
+
+
+class ShapeSource:
+    """Serves meta tensors from a header, so the full model's shapes can be checked without weights."""
+
+    def __init__(self, header: dict):
+        self.header = header
+
+    def names(self) -> list[str]:
+        return list(self.header)
+
+    def shape(self, name: str) -> list[int]:
+        return self.header[name]["shape"]
+
+    def get(self, name: str) -> torch.Tensor:
+        entry = self.header[name]
+        return torch.empty(entry["shape"], dtype=_DTYPES[entry["dtype"]][0], device="meta")
+
+
+def device_bytes_per_rank(weights: dict[str, torch.Tensor]) -> int:
+    return sum(t.numel() * t.element_size() for t in weights.values())

@@ -1,0 +1,14 @@
+# Neuron SDK 2.28.1, the last release whose NxD stack and NKI support Inf2.
+# Source: https://awsdocs-neuron.readthedocs-hosted.com/en/latest/release-notes/prev/content.html
+torch==2.9.*
+torch-xla==2.9.*
+torch-neuronx==2.9.0.2.12.22436
+neuronx-cc==2.23.6484.0
+neuronx-distributed==0.17.26814
+libneuronxla==2.2.15515.0
+nki==0.2.0
+
+safetensors
+tokenizers
+numpy
+pytest
