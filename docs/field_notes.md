@@ -58,3 +58,8 @@ The AMI ships an older SDK than the one our graphs were compiled with:
 
 - `decode` passes: 512 of 512 values exact, 15 s including imports. Graphs compiled with the SDK 2.28.1 compiler load and run with the 2.28.1 runtime on the AMI's older 2.25.4 driver.
 - `kernel-devel` for the AMI's running kernel isn't in the repos, so the driver wasn't upgraded. So far it hasn't mattered.
+- `matrix` passes: error 0.00197, identical to the CPU's BF16 error.
+- `layer` and `block` pass: errors 0.03% to 0.68% against a 2% limit, on 6 tokens.
+- A process can't run one-core and two-core graphs together. The runtime sets its world size from the first graph it loads, and a later two-core graph fails with `NRT_INVALID in nrt_load()`, `World size of neff 2 is greater than world size of global communicator 1`. Run `decode` and `matrix` separately from `layer` onward.
+- `CCOM WARN NET/OFI ... is EFA enabled?` is harmless on a single chip.
+- `prepare_weights.py` took 3 minutes.
