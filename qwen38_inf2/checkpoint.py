@@ -184,10 +184,21 @@ def layer_weights(
 
 
 def rank_weights(source, cfg: TextConfig, rank: int, tp_degree: int, dtype: torch.dtype = torch.bfloat16):
-    """All on-device weights for one rank."""
-    out = {"norm_weight": source.get(FINAL_NORM).to(dtype)}
-    for index in range(cfg.num_hidden_layers):
-        out |= layer_weights(source, cfg, index, rank, tp_degree, dtype)
+    """All on-device weights for one rank, when the whole model is one graph."""
+    return block_weights(source, cfg, 0, cfg.num_hidden_layers, rank, tp_degree, dtype)
+
+
+def block_weights(
+    source, cfg: TextConfig, block: int, block_layers: int, rank: int, tp_degree: int, dtype: torch.dtype = torch.bfloat16
+) -> dict[str, torch.Tensor]:
+    """Weights for one repeat of a compiled block, renamed to that block's own layer numbers."""
+    first = block * block_layers
+    if cfg.layer_types[first : first + block_layers] != cfg.layer_types[:block_layers]:
+        raise ValueError(f"layers {first}..{first + block_layers - 1} do not repeat the compiled block")
+    out = {}
+    for offset in range(block_layers):
+        for name, tensor in layer_weights(source, cfg, first + offset, rank, tp_degree, dtype).items():
+            out[f"layers.{offset}." + name.split(".", 2)[2]] = tensor
     return out
 
 

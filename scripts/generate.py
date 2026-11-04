@@ -30,10 +30,15 @@ def main():
     prompt_ids = tokenizer.encode(text, add_special_tokens=False).ids
 
     source = checkpoint.TensorSource(f"{args.model_dir}/model.safetensors")
-    head = HostHead(source.get(checkpoint.EMBED_TOKENS), source.get(checkpoint.LM_HEAD))
+    head = HostHead(
+        source.get(checkpoint.EMBED_TOKENS),
+        source.get(checkpoint.FINAL_NORM),
+        source.get(checkpoint.LM_HEAD),
+        cfg.rms_norm_eps,
+    )
 
     started = time.perf_counter()
-    step = NeuronStep(args.compiled, args.weights)
+    step = NeuronStep(args.compiled, args.weights, cfg)
     print(f"loaded in {time.perf_counter() - started:.1f}s", flush=True)
 
     started = time.perf_counter()

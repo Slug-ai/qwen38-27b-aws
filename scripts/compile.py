@@ -12,7 +12,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", help="Path to the model's config.json. Omit with --tiny.")
     parser.add_argument("--tiny", action="store_true", help="Compile the tiny test model instead.")
-    parser.add_argument("--layers", type=int, help="Keep only the first N layers, to check lowering cheaply.")
+    parser.add_argument("--layers", type=int, help="Compile only the first N layers. 4 is one repeating block, loaded 16 times at run time.")
     parser.add_argument("--max-seq-len", type=int, default=2048)
     parser.add_argument("--tp-degree", type=int, default=2)
     parser.add_argument("--target", default="inf2")

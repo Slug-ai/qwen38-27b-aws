@@ -1,6 +1,7 @@
 """Check the full 27B model against the real checkpoint header. No weights are read."""
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -45,10 +46,26 @@ def test_every_parameter_loads_with_the_right_shape(cfg, header, tp_degree, rank
         assert param.dtype == weights[name].dtype, name
 
 
+def test_the_real_model_is_sixteen_repeats_of_one_block(cfg, header):
+    """Every block's weights must load into the same compiled four-layer graph."""
+    block_layers = 4
+    assert cfg.num_hidden_layers % block_layers == 0
+    block_cfg = replace(cfg, layer_types=cfg.layer_types[:block_layers])
+    with torch.device("meta"):
+        model = Qwen38Step(block_cfg, max_seq_len=128, tp_degree=2)
+    params = dict(model.named_parameters())
+    source = checkpoint.ShapeSource(header)
+    for block in range(cfg.num_hidden_layers // block_layers):
+        for rank in range(2):
+            weights = checkpoint.block_weights(source, cfg, block, block_layers, rank, 2)
+            assert set(weights) == set(params)
+            assert all(weights[n].shape == params[n].shape and weights[n].dtype == params[n].dtype for n in params)
+
+
 def test_only_vision_mtp_and_fp8_scales_go_unread(cfg, header):
     source = checkpoint.RecordingSource(checkpoint.ShapeSource(header))
     checkpoint.rank_weights(source, cfg, 0, 1)
-    unread = set(header) - source.read - {checkpoint.EMBED_TOKENS, checkpoint.LM_HEAD}
+    unread = set(header) - source.read - {checkpoint.EMBED_TOKENS, checkpoint.FINAL_NORM, checkpoint.LM_HEAD}
     assert all(n.startswith("model.visual.") or n.endswith(checkpoint.UNUSED_LAYER_SUFFIXES) for n in unread), unread
     assert not [n for n in source.read if "visual" in n or "mtp" in n]
 

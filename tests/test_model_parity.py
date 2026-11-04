@@ -1,13 +1,14 @@
 """The single-token graph must reproduce the Hugging Face model on the same FP4 weights."""
 
 import threading
+from dataclasses import replace
 
 import pytest
 import torch
 
 from qwen38_inf2 import checkpoint
 from qwen38_inf2.config import tiny_config
-from qwen38_inf2.generate import HostHead, greedy_generate, step_inputs
+from qwen38_inf2.generate import BlockChain, HostHead, greedy_generate, step_inputs
 from qwen38_inf2.model import Qwen38Step
 
 from .reference import build_reference
@@ -35,7 +36,9 @@ def run_tokens(model, cfg, head, token_ids, dtype):
 
 
 def host_head(tensors):
-    return HostHead(tensors[checkpoint.EMBED_TOKENS], tensors[checkpoint.LM_HEAD])
+    return HostHead(
+        tensors[checkpoint.EMBED_TOKENS], tensors[checkpoint.FINAL_NORM], tensors[checkpoint.LM_HEAD], tiny_config().rms_norm_eps
+    )
 
 
 def reference_and_ours(cfg, dtype):
@@ -90,6 +93,38 @@ def test_keep_state_zero_starts_a_fresh_sequence():
         list(greedy_generate(model, head, cfg, [9, 9, 9, 1, 2], 8, MAX_SEQ_LEN, dtype=torch.float32))
         again = list(greedy_generate(model, head, cfg, PROMPT, 8, MAX_SEQ_LEN, dtype=torch.float32))
     assert first == again
+
+
+def test_chained_blocks_match_one_whole_graph():
+    """One compiled block loaded per repeat must equal the model compiled as a single graph."""
+    cfg = tiny_config(num_blocks=3)
+    _, tensors = build_reference(cfg)
+    head = host_head(tensors)
+    dtype = torch.float32
+    source = checkpoint.DictSource(tensors)
+    block_layers = 4
+
+    block_cfg = replace(cfg, layer_types=cfg.layer_types[:block_layers])
+    blocks = []
+    for block in range(cfg.num_hidden_layers // block_layers):
+        model = Qwen38Step(block_cfg, MAX_SEQ_LEN, dtype=dtype).eval()
+        weights = checkpoint.block_weights(source, cfg, block, block_layers, 0, 1, dtype)
+        missing, unexpected = model.load_state_dict(weights, strict=False)
+        assert not unexpected and all(name.endswith(("_cache", "_state")) for name in missing)
+        blocks.append(model)
+
+    with torch.no_grad():
+        whole = load_model(tensors, cfg, dtype)
+        want = list(greedy_generate(whole, head, cfg, PROMPT, 12, MAX_SEQ_LEN, dtype=dtype))
+        got = list(greedy_generate(BlockChain(blocks), head, cfg, PROMPT, 12, MAX_SEQ_LEN, dtype=dtype))
+    assert got == want
+
+
+def test_block_weights_reject_a_non_repeating_layout():
+    cfg = tiny_config()
+    _, tensors = build_reference(cfg)
+    with pytest.raises(ValueError):
+        checkpoint.block_weights(checkpoint.DictSource(tensors), cfg, 1, 2, 0, 1)  # layers 2, 3 are linear, full
 
 
 class ThreadedAllReduce:
@@ -154,5 +189,5 @@ def test_all_text_tensors_are_consumed():
     _, tensors = build_reference(cfg)
     source = checkpoint.RecordingSource(checkpoint.DictSource(tensors))
     checkpoint.rank_weights(source, cfg, 0, 1)
-    host_only = {checkpoint.EMBED_TOKENS, checkpoint.LM_HEAD}
+    host_only = {checkpoint.EMBED_TOKENS, checkpoint.FINAL_NORM, checkpoint.LM_HEAD}
     assert set(tensors) - source.read == host_only

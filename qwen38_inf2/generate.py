@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterator, Sequence
 import torch
 
 from .config import TextConfig
-from .model import MASKED_SCORE
+from .model import MASKED_SCORE, rms_norm
 
 # From the checkpoint's generation_config.json: <|im_end|> and <|endoftext|>.
 EOS_TOKEN_IDS = (248046, 248044)
@@ -51,10 +51,12 @@ def step_inputs(cfg: TextConfig, position: int, max_seq_len: int, dtype: torch.d
 
 
 class HostHead:
-    """Embedding lookup and lm_head, kept off the device to save 5 GB of its memory."""
+    """Embedding lookup, final norm and lm_head, kept off the device to save 5 GB of its memory."""
 
-    def __init__(self, embed_tokens: torch.Tensor, lm_head: torch.Tensor):
+    def __init__(self, embed_tokens: torch.Tensor, norm_weight: torch.Tensor, lm_head: torch.Tensor, eps: float):
         self.embed_tokens = embed_tokens
+        self.norm_weight = norm_weight
+        self.eps = eps
         # float32 because CPU BF16 matmul is far slower. This costs host RAM, not device memory.
         self.lm_head = lm_head.float()
 
@@ -62,7 +64,20 @@ class HostHead:
         return self.embed_tokens[token_id].reshape(1, 1, -1).to(dtype)
 
     def logits(self, hidden: torch.Tensor) -> torch.Tensor:
-        return hidden.float().reshape(-1) @ self.lm_head.T
+        return rms_norm(hidden.float(), self.norm_weight, self.eps).reshape(-1) @ self.lm_head.T
+
+
+class BlockChain:
+    """Run compiled blocks of layers in sequence, as one step."""
+
+    def __init__(self, blocks: Sequence[Callable[..., torch.Tensor]]):
+        self.blocks = blocks
+
+    def __call__(self, inputs_embeds: torch.Tensor, **inputs: torch.Tensor) -> torch.Tensor:
+        hidden = inputs_embeds
+        for block in self.blocks:
+            hidden = block(inputs_embeds=hidden, **inputs)
+        return hidden
 
 
 def greedy_generate(

@@ -11,7 +11,7 @@ from safetensors.torch import load_file, save_file
 
 from . import checkpoint
 from .config import TextConfig
-from .generate import step_inputs
+from .generate import BlockChain, step_inputs
 from .model import Qwen38Step
 
 DTYPE = torch.bfloat16
@@ -63,27 +63,32 @@ def read_build_info(model_dir: str | Path) -> dict:
     return json.loads((Path(model_dir) / BUILD_INFO_FILE).read_text())
 
 
-def shard_path(weights_dir: str | Path, rank: int) -> Path:
-    return Path(weights_dir) / f"tp{rank}.safetensors"
+def shard_path(weights_dir: str | Path, block: int, rank: int) -> Path:
+    return Path(weights_dir) / f"block{block:02d}_tp{rank}.safetensors"
 
 
-def write_rank_weights(source, cfg: TextConfig, weights_dir: str | Path, tp_degree: int = 2) -> None:
-    """Cut the checkpoint into one file per NeuronCore. Vision and MTP tensors are never read."""
+def write_rank_weights(source, cfg: TextConfig, weights_dir: str | Path, block_layers: int, tp_degree: int = 2) -> None:
+    """Write one file per block per NeuronCore. Vision and MTP tensors are never read."""
     Path(weights_dir).mkdir(parents=True, exist_ok=True)
-    for rank in range(tp_degree):
-        weights = checkpoint.rank_weights(source, cfg, rank, tp_degree, DTYPE)
-        save_file({k: v.contiguous() for k, v in weights.items()}, shard_path(weights_dir, rank))
-        del weights
+    for block in range(cfg.num_hidden_layers // block_layers):
+        for rank in range(tp_degree):
+            weights = checkpoint.block_weights(source, cfg, block, block_layers, rank, tp_degree, DTYPE)
+            save_file({k: v.contiguous() for k, v in weights.items()}, shard_path(weights_dir, block, rank))
 
 
-class NeuronStep:
-    """The compiled graph, with the same call signature as `Qwen38Step` for `greedy_generate`."""
+class NeuronStep(BlockChain):
+    """The compiled block, loaded once per repeat with that repeat's weights and its own caches."""
 
-    def __init__(self, model_dir: str | Path, weights_dir: str | Path):
-        self.model = NxDModel.load(str(Path(model_dir) / MODEL_FILE))
-        ranks = range(read_build_info(model_dir)["tp_degree"])
-        self.model.set_weights([load_file(shard_path(weights_dir, rank)) for rank in ranks])
-        self.model.to_neuron()
+    def __init__(self, model_dir: str | Path, weights_dir: str | Path, cfg: TextConfig):
+        info = read_build_info(model_dir)
+        blocks = []
+        for block in range(cfg.num_hidden_layers // info["layers"]):
+            model = NxDModel.load(str(Path(model_dir) / MODEL_FILE))
+            model.set_weights([load_file(shard_path(weights_dir, block, rank)) for rank in range(info["tp_degree"])])
+            model.to_neuron()
+            blocks.append(_named_call(model))
+        super().__init__(blocks)
 
-    def __call__(self, **inputs: torch.Tensor) -> torch.Tensor:
-        return self.model(**inputs)
+
+def _named_call(model):
+    return lambda **inputs: model(**inputs)

@@ -10,7 +10,8 @@ Mirrors `transformers.models.qwen3_5.modeling_qwen3_5` with these changes for Ne
   on-device state. It does not detect `Tensor.copy_`, so do not use that here.
 * Tensor parallelism. Each rank owns a contiguous slice of heads, and each head's computation is
   independent. Only the output projections need a collective (`all_reduce`).
-* Embeddings and lm_head live on the host (see `generate.py`), so the graph maps hidden to hidden.
+* Embeddings, the final norm and lm_head live on the host (see `generate.py`), so the graph maps
+  hidden to hidden. That also lets one compiled block of layers be chained with itself.
 """
 
 import math
@@ -240,10 +241,12 @@ class DecoderLayer(nn.Module):
 
 
 class Qwen38Step(nn.Module):
-    """The compiled graph: one token's embedding in, one token's final hidden state out.
+    """The compiled graph: a run of decoder layers, for one token.
+
+    `cfg.layer_types` may be the whole model or one repeating block of it (see `generate.BlockChain`).
 
     Inputs (all built by `generate.step_inputs`):
-        inputs_embeds: ``[1, 1, hidden]``.
+        inputs_embeds: ``[1, 1, hidden]``, from the embedding table or the previous block.
         cos, sin: rotary terms for this position, ``[1, 1, rotary_dim]``.
         write_mask: float32 ``[1, 1, max_seq_len, 1]``, 1 at this position.
         attn_mask: float32 ``[1, 1, 1, max_seq_len]``, 0 where filled and `MASKED_SCORE` elsewhere.
@@ -264,10 +267,9 @@ class Qwen38Step(nn.Module):
         self.layers = nn.ModuleList(
             DecoderLayer(cfg, layer_type, tp_degree, max_seq_len, dtype, all_reduce) for layer_type in cfg.layer_types
         )
-        self.norm_weight = _frozen(cfg.hidden_size, dtype=dtype)
 
     def forward(self, inputs_embeds, cos, sin, write_mask, attn_mask, keep_state):
         x = inputs_embeds
         for layer in self.layers:
             x = layer(x, cos, sin, write_mask, attn_mask, keep_state)
-        return rms_norm(x, self.norm_weight, self.cfg.rms_norm_eps)
+        return x
