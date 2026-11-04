@@ -76,6 +76,8 @@ python scripts/generate.py --simulate --model-dir model --compiled artifacts/blo
   --prompt "The capital of France is" --raw --max-new-tokens 8
 ```
 
+This is slow, at about 50 seconds per token on an Apple Silicon Mac, and it says nothing about speed on a chip.
+
 ## On the instance
 
 Start with `inf2.xlarge`. It has the same chip as `inf2.8xlarge` and is cheaper, but only 16 GiB of host RAM and 4 vCPUs, so compile elsewhere and copy `artifacts/block4` over. Move up to `inf2.8xlarge` (128 GiB) only if loading the weights runs out of host RAM. Allow at least 50 GB of disk.
@@ -120,7 +122,7 @@ uv pip install --python .venv/bin/python --no-deps compressed-tensors==0.20.1
 python -m pytest tests/test_xla_graph.py
 ```
 
-To check the real weights against the Hugging Face layers without downloading them (about 13 GB of network and no disk, roughly 90 minutes):
+To check the real weights against the Hugging Face layers without downloading them (no disk, but about 13 GB of layers and 5 GB of `lm_head` over the network, which took about 2.5 hours on a slow connection):
 
 ```bash
 PYTHONPATH=. .venv/bin/python scripts/verify_real_weights.py
@@ -136,6 +138,8 @@ PYTHONPATH=. .venv/bin/python scripts/verify_real_weights.py
 | Logits on a tiny model vs Hugging Face | float32 error under 1e-5. BF16 differs only by rounding |
 | Two simulated cores vs one core | Match to under 1e-5 |
 | Chained blocks vs one whole graph, on a tiny model | Identical greedy output |
+| All 64 real layers vs Hugging Face, in float32 ([results](docs/real_weights_check.json)) | Same top token at 38 of 38 positions, worst relative layer error 5.3e-6. Predicts `France is -> Paris`, `Japan is -> Tokyo` |
+| Real layers 0 and 3 as two simulated cores vs one core | Absolute error about 1e-6 to 2e-6 |
 | Real checkpoint header vs the full model | Every tensor maps, for both cores and all 16 blocks |
 | Traced graph through XLA on CPU vs PyTorch, on a tiny model | float32 error under 1e-4 relative, at every token |
 | Compile for `--target inf2` on two cores, real layer sizes | 4 layers and 8 layers both compile |
