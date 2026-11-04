@@ -35,6 +35,7 @@ def build(
     target: str = "inf2",
     extra_compiler_args: str = "",
     workdir: str | Path | None = None,
+    optimize_layout: bool = False,
 ) -> Path:
     """Trace and compile the single-token graph for `tp_degree` NeuronCores."""
     output_dir = Path(output_dir)
@@ -49,7 +50,11 @@ def build(
         )
         builder = ModelBuilder(model)
         builder.trace(kwargs=example_inputs(cfg, max_seq_len), tag="decode")
-        nxd_model = builder.compile(compiler_args=compiler_args, compiler_workdir=workdir)
+        nxd_model = builder.compile(
+            priority_model_key="decode" if optimize_layout else None,
+            compiler_args=compiler_args,
+            compiler_workdir=workdir,
+        )
 
     path = output_dir / MODEL_FILE
     nxd_model.save(str(path))

@@ -17,6 +17,7 @@ def main():
     parser.add_argument("--tp-degree", type=int, default=2)
     parser.add_argument("--target", default="inf2")
     parser.add_argument("--compiler-args", default="")
+    parser.add_argument("--optimize-layout", action="store_true", help="Use NxD's weight layout optimization.")
     parser.add_argument("--output", required=True)
     parser.add_argument("--workdir", help="Compiler scratch and logs. Defaults to <output>/compiler-work.")
     args = parser.parse_args()
@@ -29,7 +30,7 @@ def main():
 
     started = time.time()
     workdir = args.workdir or f"{args.output}/compiler-work"
-    path = build(cfg, args.max_seq_len, args.output, args.tp_degree, args.target, args.compiler_args, workdir)
+    path = build(cfg, args.max_seq_len, args.output, args.tp_degree, args.target, args.compiler_args, workdir, args.optimize_layout)
     print(f"compiled {cfg.num_hidden_layers} layers for {args.target} in {time.time() - started:.0f}s: {path}")
 
 
