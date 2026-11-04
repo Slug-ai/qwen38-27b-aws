@@ -23,6 +23,7 @@ One change per row, each measured on the real chip with `scripts/batch_generate.
 | 11 | Scratchpad pages of 128 MB instead of the runtime's default, which frees 256 MB per core | 60 | 0.30 | 0.03 | 99.64 | 167.39 | yes, 38 of 38, see below |
 | 12 | Scratchpad pages of 64 MB, which fits two more rows. Not an improvement, because host time doubled | 62 | 0.29 | 0.06 | 97.29 | 163.49 | yes, 38 of 38 |
 | 13 | Read lm_head and the embeddings into the disk cache after loading | 62 | 0.29 | 0.03 | 108.32 | 182.03 | yes, 38 of 38 |
+| 14 | One more row, and the compiler's plan for this batch size is faster | 63 | 0.26 | 0.03 | 120.65 | 202.78 | yes, 38 of 38, see below |
 
 Rows 1 to 4 allow 2048 tokens of prompt plus output, and from row 5 it's 512. Batch 24 at 2048 ran out of chip memory.
 
@@ -33,6 +34,8 @@ Row 7 changes numbers, not just speed. Compared with row 6's build on the same p
 Row 11's host time fell with no host code change, probably because the checkpoint's lm_head rows were already in the disk cache from earlier runs, so part of its gain isn't from the scratchpad. A long-running server would also see the warm number. With every row generating, row 11 reached 172.1 tok/s over 12 steps.
 
 Row 13 reached 192.1 tok/s with every row generating, over 13 steps. A run at batch 60 with the same warm cache gave 101.01 generated tok/s and 0.30 s on the chip, so batch 62 really is faster per step there.
+
+Row 14 reached 211.5 tok/s with every row generating, over 19 steps. Its token comparison with the float32-state build is 31 of 40 identical sequences and 1135 of 1280 tokens before a first difference.
 
 Raw results are in [throughput/](throughput/). `git log docs/throughput.md` gives the commit for each row.
 
