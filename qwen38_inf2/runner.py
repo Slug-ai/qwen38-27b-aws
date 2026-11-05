@@ -29,7 +29,7 @@ class Loaded:
 
 
 def load(model_dir, compiled, weights, head_dir=None, simulate: bool = False, log: Callable[[str], None] = _log) -> Loaded:
-    """Load the graphs and weights, about 3 minutes on the chip, then read lm_head and the embeddings into the disk cache."""
+    """Load the graphs and weights, then read lm_head and the embeddings into the disk cache."""
     # The runtime reads this when it starts. The default page size reserves far more scratchpad than these graphs need.
     os.environ.setdefault("NEURON_SCRATCHPAD_PAGE_SIZE", "64")
     cfg = TextConfig.from_file(f"{model_dir}/config.json")
@@ -44,7 +44,6 @@ def load(model_dir, compiled, weights, head_dir=None, simulate: bool = False, lo
     else:
         head = HostHead(source, cfg.rms_norm_eps)
 
-    log(f"loading the {batch_size}-row graph, which takes about 3 minutes on the chip")
     started = time.perf_counter()
     if simulate:
         from .cpu_sim import SimulatedCoresStep
@@ -55,7 +54,7 @@ def load(model_dir, compiled, weights, head_dir=None, simulate: bool = False, lo
 
         step = NeuronStep(compiled, weights, cfg)
     load_seconds = time.perf_counter() - started
-    log(f"loaded in {load_seconds:.1f}s")
+    log(f"loaded {batch_size}-row graph in {load_seconds:.1f}s")
     if head_dir:
         # Loading the weights pushes these tables out of the disk cache, and each step reads scattered rows of them.
         started = time.perf_counter()

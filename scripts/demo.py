@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """Load the model once, then keep taking prompts, on Inf2 or with --simulate on CPU.
 
-Loading takes about 3 minutes, so this keeps one process running instead of paying for it on every run.
 At the prompt, type a message to see the answer as it's generated, or `@prompts.txt` to run a file of
 prompts, one per line, together. `quit` or Ctrl-D exits, and Ctrl-C stops a generation in progress.
 
-The batch has a fixed number of rows. One message at a time uses one row, so it runs at the chip's step
-rate, about 3.5 tokens/s for the batch 63 build, and each prompt token takes a step too. A file of prompts
-fills the rows, which is where the throughput comes from.
+One message uses one row of the batch. A file of prompts fills the rows, which is where the throughput comes from.
 """
 
 import argparse
