@@ -96,7 +96,7 @@ def compare_tokens(outputs: dict, reference: dict) -> dict:
 
 
 def screen(step, cfg, batch_size: int, max_seq_len: int, blocks: int, steps: int = 12) -> None:
-    """A quick look at a new graph. Only part of the model runs, so its output means nothing, and it's not throughput."""
+    """A quick check that a new graph runs. Its output means nothing, and its timing isn't reliable enough to compare builds."""
     embeds = torch.zeros(batch_size, 1, cfg.hidden_size, dtype=torch.bfloat16)
     times = []
     for position in range(steps):
@@ -125,7 +125,7 @@ def main():
     parser.add_argument("--compare-tokens", type=Path, help="Compare generated tokens with a file from --save-tokens.")
     parser.add_argument("--show", type=int, default=8, help="How many outputs to print.")
     parser.add_argument("--simulate", action="store_true", help="Run on CPU instead of a chip.")
-    parser.add_argument("--screen-blocks", type=int, help="Time this many real blocks at the real batch size, then stop. Takes a minute, and gives no throughput result.")
+    parser.add_argument("--screen-blocks", type=int, help="Time this many real blocks at the real batch size, then stop. Only shows a graph runs, because its timing varies by nearly 2x between runs.")
     args = parser.parse_args()
 
     cfg = TextConfig.from_file(f"{args.model_dir}/config.json")
