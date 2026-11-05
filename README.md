@@ -73,6 +73,18 @@ python scripts/batch_generate.py --model-dir model --compiled artifacts/block16_
 
 For your own prompts, add `--prompts-file prompts.txt --sequences N`, with one prompt per line. Row 0 always runs the saved greedy prompt, so `N` can be at most the number of lines plus one. `--show` sets how many outputs are printed.
 
+### Demo: load once, then keep taking prompts
+
+`batch_generate.py` loads for about 3.5 minutes every run, because the chip keeps nothing after a process exits and the weights don't fit in the host's disk cache. `scripts/demo.py` loads once and then takes prompts until you quit:
+
+```bash
+python scripts/demo.py --model-dir model --compiled artifacts/block16_b63_s512_fp8_bf16state --head artifacts/head_fp8_b63 --weights weights_fp8
+```
+
+At the `>` prompt, type a message to see its answer as it's generated, or `@prompts.txt` to run a file of prompts together, one per line, which prints each answer and the generated tok/s. `quit` or Ctrl-D exits, and Ctrl-C stops a generation in progress. `--max-new-tokens` caps each answer, 256 by default, and prompt plus answer stops at 512 tokens.
+
+One message uses one of the 63 rows, so it runs at the chip's step rate, about 3.5 tokens/s, and each prompt token takes a step before the answer starts. A file of prompts fills the rows, which is where the throughput comes from.
+
 ## Compile (no chip needed)
 
 Compiling one 4-layer FP4 block takes about 10 minutes and peaks at 11.4 GB of RAM. The output is about 37 MB and can be copied to the instance. A single 64-layer FP4 graph would need about 184 GB of RAM and about 2.9 hours to compile, projected from measured compiles of 4 and 8 layers. Pick either route.
