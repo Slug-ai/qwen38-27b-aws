@@ -42,27 +42,33 @@ These choices change some outputs. Against an earlier float32-state build at bat
 
 ## Run the measured build
 
-These commands produced the 108.32 tok/s result. The rest of this README covers the batch-1 FP4 graph used for first bring-up, which is what `scripts/generate.py` and `scripts/chip_check.py` take, and it explains how to set up the compiler, checkpoint and instance used here.
+These commands give the 122.67 tok/s build. The rest of this README covers the batch-1 FP4 graph used for first bring-up, which is what `scripts/generate.py` and `scripts/chip_check.py` take, and it explains how to set up the compiler, checkpoint and instance used here. [The field notes](docs/field_notes.md) cover installing the runtime and Python packages on the Amazon Linux Neuron AMI.
 
-Compile the layers and `lm_head`. Run at the same time on a 16-thread machine, these took about 4 and 5.5 minutes:
+The compiled graphs are in [the `graphs-b63` release](https://github.com/Slug-ai/qwen38-27b-aws/releases/tag/graphs-b63), which is 14 MB to download. From the repo root:
 
 ```bash
-python scripts/compile.py --config tests/fixtures/config.json --layers 16 --max-seq-len 512 --batch-size 62 \
-  --weight-format fp8 --recurrent-state bf16 --optimize-layout --output artifacts/block16_b62
-python scripts/compile.py --config tests/fixtures/config.json --head --head-format fp8 --batch-size 62 --output artifacts/head_b62
+curl -fL https://github.com/Slug-ai/qwen38-27b-aws/releases/download/graphs-b63/graphs_b63.tar.gz | tar xz
+```
+
+Or compile the layers and `lm_head` yourself. Run at the same time on a 16-thread machine, these took about 4 and 5.5 minutes:
+
+```bash
+python scripts/compile.py --config tests/fixtures/config.json --layers 16 --max-seq-len 512 --batch-size 63 \
+  --weight-format fp8 --recurrent-state bf16 --optimize-layout --output artifacts/block16_b63_s512_fp8_bf16state
+python scripts/compile.py --config tests/fixtures/config.json --head --head-format fp8 --batch-size 63 --output artifacts/head_fp8_b63
 ```
 
 Prepare the weights, which takes about 26 GB of disk on top of the 19 GB checkpoint:
 
 ```bash
-python scripts/prepare_weights.py --model-dir model --compiled artifacts/block16_b62 --output weights_fp8
-python scripts/prepare_weights.py --model-dir model --compiled artifacts/head_b62 --output weights_fp8 --head-only
+python scripts/prepare_weights.py --model-dir model --compiled artifacts/block16_b63_s512_fp8_bf16state --output weights_fp8
+python scripts/prepare_weights.py --model-dir model --compiled artifacts/head_fp8_b63 --output weights_fp8 --head-only
 ```
 
 Run the benchmark on the instance. Loading takes about 3 minutes:
 
 ```bash
-python scripts/batch_generate.py --model-dir model --compiled artifacts/block16_b62 --head artifacts/head_b62 --weights weights_fp8
+python scripts/batch_generate.py --model-dir model --compiled artifacts/block16_b63_s512_fp8_bf16state --head artifacts/head_fp8_b63 --weights weights_fp8
 ```
 
 For your own prompts, add `--prompts-file prompts.txt --sequences N`, with one prompt per line. Row 0 always runs the saved greedy prompt, so `N` can be at most the number of lines plus one. `--show` sets how many outputs are printed.
