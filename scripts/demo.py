@@ -11,33 +11,13 @@ fills the rows, which is where the throughput comes from.
 """
 
 import argparse
-import os
 import sys
-import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from pathlib import Path
 
 import torch
-from tokenizers import Tokenizer
 
-from qwen38_inf2 import checkpoint
-from qwen38_inf2.config import TextConfig
-from qwen38_inf2.generate import EOS_TOKEN_IDS, ChipHead, HostHead, batched_greedy_generate, chat_prompt
-
-
-def generate(step, head, cfg, prompts: Sequence[Sequence[int]], batch_size: int, max_new_tokens: int, max_seq_len: int, on_token=None):
-    """Run token-id prompts through the loaded batch, and return each one's new tokens and the wall time.
-
-    Each prompt starts its row at position 0, which clears that row's state, so nothing carries over from
-    an earlier call, including one that was stopped partway.
-    """
-    outputs = [[] for _ in prompts]
-    started = time.perf_counter()
-    for index, token_id in batched_greedy_generate(step, head, cfg, prompts, batch_size, max_new_tokens, max_seq_len, EOS_TOKEN_IDS):
-        outputs[index].append(token_id)
-        if on_token:
-            on_token(index, token_id)
-    return outputs, time.perf_counter() - started
+from qwen38_inf2.runner import encode, generate, load
 
 
 class Streamer:
@@ -56,10 +36,6 @@ class Streamer:
             self.out.write(text[self.written :])
             self.out.flush()
             self.written = len(text)
-
-
-def encode(tokenizer, lines: Sequence[str]) -> list[list[int]]:
-    return [tokenizer.encode(chat_prompt(line), add_special_tokens=False).ids for line in lines]
 
 
 def repl(
@@ -121,8 +97,6 @@ def repl(
 
 
 def main():
-    # The runtime reads this when it starts. The default page size reserves far more scratchpad than these graphs need.
-    os.environ.setdefault("NEURON_SCRATCHPAD_PAGE_SIZE", "64")
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--compiled", required=True)
@@ -132,39 +106,10 @@ def main():
     parser.add_argument("--simulate", action="store_true", help="Run on CPU instead of a chip.")
     args = parser.parse_args()
 
-    cfg = TextConfig.from_file(f"{args.model_dir}/config.json")
-    info = checkpoint.read_build_info(args.compiled)
-    batch_size = info.get("batch_size", 1)
-    tokenizer = Tokenizer.from_file(f"{args.model_dir}/tokenizer.json")
-    source = checkpoint.TensorSource(f"{args.model_dir}/model.safetensors")
-    if args.head:
-        from qwen38_inf2.neuron import load_head_graph
-
-        head = ChipHead(source, cfg.rms_norm_eps, load_head_graph(args.head, args.weights), batch_size)
-    else:
-        head = HostHead(source, cfg.rms_norm_eps)
-
-    print(f"loading the {batch_size}-row graph, which takes about 3 minutes on the chip", flush=True)
-    started = time.perf_counter()
-    if args.simulate:
-        from qwen38_inf2.cpu_sim import SimulatedCoresStep
-
-        step = SimulatedCoresStep(args.weights, cfg, info, torch.bfloat16)
-    else:
-        from qwen38_inf2.neuron import NeuronStep
-
-        step = NeuronStep(args.compiled, args.weights, cfg)
-    print(f"loaded in {time.perf_counter() - started:.1f}s", flush=True)
-    if args.head:
-        # Loading the weights pushes these tables out of the disk cache, and each step reads scattered rows of them.
-        started = time.perf_counter()
-        source.touch(checkpoint.LM_HEAD)
-        source.touch(checkpoint.EMBED_TOKENS)
-        print(f"read lm_head and embeddings into the disk cache in {time.perf_counter() - started:.1f}s", flush=True)
-
+    loaded = load(args.model_dir, args.compiled, args.weights, args.head, args.simulate)
     print("ready. Type a message, or @file.txt for a file of prompts, one per line. quit or Ctrl-D exits.", flush=True)
     with torch.no_grad():
-        repl(step, head, cfg, tokenizer, batch_size, info["max_seq_len"], args.max_new_tokens)
+        repl(loaded.step, loaded.head, loaded.cfg, loaded.tokenizer, loaded.batch_size, loaded.max_seq_len, args.max_new_tokens)
 
 
 if __name__ == "__main__":

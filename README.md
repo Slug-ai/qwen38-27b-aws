@@ -73,6 +73,12 @@ python scripts/batch_generate.py --model-dir model --compiled artifacts/block16_
 
 For your own prompts, add `--prompts-file prompts.txt --sequences N`, with one prompt per line. Row 0 always runs the saved greedy prompt, so `N` can be at most the number of lines plus one. `--show` sets how many outputs are printed.
 
+`scripts/benchmark.py` takes the same arguments and runs the same work, but prints only one example answer, then the batch size, sequences, generated tokens, total time, throughput, tokens per second for one user, and whether row 0 matched. The per-user figure is each sequence's rate from its first new token to its last, averaged, so the wait while its prompt is read isn't in it. It skips the saved-passage check and the JSON results, so use `batch_generate.py` for rows of [the throughput log](docs/throughput.md).
+
+```bash
+python scripts/benchmark.py --model-dir model --compiled artifacts/block16_b63_s512_fp8_bf16state --head artifacts/head_fp8_b63 --weights weights_fp8
+```
+
 ### Demo: load once, then keep taking prompts
 
 `batch_generate.py` loads for about 3.5 minutes every run, because the chip keeps nothing after a process exits and the weights don't fit in the host's disk cache. `scripts/demo.py` loads once and then takes prompts until you quit:

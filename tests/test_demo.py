@@ -10,7 +10,8 @@ from qwen38_inf2 import checkpoint
 from qwen38_inf2.config import tiny_config
 from qwen38_inf2.generate import HostHead
 from qwen38_inf2.model import Qwen38Step
-from scripts.demo import encode, generate, repl
+from qwen38_inf2.runner import encode, generate
+from scripts.demo import repl
 
 from .reference import build_reference
 
