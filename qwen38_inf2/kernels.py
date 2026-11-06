@@ -274,6 +274,124 @@ def _to_sbuf(tile, rows: int, cols: int):
     return copied
 
 
+def _delta_head(h, c):
+    """One value head's chunked gated delta rule for `delta_prefill_body`, piece by piece from its state.
+
+    A generator that yields between dependent steps, so `_interleave` can emit several heads' steps in turn: the
+    engines take instructions in order, and one head alone kept each engine waiting on the others at every step.
+    `c` holds the kernel's inputs, constants and conv outputs.
+    """
+    (state, decay, beta, z, gated, final, q_t, k_t, v_p, mask, eye, ones, epsilon_column, weight_row, i_p, i_f,
+     repeat, pieces, k_head, v_head) = c
+    kh = h // repeat
+    s = nl.load(state[h])
+    for t in list(range(pieces)):
+        cols = slice(t * PIECE, (t + 1) * PIECE)
+        q_tp = q_t[kh][:, cols]
+        k_tp = k_t[kh][:, cols]
+        k_p = nl.ndarray((nl.par_dim(PIECE), k_head), dtype=nl.float32, buffer=nl.sbuf)
+        k_p[...] = nisa.nc_transpose(k_tp)
+        v_now = v_p[(h * pieces) + t]
+        # Rows of the piece's log decays and betas, broadcast to every partition by a one-row matmul, and their
+        # diagonals as columns, one value per token.
+        g_row = _to_sbuf(_matmul(ones, nl.load(decay[h : h + 1, cols]), PIECE, PIECE), PIECE, PIECE)
+        b_row = _to_sbuf(_matmul(ones, nl.load(beta[h : h + 1, cols]), PIECE, PIECE), PIECE, PIECE)
+        g_col = nisa.tensor_reduce(nl.add, nisa.tensor_tensor(g_row, eye, op=nl.multiply), axis=[1], keepdims=True)
+        b_col = nisa.tensor_reduce(nl.add, nisa.tensor_tensor(b_row, eye, op=nl.multiply), axis=[1], keepdims=True)
+        g_last = g_row[:, PIECE - 1 : PIECE]
+        yield
+
+        # exp(g_i - g_j), selected before it can overflow: rows i, and transposed with rows j.
+        between = nisa.activation(nl.exp, g_row, bias=g_col, scale=-1.0)
+        between_t = nisa.activation(nl.exp, g_row, bias=nisa.tensor_scalar(g_col, nl.multiply, -1.0))
+        below = nisa.affine_select(i_p - i_f > 0, between, 0.0)
+        above_t = nisa.affine_select(i_f - i_p > 0, between_t, 0.0)
+        causal_t = nisa.affine_select(i_f - i_p >= 0, between_t, 0.0)
+        yield
+
+        kk = _matmul(k_tp, k_tp, PIECE, PIECE)
+        negative_beta = nisa.tensor_scalar(b_col, nl.multiply, -1.0)
+        lower = nisa.scalar_tensor_tensor(data=kk, op0=nl.multiply, operand0=negative_beta, op1=nl.multiply, operand1=below)
+        lower_t = nisa.tensor_tensor(nisa.tensor_tensor(kk, above_t, op=nl.multiply), b_row, op=nl.multiply)
+        lower_t = nisa.tensor_scalar(lower_t, nl.multiply, -1.0)
+        yield
+
+        # (I - lower)^-1: 8x8 diagonal blocks by doubling, then neighbouring blocks merged. Kept with its transpose.
+        power = nisa.tensor_tensor(lower, mask[0], op=nl.multiply)
+        power_t = nisa.tensor_tensor(lower_t, mask[5], op=nl.multiply)
+        inverse = nisa.tensor_tensor(eye, power, op=nl.add)
+        inverse_t = nisa.tensor_tensor(eye, power_t, op=nl.add)
+        for _ in list(range(2)):
+            squared = _to_sbuf(_matmul(power_t, power, PIECE, PIECE), PIECE, PIECE)
+            squared_t = _to_sbuf(_matmul(power, power_t, PIECE, PIECE), PIECE, PIECE)
+            yield
+            inverse = nisa.tensor_tensor(inverse, _matmul(inverse_t, squared, PIECE, PIECE), op=nl.add)
+            inverse_t = nisa.tensor_tensor(inverse_t, _matmul(squared, inverse_t, PIECE, PIECE), op=nl.add)
+            yield
+            power, power_t = squared, squared_t
+        for level in list(range(4)):
+            beside = nisa.tensor_tensor(lower, mask[1 + level], op=nl.multiply)
+            beside_t = nisa.tensor_tensor(lower_t, mask[6 + level], op=nl.multiply)
+            # inverse @ beside @ inverse, and its transpose.
+            right = _to_sbuf(_matmul(beside_t, inverse, PIECE, PIECE), PIECE, PIECE)
+            left_t = _to_sbuf(_matmul(beside, inverse_t, PIECE, PIECE), PIECE, PIECE)
+            yield
+            inverse_new = nisa.tensor_tensor(inverse, _matmul(inverse_t, right, PIECE, PIECE), op=nl.add)
+            inverse_t = nisa.tensor_tensor(inverse_t, _matmul(inverse, left_t, PIECE, PIECE), op=nl.add)
+            inverse = inverse_new
+            yield
+
+        v_beta = nisa.tensor_scalar(v_now, nl.multiply, b_col)
+        new_values = _to_sbuf(_matmul(inverse_t, v_beta, PIECE, v_head), PIECE, v_head)
+        yield
+        k_scaled = nisa.tensor_scalar(k_p, nl.multiply, b_col, op1=nl.multiply, operand1=nisa.activation(nl.exp, g_col))
+        cumulative_t = _to_sbuf(_matmul(k_scaled, inverse_t, k_head, PIECE), k_head, PIECE)
+        yield
+
+        # From here on the piece depends on the state.
+        v_new = nisa.tensor_tensor(new_values, _matmul(cumulative_t, s, PIECE, v_head), op=nl.subtract)
+        yield
+        q_scaled_t = nisa.tensor_tensor(q_tp, nisa.activation(nl.exp, g_row[0:k_head, :]), op=nl.multiply)
+        attn_t = nisa.tensor_tensor(_matmul(k_tp, q_tp, PIECE, PIECE), causal_t, op=nl.multiply)
+        result = nl.zeros((nl.par_dim(PIECE), v_head), nl.float32, buffer=nl.psum)
+        result += nisa.nc_matmul(q_scaled_t, s)
+        result += nisa.nc_matmul(attn_t, v_new)
+        yield
+
+        # Gated RMS norm of the head's output: rounded to BF16 before the weight, as the model does.
+        out = _to_sbuf(result, PIECE, v_head)
+        mean_square = nisa.tensor_reduce(nl.add, nisa.tensor_tensor(out, out, op=nl.multiply), axis=[1], keepdims=True)
+        scale = nisa.activation(nl.rsqrt, mean_square, scale=1.0 / v_head, bias=epsilon_column)
+        normed = nisa.tensor_scalar(out, nl.multiply, scale, dtype=nl.bfloat16)
+        yield
+        gate = nl.load(z[cols, h * v_head : (h + 1) * v_head], dtype=nl.float32)
+        gate = nisa.tensor_tensor(gate, nisa.activation(nl.sigmoid, gate), op=nl.multiply)
+        weighted = nisa.tensor_tensor(normed, weight_row, op=nl.multiply, dtype=nl.bfloat16)
+        nl.store(gated[cols, h * v_head : (h + 1) * v_head], nisa.tensor_tensor(weighted, gate, op=nl.multiply, dtype=z.dtype))
+
+        k_decayed = nisa.tensor_scalar(k_p, nl.multiply, nisa.activation(nl.exp, g_col, bias=g_last, scale=-1.0))
+        s = nisa.scalar_tensor_tensor(
+            data=s, op0=nl.multiply, operand0=nisa.activation(nl.exp, g_last), op1=nl.add, operand1=_matmul(k_decayed, v_new, k_head, v_head)
+        )
+        yield
+    nl.store(final[h], s)
+
+
+def _interleave(steps) -> None:
+    """Run generators round-robin, one step each, until all finish."""
+    active = list(steps)
+    while active:
+        for g in list(active):
+            try:
+                next(g)
+            except StopIteration:
+                active.remove(g)
+
+
+# Value heads whose steps the delta prefill kernel interleaves.
+DELTA_HEAD_GROUP = 4
+
+
 def delta_prefill_body(
     qkv: nl.ndarray, z: nl.ndarray, conv_weight: nl.ndarray, conv_history: nl.ndarray, decay: nl.ndarray,
     beta: nl.ndarray, state: nl.ndarray, masks: nl.ndarray, norm_weight: nl.ndarray, key_heads: int, eps: float,
@@ -352,86 +470,10 @@ def delta_prefill_body(
                 flipped[...] = nisa.nc_transpose(mixed[:, t * PIECE : (t + 1) * PIECE])
                 v_p.append(flipped)
 
-    for h in list(range(value_heads)):
-        kh = h // repeat
-        s = nl.load(state[h])
-        for t in list(range(pieces)):
-            cols = slice(t * PIECE, (t + 1) * PIECE)
-            q_tp = q_t[kh][:, cols]
-            k_tp = k_t[kh][:, cols]
-            k_p = nl.ndarray((nl.par_dim(PIECE), k_head), dtype=nl.float32, buffer=nl.sbuf)
-            k_p[...] = nisa.nc_transpose(k_tp)
-            v_now = v_p[(h * pieces) + t]
-            # Rows of the piece's log decays and betas, broadcast to every partition by a one-row matmul, and their
-            # diagonals as columns, one value per token.
-            g_row = _to_sbuf(_matmul(ones, nl.load(decay[h : h + 1, cols]), PIECE, PIECE), PIECE, PIECE)
-            b_row = _to_sbuf(_matmul(ones, nl.load(beta[h : h + 1, cols]), PIECE, PIECE), PIECE, PIECE)
-            g_col = nisa.tensor_reduce(nl.add, nisa.tensor_tensor(g_row, eye, op=nl.multiply), axis=[1], keepdims=True)
-            b_col = nisa.tensor_reduce(nl.add, nisa.tensor_tensor(b_row, eye, op=nl.multiply), axis=[1], keepdims=True)
-            g_last = g_row[:, PIECE - 1 : PIECE]
-
-            # exp(g_i - g_j), selected before it can overflow: rows i, and transposed with rows j.
-            between = nisa.activation(nl.exp, g_row, bias=g_col, scale=-1.0)
-            between_t = nisa.activation(nl.exp, g_row, bias=nisa.tensor_scalar(g_col, nl.multiply, -1.0))
-            below = nisa.affine_select(i_p - i_f > 0, between, 0.0)
-            above_t = nisa.affine_select(i_f - i_p > 0, between_t, 0.0)
-            causal_t = nisa.affine_select(i_f - i_p >= 0, between_t, 0.0)
-
-            kk = _matmul(k_tp, k_tp, PIECE, PIECE)
-            negative_beta = nisa.tensor_scalar(b_col, nl.multiply, -1.0)
-            lower = nisa.scalar_tensor_tensor(data=kk, op0=nl.multiply, operand0=negative_beta, op1=nl.multiply, operand1=below)
-            lower_t = nisa.tensor_tensor(nisa.tensor_tensor(kk, above_t, op=nl.multiply), b_row, op=nl.multiply)
-            lower_t = nisa.tensor_scalar(lower_t, nl.multiply, -1.0)
-
-            # (I - lower)^-1: 8x8 diagonal blocks by doubling, then neighbouring blocks merged. Kept with its transpose.
-            power = nisa.tensor_tensor(lower, mask[0], op=nl.multiply)
-            power_t = nisa.tensor_tensor(lower_t, mask[5], op=nl.multiply)
-            inverse = nisa.tensor_tensor(eye, power, op=nl.add)
-            inverse_t = nisa.tensor_tensor(eye, power_t, op=nl.add)
-            for _ in list(range(2)):
-                squared = _to_sbuf(_matmul(power_t, power, PIECE, PIECE), PIECE, PIECE)
-                squared_t = _to_sbuf(_matmul(power, power_t, PIECE, PIECE), PIECE, PIECE)
-                inverse = nisa.tensor_tensor(inverse, _matmul(inverse_t, squared, PIECE, PIECE), op=nl.add)
-                inverse_t = nisa.tensor_tensor(inverse_t, _matmul(squared, inverse_t, PIECE, PIECE), op=nl.add)
-                power, power_t = squared, squared_t
-            for level in list(range(4)):
-                beside = nisa.tensor_tensor(lower, mask[1 + level], op=nl.multiply)
-                beside_t = nisa.tensor_tensor(lower_t, mask[6 + level], op=nl.multiply)
-                # inverse @ beside @ inverse, and its transpose.
-                right = _to_sbuf(_matmul(beside_t, inverse, PIECE, PIECE), PIECE, PIECE)
-                left_t = _to_sbuf(_matmul(beside, inverse_t, PIECE, PIECE), PIECE, PIECE)
-                inverse_new = nisa.tensor_tensor(inverse, _matmul(inverse_t, right, PIECE, PIECE), op=nl.add)
-                inverse_t = nisa.tensor_tensor(inverse_t, _matmul(inverse, left_t, PIECE, PIECE), op=nl.add)
-                inverse = inverse_new
-
-            v_beta = nisa.tensor_scalar(v_now, nl.multiply, b_col)
-            new_values = _to_sbuf(_matmul(inverse_t, v_beta, PIECE, v_head), PIECE, v_head)
-            k_scaled = nisa.tensor_scalar(k_p, nl.multiply, b_col, op1=nl.multiply, operand1=nisa.activation(nl.exp, g_col))
-            cumulative_t = _to_sbuf(_matmul(k_scaled, inverse_t, k_head, PIECE), k_head, PIECE)
-
-            # From here on the piece depends on the state.
-            v_new = nisa.tensor_tensor(new_values, _matmul(cumulative_t, s, PIECE, v_head), op=nl.subtract)
-            q_scaled_t = nisa.tensor_tensor(q_tp, nisa.activation(nl.exp, g_row[0:k_head, :]), op=nl.multiply)
-            attn_t = nisa.tensor_tensor(_matmul(k_tp, q_tp, PIECE, PIECE), causal_t, op=nl.multiply)
-            result = nl.zeros((nl.par_dim(PIECE), v_head), nl.float32, buffer=nl.psum)
-            result += nisa.nc_matmul(q_scaled_t, s)
-            result += nisa.nc_matmul(attn_t, v_new)
-
-            # Gated RMS norm of the head's output: rounded to BF16 before the weight, as the model does.
-            out = _to_sbuf(result, PIECE, v_head)
-            mean_square = nisa.tensor_reduce(nl.add, nisa.tensor_tensor(out, out, op=nl.multiply), axis=[1], keepdims=True)
-            scale = nisa.activation(nl.rsqrt, mean_square, scale=1.0 / v_head, bias=epsilon_column)
-            normed = nisa.tensor_scalar(out, nl.multiply, scale, dtype=nl.bfloat16)
-            gate = nl.load(z[cols, h * v_head : (h + 1) * v_head], dtype=nl.float32)
-            gate = nisa.tensor_tensor(gate, nisa.activation(nl.sigmoid, gate), op=nl.multiply)
-            weighted = nisa.tensor_tensor(normed, weight_row, op=nl.multiply, dtype=nl.bfloat16)
-            nl.store(gated[cols, h * v_head : (h + 1) * v_head], nisa.tensor_tensor(weighted, gate, op=nl.multiply, dtype=z.dtype))
-
-            k_decayed = nisa.tensor_scalar(k_p, nl.multiply, nisa.activation(nl.exp, g_col, bias=g_last, scale=-1.0))
-            s = nisa.scalar_tensor_tensor(
-                data=s, op0=nl.multiply, operand0=nisa.activation(nl.exp, g_last), op1=nl.add, operand1=_matmul(k_decayed, v_new, k_head, v_head)
-            )
-        nl.store(final[h], s)
+    # Groups of heads, each head's steps emitted in turn with the others' so their chains overlap.
+    c = (state, decay, beta, z, gated, final, q_t, k_t, v_p, mask, eye, ones, epsilon_column, weight_row, i_p, i_f, repeat, pieces, k_head, v_head)
+    for g0 in list(range(0, value_heads, DELTA_HEAD_GROUP)):
+        _interleave([_delta_head(h, c) for h in list(range(g0, min(g0 + DELTA_HEAD_GROUP, value_heads)))])
     return gated, final
 
 
