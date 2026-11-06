@@ -243,60 +243,100 @@ def _to_sbuf(tile, rows: int, cols: int):
     return copied
 
 
-def chunked_delta_body(
-    q_t: nl.ndarray, k_t: nl.ndarray, v: nl.ndarray, decay: nl.ndarray, decay_t: nl.ndarray,
-    beta: nl.ndarray, beta_t: nl.ndarray, state: nl.ndarray, masks: nl.ndarray,
+def delta_prefill_body(
+    qkv: nl.ndarray, z: nl.ndarray, conv_weight: nl.ndarray, conv_history: nl.ndarray, decay: nl.ndarray,
+    beta: nl.ndarray, state: nl.ndarray, masks: nl.ndarray, norm_weight: nl.ndarray, key_heads: int, eps: float,
 ):
-    """The gated delta rule over a chunk of one row, as `model.chunked_gated_delta` computes it, in 128-token pieces.
+    """A gated delta layer's prefill between its input and output projections, for a chunk of one row.
 
-    Each piece's triangular solve is done in SBUF by blocked forward substitution, and the state stays in SBUF from
+    The causal conv, SiLU, query and key L2 norms, the chunked gated delta rule as `model.chunked_gated_delta`
+    computes it in 128-token pieces, and the gated RMS norm all run here in SBUF, so none of it makes a round trip
+    through HBM. Each piece's triangular solve is blocked forward substitution, and the state stays in SBUF from
     piece to piece. Every product is arranged so its left operand is already transposed, which the Tensor Engine
-    needs, so only keys are transposed, once per piece. All matmuls are float32.
+    needs. The rule's matmuls are float32.
 
-    Keys come in one layout only. Given the same keys in two layouts, as two views of one tensor, the compiler
-    handed one of them over in a layout the kernel doesn't expect, which corrupted the state from the second piece on.
+    Each tensor comes in one layout only, and the kernel transposes on the Tensor Engine where it needs another.
+    Given two views of one tensor, the compiler handed one over in a layout the kernel didn't expect.
 
     Args:
-        q_t, k_t: float32 ``[key_heads, k_head, tokens]``. Query normalized and scaled, key normalized. Each key head
-            serves ``value_heads // key_heads`` value heads.
-        v: float32 ``[value_heads, tokens, v_head]``.
-        decay: float32 ``[value_heads, tokens]``, the log decay summed from the start of each piece. decay_t is
-            ``[tokens, value_heads]``.
-        beta: float32 ``[value_heads, tokens]``, and beta_t ``[tokens, value_heads]``.
+        qkv: BF16 ``[tokens, conv_dim]``, the input projection: queries, keys, then values, by head.
+        z: BF16 ``[tokens, value_heads * v_head]``, the output gate's projection.
+        conv_weight: BF16 ``[conv_dim, kernel]``, with the newest sample last.
+        conv_history: BF16 ``[conv_dim, kernel - 1]``, the inputs before the chunk, zero at a sequence's start.
+        decay: float32 ``[value_heads, tokens]``, the log decay summed from the start of each piece.
+        beta: float32 ``[value_heads, tokens]``. Both are 0 for padding, which then leaves the state as it was.
         state: float32 ``[value_heads, k_head, v_head]`` before the chunk.
         masks: float32 ``[10, 128, 128]``: the 8-block diagonal, then for blocks of 8, 16, 32 and 64 the places
             where a lower block meets the upper block beside it, then the same five transposed.
+        norm_weight: BF16 ``[128, v_head]``, the gated norm's weight on every partition.
+        key_heads: query and key heads. Each serves ``value_heads // key_heads`` value heads.
+        eps: the norms' epsilon.
 
     Returns:
-        (output ``[value_heads, tokens, v_head]``, state after the chunk), both float32.
+        (BF16 ``[tokens, value_heads * v_head]`` for the output projection, float32 state after the chunk).
     """
-    key_heads, k_head, tokens = q_t.shape
-    value_heads, _, v_head = v.shape
+    tokens, conv_dim = qkv.shape
+    value_heads, k_head, v_head = state.shape
+    kernel = conv_weight.shape[1]
     repeat = value_heads // key_heads
-    outputs = nl.ndarray((value_heads, tokens, v_head), dtype=nl.float32, buffer=nl.shared_hbm)
+    channel_tiles = conv_dim // PIECE
+    pieces = tokens // PIECE
+    gated = nl.ndarray((tokens, value_heads * v_head), dtype=z.dtype, buffer=nl.shared_hbm)
     final = nl.ndarray((value_heads, k_head, v_head), dtype=nl.float32, buffer=nl.shared_hbm)
     i_p = nl.arange(PIECE)[:, None]
     i_f = nl.arange(PIECE)[None, :]
     ones = nl.ones((1, PIECE), dtype=nl.float32, buffer=nl.sbuf)
-    zero = nl.zeros((nl.par_dim(PIECE), PIECE), dtype=nl.float32, buffer=nl.sbuf)
+    ones_column = nl.ones((PIECE, 1), dtype=nl.float32, buffer=nl.sbuf)
     eye = nisa.affine_select(i_p - i_f == 0, nl.ones((nl.par_dim(PIECE), PIECE), dtype=nl.float32, buffer=nl.sbuf), 0.0)
     mask = [nl.load(masks[m]) for m in list(range(10))]
+    epsilon = nl.full((1, 1), eps, dtype=nl.float32, buffer=nl.sbuf)
+    epsilon_column = nl.full((PIECE, 1), eps, dtype=nl.float32, buffer=nl.sbuf)
+    weight_row = nl.load(norm_weight)
+
+    # Conv, SiLU and norms with channels on partitions. Queries and keys stay that way, ``[k_head, tokens]``, as the
+    # rule's matmuls want them. Values go back to tokens on partitions, one ``[128, v_head]`` tile per head and piece.
+    q_t, k_t, v_p = [], [], []
+    for c in list(range(channel_tiles)):
+        window = nl.ndarray((nl.par_dim(PIECE), kernel - 1 + tokens), dtype=nl.float32, buffer=nl.sbuf)
+        window[:, 0 : kernel - 1] = nl.load(conv_history[c * PIECE : (c + 1) * PIECE, :], dtype=nl.float32)
+        for t in list(range(pieces)):
+            rows = nl.load(qkv[t * PIECE : (t + 1) * PIECE, c * PIECE : (c + 1) * PIECE])
+            window[:, kernel - 1 + t * PIECE : kernel - 1 + (t + 1) * PIECE] = nisa.nc_transpose(rows)
+        w = nl.load(conv_weight[c * PIECE : (c + 1) * PIECE, :], dtype=nl.float32)
+        mixed = nisa.tensor_scalar(window[:, 0:tokens], nl.multiply, w[:, 0:1])
+        for j in list(range(1, kernel)):
+            mixed = nisa.scalar_tensor_tensor(data=window[:, j : j + tokens], op0=nl.multiply, operand0=w[:, j : j + 1], op1=nl.add, operand1=mixed)
+        mixed = nisa.tensor_tensor(mixed, nisa.activation(nl.sigmoid, mixed), op=nl.multiply)
+        if c < 2 * key_heads:
+            # L2 norm over the head's 128 channels, which are the partitions: a ones-vector matmul sums them.
+            squares = nisa.tensor_tensor(mixed, mixed, op=nl.multiply)
+            inverse = nisa.activation(nl.rsqrt, _matmul(ones_column, squares, 1, tokens), bias=epsilon)
+            if c < key_heads:
+                inverse = nisa.tensor_scalar(inverse, nl.multiply, k_head**-0.5)
+            spread = _matmul(ones, inverse, PIECE, tokens)
+            (q_t if c < key_heads else k_t).append(nisa.tensor_tensor(mixed, spread, op=nl.multiply))
+        else:
+            for t in list(range(pieces)):
+                flipped = nl.ndarray((nl.par_dim(PIECE), v_head), dtype=nl.float32, buffer=nl.sbuf)
+                flipped[...] = nisa.nc_transpose(mixed[:, t * PIECE : (t + 1) * PIECE])
+                v_p.append(flipped)
 
     for h in list(range(value_heads)):
         kh = h // repeat
         s = nl.load(state[h])
-        for p0 in list(range(0, tokens, PIECE)):
-            cols = slice(p0, p0 + PIECE)
-            q_tp = nl.load(q_t[kh, :, cols])
-            k_tp = nl.load(k_t[kh, :, cols])
+        for t in list(range(pieces)):
+            cols = slice(t * PIECE, (t + 1) * PIECE)
+            q_tp = q_t[kh][:, cols]
+            k_tp = k_t[kh][:, cols]
             k_p = nl.ndarray((nl.par_dim(PIECE), k_head), dtype=nl.float32, buffer=nl.sbuf)
             k_p[...] = nisa.nc_transpose(k_tp)
-            v_p = nl.load(v[h, cols, :])
-            g_col = nl.load(decay_t[cols, h : h + 1])
-            b_col = nl.load(beta_t[cols, h : h + 1])
-            # Rows of the piece's log decays and betas, broadcast to every partition by a one-row matmul.
+            v_now = v_p[(h * pieces) + t]
+            # Rows of the piece's log decays and betas, broadcast to every partition by a one-row matmul, and their
+            # diagonals as columns, one value per token.
             g_row = _to_sbuf(_matmul(ones, nl.load(decay[h : h + 1, cols]), PIECE, PIECE), PIECE, PIECE)
             b_row = _to_sbuf(_matmul(ones, nl.load(beta[h : h + 1, cols]), PIECE, PIECE), PIECE, PIECE)
+            g_col = nisa.tensor_reduce(nl.add, nisa.tensor_tensor(g_row, eye, op=nl.multiply), axis=[1], keepdims=True)
+            b_col = nisa.tensor_reduce(nl.add, nisa.tensor_tensor(b_row, eye, op=nl.multiply), axis=[1], keepdims=True)
             g_last = g_row[:, PIECE - 1 : PIECE]
 
             # exp(g_i - g_j), selected before it can overflow: rows i, and transposed with rows j.
@@ -333,7 +373,7 @@ def chunked_delta_body(
                 inverse_t = nisa.tensor_tensor(inverse_t, _matmul(inverse, left_t, PIECE, PIECE), op=nl.add)
                 inverse = inverse_new
 
-            v_beta = nisa.tensor_scalar(v_p, nl.multiply, b_col)
+            v_beta = nisa.tensor_scalar(v_now, nl.multiply, b_col)
             new_values = _to_sbuf(_matmul(inverse_t, v_beta, PIECE, v_head), PIECE, v_head)
             k_scaled = nisa.tensor_scalar(k_p, nl.multiply, b_col, op1=nl.multiply, operand1=nisa.activation(nl.exp, g_col))
             cumulative_t = _to_sbuf(_matmul(k_scaled, inverse_t, k_head, PIECE), k_head, PIECE)
@@ -345,17 +385,26 @@ def chunked_delta_body(
             result = nl.zeros((nl.par_dim(PIECE), v_head), nl.float32, buffer=nl.psum)
             result += nisa.nc_matmul(q_scaled_t, s)
             result += nisa.nc_matmul(attn_t, v_new)
-            nl.store(outputs[h, cols, :], _to_sbuf(result, PIECE, v_head))
+
+            # Gated RMS norm of the head's output: rounded to BF16 before the weight, as the model does.
+            out = _to_sbuf(result, PIECE, v_head)
+            mean_square = nisa.tensor_reduce(nl.add, nisa.tensor_tensor(out, out, op=nl.multiply), axis=[1], keepdims=True)
+            scale = nisa.activation(nl.rsqrt, mean_square, scale=1.0 / v_head, bias=epsilon_column)
+            normed = nisa.tensor_scalar(out, nl.multiply, scale, dtype=nl.bfloat16)
+            gate = nl.load(z[cols, h * v_head : (h + 1) * v_head], dtype=nl.float32)
+            gate = nisa.tensor_tensor(gate, nisa.activation(nl.sigmoid, gate), op=nl.multiply)
+            weighted = nisa.tensor_tensor(normed, weight_row, op=nl.multiply, dtype=nl.bfloat16)
+            nl.store(gated[cols, h * v_head : (h + 1) * v_head], nisa.tensor_tensor(weighted, gate, op=nl.multiply, dtype=z.dtype))
 
             k_decayed = nisa.tensor_scalar(k_p, nl.multiply, nisa.activation(nl.exp, g_col, bias=g_last, scale=-1.0))
             s = nisa.scalar_tensor_tensor(
                 data=s, op0=nl.multiply, operand0=nisa.activation(nl.exp, g_last), op1=nl.add, operand1=_matmul(k_decayed, v_new, k_head, v_head)
             )
         nl.store(final[h], s)
-    return outputs, final
+    return gated, final
 
 
 fp8_linear = nki.jit(fp8_linear_body)
-chunked_delta = nki.jit(chunked_delta_body)
+delta_prefill = nki.jit(delta_prefill_body)
 prefill_attention = nki.jit(prefill_attention_body)
 lm_head_group_maxima = nki.jit(lm_head_group_maxima_body)

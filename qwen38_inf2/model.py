@@ -281,17 +281,15 @@ class GatedDeltaNetStep(nn.Module):
             torch.zeros(batch_size, self.num_v_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim, dtype=self.state_dtype),
         )
 
-    def _split(self, mixed: torch.Tensor, per_value_head: bool = True):
-        """Query, key and value from the conv output ``[tokens, conv_dim]``, all float32. Query and key are per value
-        head, or per key head with `per_value_head` False."""
+    def _split(self, mixed: torch.Tensor):
+        """Query and key per value head, and value, from the conv output ``[tokens, conv_dim]``, all float32."""
         tokens = mixed.shape[0]
         k_head, v_head = self.cfg.linear_key_head_dim, self.cfg.linear_value_head_dim
         query = mixed[:, : self.key_dim].reshape(tokens, self.num_k_heads, k_head)
         key = mixed[:, self.key_dim : 2 * self.key_dim].reshape(tokens, self.num_k_heads, k_head)
         value = mixed[:, 2 * self.key_dim :].reshape(tokens, self.num_v_heads, v_head)
-        if per_value_head:
-            query = repeat_interleave(query, self.cfg.linear_key_repeat, dim=1)
-            key = repeat_interleave(key, self.cfg.linear_key_repeat, dim=1)
+        query = repeat_interleave(query, self.cfg.linear_key_repeat, dim=1)
+        key = repeat_interleave(key, self.cfg.linear_key_repeat, dim=1)
         return l2_norm(query.float()) / math.sqrt(k_head), l2_norm(key.float()), value.float()
 
     def _gates(self, x: torch.Tensor):
@@ -337,46 +335,50 @@ class GatedDeltaNetStep(nn.Module):
         return self.all_reduce(self._finish(out, z, dtype))
 
     def prefill(self, x: torch.Tensor, slot: torch.Tensor, start: torch.Tensor, n_valid: torch.Tensor) -> torch.Tensor:
-        """A chunk of one row's tokens. ``x`` is ``[1, chunk, hidden]``. Tokens from `n_valid` on are padding."""
+        """A chunk of one row's tokens. ``x`` is ``[1, chunk, hidden]``. Tokens from `n_valid` on are padding.
+
+        On the chip everything between the input and output projections is one kernel, `kernels.delta_prefill`.
+        """
         dtype = x.dtype
         tokens = x.shape[1]
         kernel = self.cfg.linear_conv_kernel_dim
         slot, keep = slot.long(), (start > 0).to(dtype)
         valid = (torch.arange(tokens, device=x.device) < n_valid).float()
 
-        qkv = self.in_proj_qkv(x)[0].transpose(0, 1)
-        window = torch.cat((self.conv_state.index_select(0, slot)[0] * keep, qkv), dim=-1)
-        conv = sum(window[:, j : j + tokens] * self.conv_weight[:, j : j + 1] for j in range(kernel))
+        qkv = self.in_proj_qkv(x)[0]
+        history = self.conv_state.index_select(0, slot)[0] * keep
         # The last kernel - 1 real inputs carry over to the next chunk or to decode.
-        carried = window.index_select(1, n_valid.long() + torch.arange(kernel - 1, device=x.device))
+        window = torch.cat((history.transpose(0, 1), qkv))
+        carried = window.index_select(0, n_valid.long() + torch.arange(kernel - 1, device=x.device)).transpose(0, 1)
         self.conv_state = self.conv_state.index_copy(0, slot, carried.unsqueeze(0))
-        on_chip = x.device.type != "cpu"
-        query, key, value = self._split(silu(conv).transpose(0, 1), per_value_head=not on_chip)
 
-        z = self.in_proj_z(x)[0].reshape(tokens, self.num_v_heads, -1)
+        z = self.in_proj_z(x)[0]
         beta, log_decay = self._gates(x[0])
         beta, log_decay = beta * valid.unsqueeze(-1), log_decay * valid.unsqueeze(-1)
-
         state = self.recurrent_state.index_select(0, slot)[0].float() * keep.float()
-        if on_chip:
-            from .kernels import chunked_delta
 
-            # Key heads stay unrepeated: the kernel reads each one for all of its value heads. The sum of log decays
-            # from each piece's start is a matmul with a block triangle of ones: the compiler's cumsum over a
-            # reshaped axis summed across pieces, which broke every piece after the first.
+        if x.device.type != "cpu":
+            from .kernels import delta_prefill
+
+            # The sum of log decays from each piece's start is a matmul with a block triangle of ones.
             index = torch.arange(tokens, device=x.device)
             same_piece = (index.unsqueeze(-1) // DELTA_CHUNK == index // DELTA_CHUNK) & (index.unsqueeze(-1) <= index)
-            piecewise = log_decay.transpose(0, 1) @ same_piece.float()
-            out, state = chunked_delta(
-                query.permute(1, 2, 0), key.permute(1, 2, 0), value.transpose(0, 1),
-                piecewise, piecewise.transpose(0, 1), beta.transpose(0, 1), beta, state, piece_masks(x.device),
+            gated, state = delta_prefill(
+                qkv, z, self.conv_weight, history, log_decay.transpose(0, 1) @ same_piece.float(), beta.transpose(0, 1), state,
+                piece_masks(x.device), self.norm_weight.reshape(1, -1).expand(DELTA_CHUNK, -1),
+                key_heads=self.num_k_heads, eps=self.cfg.rms_norm_eps,
             )
-        else:
-            out, state = chunked_gated_delta(
-                query.transpose(0, 1), key.transpose(0, 1), value.transpose(0, 1), log_decay.transpose(0, 1), beta.transpose(0, 1), state,
-                min(DELTA_CHUNK, tokens),
-            )
+            self.recurrent_state = self.recurrent_state.index_copy(0, slot, state.unsqueeze(0).to(self.state_dtype))
+            return self.all_reduce(self.out_proj(gated.reshape(tokens, 1, -1)).reshape(1, tokens, -1))
+
+        conv = sum(window.transpose(0, 1)[:, j : j + tokens] * self.conv_weight[:, j : j + 1] for j in range(kernel))
+        query, key, value = self._split(silu(conv).transpose(0, 1))
+        out, state = chunked_gated_delta(
+            query.transpose(0, 1), key.transpose(0, 1), value.transpose(0, 1), log_decay.transpose(0, 1), beta.transpose(0, 1), state,
+            min(DELTA_CHUNK, tokens),
+        )
         self.recurrent_state = self.recurrent_state.index_copy(0, slot, state.unsqueeze(0).to(self.state_dtype))
+        z = z.reshape(tokens, self.num_v_heads, -1)
         return self.all_reduce(self._finish(out.transpose(0, 1).to(dtype), z, dtype).reshape(1, tokens, -1))
 
 
