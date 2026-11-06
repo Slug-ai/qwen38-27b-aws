@@ -72,6 +72,11 @@ def apply_rotary(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch
     return torch.cat((q_out, q_pass), dim=-1), torch.cat((k_out, k_pass), dim=-1)
 
 
+def fp8_round(x: torch.Tensor) -> torch.Tensor:
+    """Round to FP8 e5m2 and back, as the chip's matmul kernel does to its input."""
+    return x.to(torch.float8_e5m2).to(x.dtype)
+
+
 def _frozen(*shape: int, dtype: torch.dtype) -> nn.Parameter:
     return nn.Parameter(torch.zeros(*shape, dtype=dtype), requires_grad=False)
 
@@ -101,6 +106,8 @@ class FP8Linear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.device.type == "cpu":
+            # The chip's kernel rounds x to FP8 e5m2 too, since its Tensor Engine multiplies FP8 only by FP8.
+            x = fp8_round(x)
             return F.linear(x, fp4.fp8_to_float(self.weight_fp8).T.to(x.dtype))
         from .kernels import fp8_linear
 

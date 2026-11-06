@@ -27,6 +27,7 @@ One change per row, each measured on the real chip with `scripts/batch_generate.
 | 13 | Read lm_head and the embeddings into the disk cache after loading | 62 | 0.29 | 0.03 | 108.32 | 182.03 | yes, 38 of 38 |
 | 14 | One more row, and the compiler's plan for this batch size is faster | 63 | 0.26 | 0.03 | 120.65 | 202.78 | yes, 38 of 38, see below |
 | 15 | Build each row's inputs in one vectorized call | 63 | 0.26 | 0.02 | 122.67 | 206.18 | yes, 38 of 38, see below |
+| 16 | Matmul inputs rounded to FP8 e5m2, so the Tensor Engine multiplies FP8 by FP8 with no weight cast, and weights read 2048 columns at a time | 63 | 0.20 | 0.02 | 156.20 | 262.54 | yes, 37 of 38 and 1 near tie, see below |
 
 Rows 1 to 4 allow 2048 tokens of prompt plus output, and from row 5 it's 512. Batch 24 at 2048 ran out of chip memory.
 
@@ -39,6 +40,8 @@ Row 11's host time fell with no host code change, probably because the checkpoin
 Row 13 reached 192.1 tok/s with every row generating, over 13 steps. A run at batch 60 with the same warm cache gave 101.01 generated tok/s and 0.30 s on the chip, so batch 62 really is faster per step there.
 
 Row 15 reached 214.5 tok/s with every row generating, over 19 steps. At batch 63, the token comparison with the float32-state build is 31 of 40 identical sequences and 1135 of 1280 tokens before a first difference. The quality check there still gives 315 of 323, and the same top token as the float32-state build at all 324 positions.
+
+Row 16 changes numbers: every matmul's input is rounded to FP8 e5m2, 2 mantissa bits with an exponent per value. The checkpoint was calibrated for MXFP4 activations, 1 mantissa bit with one exponent per 32 values, so this is still finer than its intended serving, and on a tiny model it gives under half the logit error of MXFP4 activations (`tests/test_model_parity.py`). The quality check gives 316 of 323 against 315 for row 15's build, with the same top token at 322 of 324 positions. Greedy text drifts more, because each near tie can flip: 30 of 126 sequences are identical to row 15's, and 2110 of 4032 tokens come before a first difference. Row 15's build, rerun in the same session on this instance, gave 123.23 generated tok/s, so the gain is 27%. With every row generating, row 16 reached 269.3 tok/s over 19 steps.
 
 Raw results are in [throughput/](throughput/). `git log docs/throughput.md` gives the commit for each row.
 

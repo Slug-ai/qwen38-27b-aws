@@ -7,7 +7,7 @@ from dataclasses import replace
 import pytest
 import torch
 
-from qwen38_inf2 import checkpoint
+from qwen38_inf2 import checkpoint, fp4, model as model_module
 from qwen38_inf2.config import tiny_config
 from qwen38_inf2.cpu_sim import SimulatedCoresStep, ThreadedAllReduce
 from qwen38_inf2.generate import BlockChain, ChipHead, HostHead, batch_step_inputs, batched_greedy_generate, greedy_generate, step_inputs
@@ -242,16 +242,37 @@ def test_batched_graph_matches_two_simulated_cores(tmp_path):
     assert got == want
 
 
-def test_fp8_weights_match_the_reference():
-    cfg = replace(tiny_config(), weight_format="fp8")
+def fp8_logits(cfg):
     reference, tensors = build_reference(cfg)
     model = load_model(tensors, cfg, torch.float32)
     head = host_head(tensors)
     with torch.no_grad():
         want = reference(input_ids=torch.tensor([PROMPT]), use_cache=False).logits[0].float()
         got = torch.stack([head.logits(h) for h in run_tokens(model, cfg, head, PROMPT, torch.float32)])
+    return got, want
+
+
+def test_fp8_weights_match_the_reference(monkeypatch):
+    # Without the kernel's rounding of activations, FP8 weights alone change nothing.
+    monkeypatch.setattr(model_module, "fp8_round", lambda x: x)
+    got, want = fp8_logits(replace(tiny_config(), weight_format="fp8"))
     assert (got - want).abs().max() < 1e-4
     assert torch.equal(got.argmax(-1), want.argmax(-1))
+
+
+def mxfp4_round(x):
+    """The checkpoint's own activation format: FP4 values sharing one power-of-two scale per 32, as vLLM runs it."""
+    flat = x.float().reshape(-1, x.shape[-1])
+    return fp4.decode_host(*fp4.encode_host(flat), torch.float32).reshape(x.shape).to(x.dtype)
+
+
+def test_fp8_activations_are_closer_to_the_reference_than_the_checkpoints_mxfp4(monkeypatch):
+    cfg = replace(tiny_config(), weight_format="fp8")
+    got, want = fp8_logits(cfg)
+    monkeypatch.setattr(model_module, "fp8_round", mxfp4_round)
+    intended, _ = fp8_logits(cfg)
+    # The checkpoint was calibrated for MXFP4 activations, so that is the error its makers accepted.
+    assert (got - want).std() < 0.7 * (intended - want).std()
 
 
 @pytest.mark.parametrize("head_format", ["bf16", "fp8"])

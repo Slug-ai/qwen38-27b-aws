@@ -31,6 +31,7 @@ LABELS = [
     "Warm disk cache",
     "Batch 63",
     "Faster row inputs",
+    "FP8 x FP8 matmuls",
 ]
 INK, MUTED, GRID = "#000000", "#555555", "#dddddd"
 

@@ -2,7 +2,7 @@
 
 Runs the text part of [RedHatAI/Qwen3.8-27B-MXFP4](https://huggingface.co/RedHatAI/Qwen3.8-27B-MXFP4) on one AWS Inferentia2 chip (two NeuronCores), with its FP4 weights converted to FP8 and greedy decoding.
 
-**Status: runs end to end on a real `inf2.xlarge`.** Currently 122.67 generated tokens/s at batch 63 with a maximum of 512 tokens per sequence, measured. See [the throughput log](docs/throughput.md) and [the field notes](docs/field_notes.md), which cover setup on the Amazon Linux Neuron AMI.
+**Status: runs end to end on a real `inf2.xlarge`.** Currently 156.20 generated tokens/s at batch 63 with a maximum of 512 tokens per sequence, measured. See [the throughput log](docs/throughput.md) and [the field notes](docs/field_notes.md), which cover setup on the Amazon Linux Neuron AMI.
 
 **Goal: maximum throughput, not latency.** Every design choice is judged by total tokens per second across all sequences. Time per token doesn't matter, so large batches and slow steps are fine.
 
@@ -10,7 +10,7 @@ Runs the text part of [RedHatAI/Qwen3.8-27B-MXFP4](https://huggingface.co/RedHat
 
 This describes the build measured in [the throughput log](docs/throughput.md), which also gives the effect of each change.
 
-- **FP8 weights on a chip without FP4.** NeuronCore-v2 has no FP4 type (native MX compute is Trn3 only), and the weights would take about 22.7 GiB per core at BF16. So they are converted once, when prepared, to one FP8 byte per value. Two NKI kernels ([kernels.py](qwen38_inf2/kernels.py)) have the Tensor Engine read those bytes with a cheap cast to BF16, so no decode runs on the chip. FP8 holds all but 0.0003% of scale groups exactly, and the rest are weights under 1e-4 that round to the nearest FP8 value.
+- **FP8 weights on a chip without FP4.** NeuronCore-v2 has no FP4 type (native MX compute is Trn3 only), and the weights would take about 22.7 GiB per core at BF16. So they are converted once, when prepared, to one FP8 byte per value. Two NKI kernels ([kernels.py](qwen38_inf2/kernels.py)) have the Tensor Engine read those bytes directly. The matmul kernel rounds its input to FP8 e5m2, because NeuronCore-v2 multiplies FP8 only by FP8, so no decode or weight cast runs on the chip. FP8 holds all but 0.0003% of scale groups exactly, and the rest are weights under 1e-4 that round to the nearest FP8 value.
 - **Memory limits the batch.** Chip time per step fits about 0.118 s + 0.0031 s per row, so more rows keep helping until memory runs out. A core fills at 15.94 GiB, which the runtime's memory table labels GB:
 
   | | Per NeuronCore, at batch 62 |
@@ -36,25 +36,25 @@ Two earlier designs are still available. `--weight-format fp4`, the default in `
 
 ### Differences from the checkpoint's intended serving
 
-Weights are FP8, converted from the checkpoint's FP4. Activations and the KV cache run at BF16, while the checkpoint was calibrated for FP4 activations and an FP8 cache. Gated delta state also runs at BF16, where the reference uses float32.
+Weights are FP8, converted from the checkpoint's FP4. Matmul inputs are rounded to FP8 e5m2 and the KV cache runs at BF16, while the checkpoint was calibrated for MXFP4 activations and an FP8 cache. e5m2 keeps 2 mantissa bits and an exponent per value, against 1 mantissa bit and one exponent per 32 values for MXFP4, so it is the finer of the two. Gated delta state also runs at BF16, where the reference uses float32.
 
-These choices change some outputs. Against an earlier float32-state build at batch 20, 33 of 40 sequences are identical, and part of that difference comes from batch size. On 324 tokens of well-known English text, BF16 and float32 state both get the real next token at 315 of 323 positions and pick the same token at 323 of 324 (`scripts/quality_check.py`). Famous text is an easy test, so this rules out large damage but not subtle damage. Nothing has been compared with FP4 activations and an FP8 cache.
+These choices change some outputs. Against an earlier float32-state build at batch 20, 33 of 40 sequences are identical, and part of that difference comes from batch size. On 324 tokens of well-known English text, BF16 and float32 state both get the real next token at 315 of 323 positions and pick the same token at 323 of 324 (`scripts/quality_check.py`). Famous text is an easy test, so this rules out large damage but not subtle damage. With FP8 matmul inputs the same check gives 316 of 323, and the same top token as the BF16-input build at 322 of 324. Nothing on real weights has been compared with MXFP4 activations and an FP8 cache.
 
 ## Run the measured build
 
-These commands give the 122.67 tok/s build. The rest of this README covers the batch-1 FP4 graph used for first bring-up, which is what `scripts/generate.py` and `scripts/chip_check.py` take, and it explains how to set up the compiler, checkpoint and instance used here. [The field notes](docs/field_notes.md) cover installing the runtime and Python packages on the Amazon Linux Neuron AMI.
+These commands give the 156.20 tok/s build. The rest of this README covers the batch-1 FP4 graph used for first bring-up, which is what `scripts/generate.py` and `scripts/chip_check.py` take, and it explains how to set up the compiler, checkpoint and instance used here. [The field notes](docs/field_notes.md) cover installing the runtime and Python packages on the Amazon Linux Neuron AMI.
 
-The compiled graphs are in [the `graphs-b63` release](https://github.com/Slug-ai/qwen38-27b-aws/releases/tag/graphs-b63), which is 14 MB to download. From the repo root:
+The graphs in [the `graphs-b63` release](https://github.com/Slug-ai/qwen38-27b-aws/releases/tag/graphs-b63) predate FP8 matmul inputs and give about 123 tok/s, so compile instead: the layers take about 2 minutes on the `inf2.xlarge` itself. To fetch the older graphs from the repo root:
 
 ```bash
 curl -fL https://github.com/Slug-ai/qwen38-27b-aws/releases/download/graphs-b63/graphs_b63.tar.gz | tar xz
 ```
 
-Or compile the layers and `lm_head` yourself. Run at the same time on a 16-thread machine, these took about 4 and 5.5 minutes:
+Compile the layers and `lm_head`:
 
 ```bash
 python scripts/compile.py --config tests/fixtures/config.json --layers 16 --max-seq-len 512 --batch-size 63 \
-  --weight-format fp8 --recurrent-state bf16 --optimize-layout --output artifacts/block16_b63_s512_fp8_bf16state
+  --weight-format fp8 --recurrent-state bf16 --output artifacts/block16_b63_s512_fp8_bf16state
 python scripts/compile.py --config tests/fixtures/config.json --head --head-format fp8 --batch-size 63 --output artifacts/head_fp8_b63
 ```
 
