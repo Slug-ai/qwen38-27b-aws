@@ -2,7 +2,7 @@
 
 Runs the text part of [RedHatAI/Qwen3.8-27B-MXFP4](https://huggingface.co/RedHatAI/Qwen3.8-27B-MXFP4) on one AWS Inferentia2 chip (two NeuronCores), with its FP4 weights converted to FP8 and greedy decoding.
 
-**Status: runs end to end on a real `inf2.xlarge`.** On coding-agent requests of 8K to 30K prompt tokens with a 32K context, 785 tokens/s in all, nearly all of them prompt tokens, and 157 requests per hour, measured. With prompt plus output capped at 512 tokens, which no agent request fits, 156.20 generated tokens/s at batch 63. See [the throughput log](docs/throughput.md) and [the field notes](docs/field_notes.md), which cover setup on the Amazon Linux Neuron AMI.
+**Status: runs end to end on a real `inf2.xlarge`.** On coding-agent requests of 8K to 30K prompt tokens with a 32K context, 884 tokens/s in all, nearly all of them prompt tokens, and 177 requests per hour, measured. With prompt plus output capped at 512 tokens, which no agent request fits, 156.20 generated tokens/s at batch 63. See [the throughput log](docs/throughput.md) and [the field notes](docs/field_notes.md), which cover setup on the Amazon Linux Neuron AMI.
 
 **Goal: maximum throughput, not latency.** Every design choice is judged by total tokens per second across all sequences. Time per token doesn't matter, so large batches and slow steps are fine.
 

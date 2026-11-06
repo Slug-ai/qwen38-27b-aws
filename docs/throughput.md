@@ -58,6 +58,8 @@ The table above measures 21-token prompts with prompt plus output capped at 512 
 | A3 | Same build | 2 x 32768 | 2 prompts of 4K | 458.68 | 6.54 | 465.22 | yes |
 | A4 | The attention kernel takes 2048 cache positions per loop iteration instead of 512 | 2 x 32768 | 16 prompts of 8K to 30K | 781.05 | 3.87 | 784.93 | yes, 157 requests per hour |
 | A4 | Same build | 2 x 32768 | 2 prompts of 4K | 498.07 | 8.57 | 506.64 | yes |
+| A5 | The attention kernel's loop over cache blocks runs only as far as the chunk's start, a trip count read at run time | 2 x 32768 | 16 prompts of 8K to 30K | 879.80 | 4.36 | 884.10 | yes, 177 requests per hour |
+| A5 | Same build | 2 x 32768 | 2 prompts of 4K | 570.50 | 9.82 | 580.32 | yes |
 
 A1 and A2 are the same build, A1 run with `--no-prefill`. A1 on the full workload would take about 3.5 hours, so both ran the small one. Only 2 rows fit: a BF16 KV cache of 32K positions takes 1.07 GB per row on each core. The FP8 cache the checkpoint was calibrated for would fit about twice as many, but the compiler accepts FP8 only inside NKI kernels.
 
@@ -66,6 +68,8 @@ In A2 the full workload made 604 prefill calls and 760 decode steps in 536 s, so
 In A3 everything in a gated delta layer's prefill between its input and output projections is one NKI kernel, so the causal conv, SiLU, query and key norms and the gated RMS norm no longer make round trips through HBM as XLA ops. One layer's prefill fell from 7.76 ms to 4.57 ms for 512 tokens. The quality check gives 315 of 323 through prefill, and 311 through decode.
 
 In A4 the prefill attention kernel waits for each block's loads before computing it, so fewer, larger blocks hide more of that latency: one layer against a 32K cache takes 8.2 ms with 2048-position blocks, against 10.4 ms with 512 and 9.0 ms with 4096. The quality check is unchanged, 315 of 323 through prefill.
+
+In A5 a chunk's attention visits only the cache blocks before its start: `range(scalar(n))` in NKI, with the SDK's `experimental-native-scalar-support` flag and middle-end transformations skipped, gives a device loop whose trip count is read from a tensor at run time. Before, every chunk scanned all 32K positions, so the first chunk of a prompt cost as much attention as the last. Alone on one core, the kernel takes 0.21 ms plus 0.59 ms per 2048 cached positions, against 8.2 ms for the full scan, so a 2048-position block costs about 19% more than in the static loop, and the full 32K scan would be 9.7 ms. On this workload a chunk visits about a third of the cache on average. The same 604 prefill calls and 797 decode steps took 346.6 s against 390.5 s. The quality check is unchanged, 315 of 323 through prefill and 311 through decode.
 
 Output tokens are few in this workload: requests stop at the end of the answer, about 64 tokens each, and only 2 rows fit at 32K positions, so most of the time is prefill.
 

@@ -514,13 +514,15 @@ class FullAttentionStep(nn.Module):
             all_values = torch.cat((cache_values, own_values), dim=1)
             out = blocked_attention(grouped, all_keys, all_values, visible, ATTENTION_BLOCK)
         else:
-            from .kernels import prefill_attention
+            from .kernels import KEY_BLOCK, prefill_attention
 
             starts = start.float().reshape(1, 1).expand(128, 1)
             first_row = (slot.int() * self.num_kv_heads * self.max_seq_len).reshape(1, 1).expand(128, 1)
+            # Only the cache blocks before `start` hold this row's keys, and the kernel visits only those.
+            blocks = torch.div(start.int() + KEY_BLOCK - 1, KEY_BLOCK, rounding_mode="floor").reshape(1, 1)
             out = prefill_attention(
                 grouped.transpose(1, 2), self.k_cache.reshape(-1, head), self.v_cache.reshape(-1, head),
-                own_keys.transpose(1, 2), own_values, starts, first_row, positions=self.max_seq_len,
+                own_keys.transpose(1, 2), own_values, starts, first_row, blocks, positions=self.max_seq_len,
             )
         out = out.to(x.dtype).reshape(self.num_heads, tokens, head).transpose(0, 1).reshape(1, tokens, self.num_heads * head)
 

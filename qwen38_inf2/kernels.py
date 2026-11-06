@@ -3,6 +3,7 @@
 import neuronxcc.nki as nki
 import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.language as nl
+from neuronxcc.nki.typing import scalar
 
 # The Tensor Engine contracts at most 128 elements per instruction, holds at most 128 stationary columns and
 # produces at most 512 output columns.
@@ -137,15 +138,29 @@ MASKED = -30000.0
 KEY_BLOCK = 2048
 
 
+def _transposed(tile, rows: int, cols: int, dtype, identity):
+    """``tile.T``, ``[rows, cols]``, in SBUF, as `nc_transpose` does it: `tile` stationary against an identity.
+
+    In a loop with a run-time trip count `nc_transpose` fails to compile, because it reloads its identity from a
+    constant in HBM every iteration. So the caller makes `identity`, ``[cols, cols]`` of `tile`'s dtype, once in
+    SBUF. With middle-end transformations skipped, the copy out of PSUM is explicit too.
+    """
+    flipped = nl.zeros((nl.par_dim(rows), cols), nl.float32, buffer=nl.psum)
+    flipped += nisa.nc_matmul(tile, identity)
+    return nisa.tensor_copy(flipped, dtype=dtype)
+
+
 def prefill_attention_body(
     q: nl.ndarray, k_cache: nl.ndarray, v_cache: nl.ndarray, k_new: nl.ndarray, v_new: nl.ndarray, start: nl.ndarray, row: nl.ndarray,
-    positions: int,
+    blocks: nl.ndarray, positions: int,
 ) -> nl.ndarray:
     """Flash attention for a prefill chunk of one row: its queries against the row's cache and against itself.
 
-    Scores stay in SBUF and PSUM, so nothing grows with the cache length but time. Cached positions before
-    `start` are all visible and the rest are not, so one mask per key block serves every query. The chunk's own
-    keys are visible causally.
+    Scores stay in SBUF and PSUM, so nothing grows with the cache length but time. The loop over cache blocks has a
+    trip count read at run time, `blocks`, so a chunk only visits the blocks holding its row's earlier keys: early
+    chunks of a long prompt cost what they would with a short cache. Cached positions before `start` are all
+    visible and the rest are not, so one mask per key block serves every query. The chunk's own keys are visible
+    causally.
 
     Args:
         q: BF16 ``[kv_heads, head, queries]``, already scaled. A KV head's query heads are stacked, so query
@@ -156,22 +171,32 @@ def prefill_attention_body(
         k_new: BF16 ``[kv_heads, head, chunk]``. v_new: BF16 ``[kv_heads, chunk, head]``. The chunk's own keys and values.
         start: float32 ``[128, 1]``, the chunk's first position on every partition.
         row: int32 ``[128, 1]``, ``slot * kv_heads * positions``, where the chunk's row begins, on every partition.
+        blocks: int32 ``[1, 1]``, ``ceil(start / KEY_BLOCK)``, the cache blocks to visit.
         positions: cache positions per row and KV head.
 
     Returns:
         BF16 ``[kv_heads, queries, head]``.
     """
+    out = nl.ndarray((q.shape[0], q.shape[2], q.shape[1]), dtype=q.dtype, buffer=nl.shared_hbm)
+    _prefill_attention(q, k_cache, v_cache, k_new, v_new, start, row, nisa.tensor_reduce(nl.add, nl.load(blocks), axis=[1]), positions, out)
+    return out
+
+
+def _prefill_attention(q, k_cache, v_cache, k_new, v_new, start, row, count, positions: int, out) -> None:
+    """`prefill_attention_body` with the block count as an SBUF scalar, `count`, writing into `out`."""
     kv_heads, head, queries = q.shape
     chunk = k_new.shape[2]
     assert positions % KEY_BLOCK == 0, f"the cache's {positions} positions must be a multiple of {KEY_BLOCK}"
     d_tiles = _tiles(head, CONTRACT_TILE)
     q_tiles = _tiles(queries, STATIONARY_TILE)
-    out = nl.ndarray((kv_heads, queries, head), dtype=q.dtype, buffer=nl.shared_hbm)
+    assert all(qs == STATIONARY_TILE for _, qs in q_tiles), "queries must fill whole tiles"
     start_tile = nl.load(start)
     row_tile = nl.load(row)
     i_p = nl.arange(STATIONARY_TILE)[:, None]
     i_f = nl.arange(KEY_BLOCK)[None, :]
     i_h = nl.arange(head)[None, :]
+    i_s = nl.arange(STATIONARY_TILE)[None, :]
+    identity = nisa.affine_select(i_p - i_s == 0, nl.ones((nl.par_dim(STATIONARY_TILE), STATIONARY_TILE), dtype=nl.bfloat16, buffer=nl.sbuf), 0.0)
 
     for h in list(range(kv_heads)):
         q_sb = [nl.load(q[h, d0 : d0 + ds, :]) for d0, ds in d_tiles]
@@ -196,27 +221,28 @@ def prefill_attention_body(
                 total[t][...] = nisa.scalar_tensor_tensor(data=total[t], op0=nl.multiply, operand0=rescale, op1=nl.add, operand1=row_sum)
                 mixed = nl.zeros((nl.par_dim(qs), head), nl.float32, buffer=nl.psum)
                 for k, k0 in enumerate(list(range(0, block, STATIONARY_TILE))):
-                    flipped = nl.ndarray((nl.par_dim(STATIONARY_TILE), qs), dtype=nl.bfloat16, buffer=nl.sbuf)
-                    flipped[...] = nisa.nc_transpose(weights[:, k0 : k0 + STATIONARY_TILE])
-                    mixed += nisa.nc_matmul(flipped, values[k])
+                    mixed += nisa.nc_matmul(_transposed(weights[:, k0 : k0 + STATIONARY_TILE], STATIONARY_TILE, qs, nl.bfloat16, identity), values[k])
                 acc[t][...] = nisa.scalar_tensor_tensor(data=acc[t], op0=nl.multiply, operand0=rescale, op1=nl.add, operand1=mixed)
                 best[t][...] = new_best
 
-        # A device loop, so code size and compile time don't grow with the cache.
-        for b in nl.sequential_range(positions // KEY_BLOCK):
-            b0 = b * KEY_BLOCK
+        # A device loop with a run-time trip count, so code size doesn't grow with the cache and time grows only
+        # with the row's keys. Where the block's rows begin and its positions are carried from block to block.
+        offset = nisa.tensor_tensor(row_tile, nisa.iota(i_p + h * positions, dtype=nl.int32), op=nl.add)
+        later = nisa.iota(i_f + 0 * i_p, dtype=nl.float32)
+        for _ in range(scalar(count)):
             keys = [nl.ndarray((nl.par_dim(ds), KEY_BLOCK), dtype=k_cache.dtype, buffer=nl.sbuf) for _, ds in d_tiles]
             values = []
             for k0 in list(range(0, KEY_BLOCK, STATIONARY_TILE)):
-                index = nisa.tensor_tensor(row_tile, nisa.iota(i_p + h * positions + b0 + k0, dtype=nl.int32), op=nl.add)
+                index = nisa.tensor_scalar(offset, nl.add, k0)
                 rows = nl.load(k_cache[index, i_h])
                 values.append(nl.load(v_cache[index, i_h]))
                 for d, (d0, ds) in enumerate(d_tiles):
-                    keys[d][:, k0 : k0 + STATIONARY_TILE] = nisa.nc_transpose(rows[:, d0 : d0 + ds])
+                    keys[d][:, k0 : k0 + STATIONARY_TILE] = _transposed(rows[:, d0 : d0 + ds], ds, STATIONARY_TILE, k_cache.dtype, identity)
             # Positions from `start` on hold no keys for this chunk yet.
-            later = nisa.iota(i_f + b0 + 0 * i_p, dtype=nl.float32)
             bias = nisa.tensor_scalar(later, nl.greater_equal, start_tile, op1=nl.multiply, operand1=MASKED)
             attend(keys, values, [bias] * len(q_tiles), KEY_BLOCK)
+            offset[...] = nisa.tensor_scalar(offset, nl.add, KEY_BLOCK)
+            later[...] = nisa.tensor_scalar(later, nl.add, float(KEY_BLOCK))
 
         keys = [nl.load(k_new[h, d0 : d0 + ds, :]) for d0, ds in d_tiles]
         values = [nl.load(v_new[h, k0 : k0 + STATIONARY_TILE, :]) for k0 in list(range(0, chunk, STATIONARY_TILE))]
@@ -230,7 +256,6 @@ def prefill_attention_body(
             inverse = nisa.reciprocal(total[t])
             result = nisa.tensor_scalar(acc[t], nl.multiply, inverse, dtype=q.dtype)
             nl.store(out[h, q0 : q0 + qs, :], result)
-    return out
 
 
 PIECE = 128
@@ -412,5 +437,7 @@ def delta_prefill_body(
 
 fp8_linear = nki.jit(fp8_linear_body)
 delta_prefill = nki.jit(delta_prefill_body)
-prefill_attention = nki.jit(prefill_attention_body)
+# Loops with a trip count read at run time need these, as the SDK's own dynamic-loop kernels use.
+DYNAMIC_LOOP_FLAGS = "experimental-native-scalar-support, experimental-local-tensor-parent"
+prefill_attention = nki.compiler.skip_middle_end_transformations(nki.jit(prefill_attention_body, experimental_flags=DYNAMIC_LOOP_FLAGS))
 lm_head_group_maxima = nki.jit(lm_head_group_maxima_body)
