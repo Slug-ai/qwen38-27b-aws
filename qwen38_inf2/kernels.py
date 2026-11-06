@@ -274,6 +274,48 @@ def _to_sbuf(tile, rows: int, cols: int):
     return copied
 
 
+def _conv_tile(c, conv):
+    """Conv, SiLU and norms for `delta_prefill_body`'s 128 channels from `c * 128`, with channels on partitions.
+
+    Queries and keys stay that way, ``[k_head, tokens]``, as the rule's matmuls want them. Values go back to tokens
+    on partitions, one ``[128, v_head]`` tile per head and piece. A generator yielding between dependent steps, so
+    `_interleave` can overlap several tiles' chains.
+    """
+    qkv, conv_weight, conv_history, q_t, k_t, v_p, ones, ones_column, epsilon, key_heads, kernel, tokens, pieces, k_head, v_head = conv
+    window = nl.ndarray((nl.par_dim(PIECE), kernel - 1 + tokens), dtype=nl.float32, buffer=nl.sbuf)
+    window[:, 0 : kernel - 1] = nl.load(conv_history[c * PIECE : (c + 1) * PIECE, :], dtype=nl.float32)
+    for t in list(range(pieces)):
+        rows = nl.load(qkv[t * PIECE : (t + 1) * PIECE, c * PIECE : (c + 1) * PIECE])
+        window[:, kernel - 1 + t * PIECE : kernel - 1 + (t + 1) * PIECE] = nisa.nc_transpose(rows)
+    w = nl.load(conv_weight[c * PIECE : (c + 1) * PIECE, :], dtype=nl.float32)
+    yield
+    mixed = nisa.tensor_scalar(window[:, 0:tokens], nl.multiply, w[:, 0:1])
+    for j in list(range(1, kernel)):
+        mixed = nisa.scalar_tensor_tensor(data=window[:, j : j + tokens], op0=nl.multiply, operand0=w[:, j : j + 1], op1=nl.add, operand1=mixed)
+    yield
+    mixed = nisa.tensor_tensor(mixed, nisa.activation(nl.sigmoid, mixed), op=nl.multiply)
+    yield
+    if c < 2 * key_heads:
+        # L2 norm over the head's 128 channels, which are the partitions: a ones-vector matmul sums them.
+        squares = nisa.tensor_tensor(mixed, mixed, op=nl.multiply)
+        inverse = nisa.activation(nl.rsqrt, _matmul(ones_column, squares, 1, tokens), bias=epsilon)
+        if c < key_heads:
+            inverse = nisa.tensor_scalar(inverse, nl.multiply, k_head**-0.5)
+        yield
+        spread = _matmul(ones, inverse, PIECE, tokens)
+        normed = nisa.tensor_tensor(mixed, spread, op=nl.multiply)
+        if c < key_heads:
+            q_t[c] = normed
+        else:
+            k_t[c - key_heads] = normed
+    else:
+        for t in list(range(pieces)):
+            flipped = nl.ndarray((nl.par_dim(PIECE), v_head), dtype=nl.float32, buffer=nl.sbuf)
+            flipped[...] = nisa.nc_transpose(mixed[:, t * PIECE : (t + 1) * PIECE])
+            v_p[(c - 2 * key_heads) * pieces + t] = flipped
+    yield
+
+
 def _delta_head(h, c):
     """One value head's chunked gated delta rule for `delta_prefill_body`, piece by piece from its state.
 
@@ -388,8 +430,9 @@ def _interleave(steps) -> None:
                 active.remove(g)
 
 
-# Value heads whose steps the delta prefill kernel interleaves.
+# Value heads, and 128-channel tiles of the conv, whose steps the delta prefill kernel interleaves.
 DELTA_HEAD_GROUP = 4
+DELTA_CONV_GROUP = 4
 
 
 def delta_prefill_body(
@@ -442,33 +485,11 @@ def delta_prefill_body(
     epsilon_column = nl.full((PIECE, 1), eps, dtype=nl.float32, buffer=nl.sbuf)
     weight_row = nl.load(norm_weight)
 
-    # Conv, SiLU and norms with channels on partitions. Queries and keys stay that way, ``[k_head, tokens]``, as the
-    # rule's matmuls want them. Values go back to tokens on partitions, one ``[128, v_head]`` tile per head and piece.
-    q_t, k_t, v_p = [], [], []
-    for c in list(range(channel_tiles)):
-        window = nl.ndarray((nl.par_dim(PIECE), kernel - 1 + tokens), dtype=nl.float32, buffer=nl.sbuf)
-        window[:, 0 : kernel - 1] = nl.load(conv_history[c * PIECE : (c + 1) * PIECE, :], dtype=nl.float32)
-        for t in list(range(pieces)):
-            rows = nl.load(qkv[t * PIECE : (t + 1) * PIECE, c * PIECE : (c + 1) * PIECE])
-            window[:, kernel - 1 + t * PIECE : kernel - 1 + (t + 1) * PIECE] = nisa.nc_transpose(rows)
-        w = nl.load(conv_weight[c * PIECE : (c + 1) * PIECE, :], dtype=nl.float32)
-        mixed = nisa.tensor_scalar(window[:, 0:tokens], nl.multiply, w[:, 0:1])
-        for j in list(range(1, kernel)):
-            mixed = nisa.scalar_tensor_tensor(data=window[:, j : j + tokens], op0=nl.multiply, operand0=w[:, j : j + 1], op1=nl.add, operand1=mixed)
-        mixed = nisa.tensor_tensor(mixed, nisa.activation(nl.sigmoid, mixed), op=nl.multiply)
-        if c < 2 * key_heads:
-            # L2 norm over the head's 128 channels, which are the partitions: a ones-vector matmul sums them.
-            squares = nisa.tensor_tensor(mixed, mixed, op=nl.multiply)
-            inverse = nisa.activation(nl.rsqrt, _matmul(ones_column, squares, 1, tokens), bias=epsilon)
-            if c < key_heads:
-                inverse = nisa.tensor_scalar(inverse, nl.multiply, k_head**-0.5)
-            spread = _matmul(ones, inverse, PIECE, tokens)
-            (q_t if c < key_heads else k_t).append(nisa.tensor_tensor(mixed, spread, op=nl.multiply))
-        else:
-            for t in list(range(pieces)):
-                flipped = nl.ndarray((nl.par_dim(PIECE), v_head), dtype=nl.float32, buffer=nl.sbuf)
-                flipped[...] = nisa.nc_transpose(mixed[:, t * PIECE : (t + 1) * PIECE])
-                v_p.append(flipped)
+    # Conv, SiLU and norms, 128 channels at a time, several tiles' steps in turn.
+    q_t, k_t, v_p = [None] * key_heads, [None] * key_heads, [None] * (value_heads * pieces)
+    conv = (qkv, conv_weight, conv_history, q_t, k_t, v_p, ones, ones_column, epsilon, key_heads, kernel, tokens, pieces, k_head, v_head)
+    for c0 in list(range(0, channel_tiles, DELTA_CONV_GROUP)):
+        _interleave([_conv_tile(c, conv) for c in list(range(c0, min(c0 + DELTA_CONV_GROUP, channel_tiles)))])
 
     # Groups of heads, each head's steps emitted in turn with the others' so their chains overlap.
     c = (state, decay, beta, z, gated, final, q_t, k_t, v_p, mask, eye, ones, epsilon_column, weight_row, i_p, i_f, repeat, pieces, k_head, v_head)
