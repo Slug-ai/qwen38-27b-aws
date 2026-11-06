@@ -131,7 +131,10 @@ def _fp8_linear_looped(x: nl.ndarray, weight: nl.ndarray, out: nl.ndarray) -> No
 
 # Added to scores of keys a query must not see. exp() of it, against any real score, is exactly zero in float32.
 MASKED = -30000.0
-KEY_BLOCK = 512
+# Cache positions per iteration of the attention kernel's device loop. Each iteration waits for its loads, so
+# fewer, larger blocks hide more of that latency: at 32K positions 512 took 10.4 ms per layer, 2048 8.2 ms and
+# 4096 9.0 ms.
+KEY_BLOCK = 2048
 
 
 def prefill_attention_body(
@@ -160,6 +163,7 @@ def prefill_attention_body(
     """
     kv_heads, head, queries = q.shape
     chunk = k_new.shape[2]
+    assert positions % KEY_BLOCK == 0, f"the cache's {positions} positions must be a multiple of {KEY_BLOCK}"
     d_tiles = _tiles(head, CONTRACT_TILE)
     q_tiles = _tiles(queries, STATIONARY_TILE)
     out = nl.ndarray((kv_heads, queries, head), dtype=q.dtype, buffer=nl.shared_hbm)
@@ -178,10 +182,12 @@ def prefill_attention_body(
         def attend(keys, values, biases, block):
             """One block of keys for every query tile. `biases[t]` is the mask added to query tile t's scores."""
             for t, (q0, qs) in enumerate(q_tiles):
-                scores = nl.zeros((nl.par_dim(qs), block), nl.float32, buffer=nl.psum)
-                for d, (d0, ds) in enumerate(d_tiles):
-                    scores += nisa.nc_matmul(q_sb[d][:, q0 : q0 + qs], keys[d])
-                masked = nisa.tensor_tensor(scores, biases[t], op=nl.add, dtype=nl.float32)
+                masked = nl.ndarray((nl.par_dim(qs), block), dtype=nl.float32, buffer=nl.sbuf)
+                for j0 in list(range(0, block, OUTPUT_TILE)):
+                    scores = nl.zeros((nl.par_dim(qs), OUTPUT_TILE), nl.float32, buffer=nl.psum)
+                    for d, (d0, ds) in enumerate(d_tiles):
+                        scores += nisa.nc_matmul(q_sb[d][:, q0 : q0 + qs], keys[d][:, j0 : j0 + OUTPUT_TILE])
+                    masked[:, j0 : j0 + OUTPUT_TILE] = nisa.tensor_tensor(scores, biases[t][:, j0 : j0 + OUTPUT_TILE], op=nl.add, dtype=nl.float32)
                 new_best = nisa.tensor_tensor(best[t], nisa.tensor_reduce(nl.maximum, masked, axis=[1], keepdims=True), op=nl.maximum)
                 negative = nisa.tensor_scalar(new_best, nl.multiply, -1.0)
                 row_sum = nl.ndarray((nl.par_dim(qs), 1), dtype=nl.float32, buffer=nl.sbuf)

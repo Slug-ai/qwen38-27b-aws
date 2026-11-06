@@ -91,8 +91,10 @@ def build(
     """Compile the one-token-per-row graph for the layers in `cfg`, plus a prefill graph of `chunk` tokens if given."""
     traces = {"decode": example_inputs(cfg, max_seq_len, batch_size)}
     if chunk:
-        if max_seq_len % chunk:
-            raise ValueError(f"max_seq_len {max_seq_len} must be a multiple of the chunk {chunk}")
+        from .kernels import KEY_BLOCK
+
+        if max_seq_len % chunk or max_seq_len % KEY_BLOCK:
+            raise ValueError(f"max_seq_len {max_seq_len} must be a multiple of the chunk {chunk} and of {KEY_BLOCK}")
         traces["prefill"] = prefill_example_inputs(cfg, chunk)
     return compile_graph(
         lambda: Qwen38Step(
