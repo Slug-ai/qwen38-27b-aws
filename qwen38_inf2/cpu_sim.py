@@ -53,6 +53,7 @@ class SimulatedCoresStep:
             layer_types=cfg.layer_types[:block_layers],
             weight_format=build_info.get("weight_format", "fp4"),
             recurrent_state_format=build_info.get("recurrent_state_format", "float32"),
+            kv_cache_format=build_info.get("kv_cache_format", "bf16"),
         )
         self.reducer = ThreadedAllReduce(tp_degree)
         self.ranks = []

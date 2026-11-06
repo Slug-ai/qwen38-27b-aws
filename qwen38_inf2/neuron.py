@@ -10,7 +10,7 @@ from neuronx_distributed.trace.nxd_model import NxDModel
 
 from . import checkpoint
 from .config import TextConfig
-from .generate import BlockChain, batch_step_inputs
+from .generate import BlockChain, batch_step_inputs, prefill_inputs
 from .model import HeadStep, Qwen38Step
 
 DTYPE = torch.bfloat16
@@ -26,9 +26,16 @@ def example_inputs(cfg: TextConfig, max_seq_len: int, batch_size: int = 1) -> di
     }
 
 
+def prefill_example_inputs(cfg: TextConfig, chunk: int) -> dict[str, torch.Tensor]:
+    return {
+        "inputs_embeds": torch.zeros(1, chunk, cfg.hidden_size, dtype=DTYPE),
+        **prefill_inputs(cfg, 0, 0, chunk, chunk, DTYPE),
+    }
+
+
 def compile_graph(
     make_model,
-    inputs: dict[str, torch.Tensor],
+    inputs: dict[str, torch.Tensor] | dict[str, dict[str, torch.Tensor]],
     output_dir: str | Path,
     info: dict,
     tp_degree: int = 2,
@@ -37,8 +44,14 @@ def compile_graph(
     workdir: str | Path | None = None,
     optimize_layout: bool = False,
 ) -> Path:
-    """Trace and compile one module for `tp_degree` NeuronCores."""
+    """Trace and compile one module for `tp_degree` NeuronCores.
+
+    `inputs` is one set of example inputs, traced as "decode", or a dict of them by tag. Every tag becomes its
+    own graph in the same model, sharing its weights and state buffers, and each call runs the graph whose
+    input names and shapes it matches.
+    """
     output_dir = Path(output_dir)
+    traces = inputs if all(isinstance(v, dict) for v in inputs.values()) else {"decode": inputs}
     output_dir.mkdir(parents=True, exist_ok=True)
     compiler_args = f"{DEFAULT_COMPILER_ARGS} --target {target} {extra_compiler_args}".strip()
     # The compiler changes into this directory before opening its log, so it must be absolute.
@@ -46,11 +59,14 @@ def compile_graph(
 
     with NxDParallelState(world_size=tp_degree, tensor_model_parallel_size=tp_degree):
         builder = ModelBuilder(make_model())
-        builder.trace(kwargs=inputs, tag="decode")
+        for tag, example in traces.items():
+            builder.trace(kwargs=example, tag=tag)
         nxd_model = builder.compile(
             priority_model_key="decode" if optimize_layout else None,
             compiler_args=compiler_args,
             compiler_workdir=workdir,
+            # One graph at a time: decode and prefill compiled together ran a 15 GB inf2.xlarge out of memory.
+            max_workers=1,
         )
 
     path = output_dir / MODEL_FILE
@@ -70,8 +86,14 @@ def build(
     workdir: str | Path | None = None,
     optimize_layout: bool = False,
     batch_size: int = 1,
+    chunk: int | None = None,
 ) -> Path:
-    """Compile the one-token-per-row graph for the layers in `cfg`."""
+    """Compile the one-token-per-row graph for the layers in `cfg`, plus a prefill graph of `chunk` tokens if given."""
+    traces = {"decode": example_inputs(cfg, max_seq_len, batch_size)}
+    if chunk:
+        if max_seq_len % chunk:
+            raise ValueError(f"max_seq_len {max_seq_len} must be a multiple of the chunk {chunk}")
+        traces["prefill"] = prefill_example_inputs(cfg, chunk)
     return compile_graph(
         lambda: Qwen38Step(
             cfg,
@@ -81,7 +103,7 @@ def build(
             all_reduce=reduce_from_tensor_model_parallel_region,
             batch_size=batch_size,
         ),
-        example_inputs(cfg, max_seq_len, batch_size),
+        traces,
         output_dir,
         {
             "max_seq_len": max_seq_len,
@@ -89,6 +111,8 @@ def build(
             "batch_size": batch_size,
             "weight_format": cfg.weight_format,
             "recurrent_state_format": cfg.recurrent_state_format,
+            "kv_cache_format": cfg.kv_cache_format,
+            **({"chunk": chunk} if chunk else {}),
         },
         tp_degree,
         target,
@@ -164,7 +188,10 @@ def load_graph(model_dir: str | Path, rank_weights: list[dict[str, torch.Tensor]
 
 
 class NeuronStep(BlockChain):
-    """The compiled block, loaded once per repeat with that repeat's weights and its own caches."""
+    """The compiled block, loaded once per repeat with that repeat's weights and its own caches.
+
+    A build with a prefill graph takes prefill inputs through the same call, since each loaded block holds both.
+    """
 
     def __init__(self, model_dir: str | Path, weights_dir: str | Path, cfg: TextConfig, num_blocks: int | None = None):
         info = checkpoint.read_build_info(model_dir)

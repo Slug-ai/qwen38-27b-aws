@@ -24,7 +24,7 @@ TEXT_PREFIX = "model.language_model."
 LM_HEAD = "lm_head.weight"
 EMBED_TOKENS = TEXT_PREFIX + "embed_tokens.weight"
 FINAL_NORM = TEXT_PREFIX + "norm.weight"
-# Static FP8 calibration scales for the KV cache. The cache here is BF16, so they are unused.
+# Static FP8 calibration scales for the KV cache. Only read when the cache is FP8.
 UNUSED_LAYER_SUFFIXES = ("self_attn.k_scale", "self_attn.v_scale")
 
 _DTYPES = {
@@ -198,6 +198,9 @@ def layer_weights(
         out |= matrix(f"{hs}.o_proj", f"{sa}.o_proj", by_cols)
         out[f"{sa}.q_norm_weight"] = source.get(f"{hs}.q_norm.weight").to(dtype)
         out[f"{sa}.k_norm_weight"] = source.get(f"{hs}.k_norm.weight").to(dtype)
+        if cfg.kv_cache_format == "fp8":
+            out[f"{sa}.k_scale"] = source.get(f"{hs}.k_scale").reshape(1).to(dtype)
+            out[f"{sa}.v_scale"] = source.get(f"{hs}.v_scale").reshape(1).to(dtype)
     return out
 
 

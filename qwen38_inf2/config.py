@@ -30,6 +30,8 @@ class TextConfig:
     weight_format: str = "fp4"
     # The reference keeps gated delta state in float32. BF16 halves it, and it is the largest cost per row.
     recurrent_state_format: str = "float32"
+    # "fp8" stores the KV cache as FP8 e4m3 with the checkpoint's static scales, the format it was calibrated for.
+    kv_cache_format: str = "bf16"
 
     @property
     def num_hidden_layers(self) -> int:

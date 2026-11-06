@@ -27,7 +27,7 @@ def main():
 
     cfg = TextConfig.from_file(f"{args.model_dir}/config.json")
     info = read_build_info(args.compiled)
-    cfg = replace(cfg, weight_format=info.get("weight_format", "fp4"))
+    cfg = replace(cfg, weight_format=info.get("weight_format", "fp4"), kv_cache_format=info.get("kv_cache_format", "bf16"))
     write_rank_weights(TensorSource(f"{args.model_dir}/model.safetensors"), cfg, args.output, info["layers"], info["tp_degree"])
     print(f"wrote weights to {args.output}")
 

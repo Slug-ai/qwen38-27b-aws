@@ -74,8 +74,9 @@ def alone(prompt: list[int], max_new_tokens: int, max_seq_len: int) -> list[int]
         token = next_token(ids)
         out.append(token)
         ids.append(token)
-        # Mirrors the scheduler's stop: the next step would write position len(ids) - 1.
-        if token == EOS or len(out) >= max_new_tokens or len(ids) - 1 >= max_seq_len:
+        # Mirrors the scheduler's stop: the next step would write position len(ids) - 1, and the cache's last
+        # chunk of positions takes junk writes.
+        if token == EOS or len(out) >= max_new_tokens or len(ids) - 1 >= max_seq_len - CHUNK:
             return out
 
 
@@ -83,7 +84,7 @@ def alone(prompt: list[int], max_new_tokens: int, max_seq_len: int) -> list[int]
 def test_every_request_gets_the_tokens_it_would_get_alone(batch_size):
     max_seq_len = 40
     torch.manual_seed(0)
-    lengths = [1, 7, 8, 9, 16, 17, 30, 39, 3, 25]
+    lengths = [1, 7, 8, 9, 16, 17, 30, 31, 3, 25]
     prompts = [torch.randint(1, 50, (n,)).tolist() for n in lengths]
     device = FakeDevice(batch_size, max_seq_len)
     scheduler = Scheduler(device.decode, device.prefill, FakeHead(device), tiny_config(), batch_size, max_seq_len, CHUNK, [EOS], torch.float32)
@@ -117,4 +118,4 @@ def test_prompts_that_leave_no_room_are_refused():
     device = FakeDevice(2, 16)
     scheduler = Scheduler(device.decode, device.prefill, FakeHead(device), tiny_config(), 2, 16, CHUNK, [], torch.float32)
     with pytest.raises(ValueError):
-        list(scheduler.run([[1] * 16], max_new_tokens=4))
+        list(scheduler.run([[1] * (16 - CHUNK)], max_new_tokens=4))

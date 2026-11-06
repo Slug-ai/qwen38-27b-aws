@@ -26,6 +26,9 @@ class Loaded:
     batch_size: int
     max_seq_len: int
     load_seconds: float
+    # The prefill graph, called as `generate.prefill_prompt` does, and its tokens per call. None without one.
+    prefill: Callable[..., torch.Tensor] | None = None
+    chunk: int | None = None
 
 
 def load(model_dir, compiled, weights, head_dir=None, simulate: bool = False, log: Callable[[str], None] = _log) -> Loaded:
@@ -61,7 +64,9 @@ def load(model_dir, compiled, weights, head_dir=None, simulate: bool = False, lo
         source.touch(checkpoint.LM_HEAD)
         source.touch(checkpoint.EMBED_TOKENS)
         log(f"read lm_head and embeddings into the disk cache in {time.perf_counter() - started:.1f}s")
-    return Loaded(cfg, tokenizer, head, step, batch_size, info["max_seq_len"], load_seconds)
+    # A build with a prefill graph holds it in the same loaded blocks, and calls are routed by their inputs.
+    chunk = info.get("chunk")
+    return Loaded(cfg, tokenizer, head, step, batch_size, info["max_seq_len"], load_seconds, step if chunk else None, chunk)
 
 
 def encode(tokenizer, lines: Sequence[str]) -> list[list[int]]:

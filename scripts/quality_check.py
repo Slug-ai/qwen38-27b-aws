@@ -15,7 +15,7 @@ from tokenizers import Tokenizer
 
 from qwen38_inf2 import checkpoint
 from qwen38_inf2.config import TextConfig
-from qwen38_inf2.generate import ChipHead, batch_step_inputs
+from qwen38_inf2.generate import ChipHead, batch_step_inputs, prefill_inputs
 from qwen38_inf2.neuron import NeuronStep, load_head_graph
 
 # The opening of the US Declaration of Independence and the Gettysburg Address, both public domain.
@@ -41,7 +41,7 @@ def main():
     info = checkpoint.read_build_info(args.compiled)
     batch = info.get("batch_size", 1)
     tokens = Tokenizer.from_file(f"{args.model_dir}/tokenizer.json").encode(TEXT, add_special_tokens=False).ids
-    tokens = tokens[: info["max_seq_len"]]
+    tokens = tokens[: info["max_seq_len"] - info.get("chunk", 1)]
 
     source = checkpoint.TensorSource(f"{args.model_dir}/model.safetensors")
     head = ChipHead(source, cfg.rms_norm_eps, load_head_graph(args.head, args.weights), batch)
@@ -56,8 +56,22 @@ def main():
         top.append(tops[0])
 
     correct = sum(a == b for a, b in zip(top[:-1], tokens[1:]))
-    results = {
-        "build": args.compiled,
+    results = {"build": args.compiled}
+    chunk = info.get("chunk")
+    if chunk:
+        # The same text through the prefill graph, a chunk at a time into row 0, which must agree with decode.
+        prefilled = []
+        for start in range(0, len(tokens), chunk):
+            ids = tokens[start : start + chunk]
+            embeds = head.embed_batch(ids + [0] * (chunk - len(ids)), torch.bfloat16).reshape(1, chunk, -1)
+            hidden = step(inputs_embeds=embeds, **prefill_inputs(cfg, 0, start, len(ids), chunk, torch.bfloat16))[0]
+            for first in range(0, len(ids), batch):
+                prefilled += head.next_tokens(hidden[first : min(first + batch, len(ids))].unsqueeze(1))
+        results |= {
+            "prefill_top_token_is_next_token": sum(a == b for a, b in zip(prefilled[:-1], tokens[1:])),
+            "prefill_same_top_token_as_decode": sum(a == b for a, b in zip(prefilled, top)),
+        }
+    results |= {
         "positions": len(tokens) - 1,
         "top_token_is_next_token": correct,
         "accuracy": correct / (len(tokens) - 1),

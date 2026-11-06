@@ -104,7 +104,8 @@ def test_tokens_catch_state_lost_between_tokens(token_golden):
     model = random_step(DTYPE)
 
     def forgetful(**inputs):
-        inputs = {**inputs, "keep_state": torch.zeros(1)}
+        # Position 0 clears gated delta state and hides every earlier cache entry.
+        inputs = {**inputs, "position": torch.zeros_like(inputs["position"])}
         for layer in model.layers:
             if layer.layer_type == "full_attention":
                 layer.self_attn.k_cache = torch.zeros_like(layer.self_attn.k_cache)

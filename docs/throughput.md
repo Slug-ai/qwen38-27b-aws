@@ -45,6 +45,22 @@ Row 16 changes numbers: every matmul's input is rounded to FP8 e5m2, 2 mantissa 
 
 Raw results are in [throughput/](throughput/). `git log docs/throughput.md` gives the commit for each row.
 
+## Agentic workload
+
+The table above measures 21-token prompts with prompt plus output capped at 512 tokens, which no coding agent's request fits. From here the headline is `scripts/agentic_benchmark.py`: requests shaped like Claude Code turns, a system prompt with tools, a task, standard library files read back as tool results and a question about them. By default 16 requests from 8K to 30K prompt tokens run, plus the saved greedy prompt, with up to 256 new tokens each, greedy. It reports input, output and total tokens per second, all measured over the whole run. Two checks must pass: the saved greedy prompt gives its saved tokens, and the longest request recalls a key planted in its first file.
+
+| # | Change | Rows x max length | Workload | Input tok/s | Output tok/s | Total tok/s | Correct |
+|---|---|---|---|---|---|---|---|
+| A1 | Prompts fed one token per decode step, as in row 16 | 2 x 32768 | 2 prompts of 4K | 24.03 | 0.41 | 24.45 | yes |
+| A2 | Prefill graph: 512 prompt tokens of one row per call, with NKI kernels for the chunked gated delta rule and for flash attention over the cache | 2 x 32768 | 2 prompts of 4K | 400.65 | 6.90 | 407.55 | yes |
+| A2 | Same build | 2 x 32768 | 16 prompts of 8K to 30K | 568.58 | 2.42 | 571.00 | yes, 114 requests per hour |
+
+A1 and A2 are the same build, A1 run with `--no-prefill`. A1 on the full workload would take about 3.5 hours, so both ran the small one. Only 2 rows fit: a BF16 KV cache of 32K positions takes 1.07 GB per row on each core. The FP8 cache the checkpoint was calibrated for would fit about twice as many, but the compiler accepts FP8 only inside NKI kernels.
+
+In A2 the full workload made 604 prefill calls and 760 decode steps in 536 s, so a 512-token chunk took about 0.79 s across the 4 blocks. One layer's prefill, timed alone on one core: gated delta 7.8 ms (21.9 ms as XLA ops), attention against a 32K cache 17.6 ms (36.8 ms with XLA scatters and a copy of the row), MLP 3.7 ms. The quality check gives 311 of 323 through decode and 313 of 323 through prefill, and the two paths pick the same top token at 319 of 324 positions.
+
+Raw results are in [throughput/agentic/](throughput/agentic/).
+
 ## Where the time goes
 
 `neuron-profile` on one block at batch 32, before change 3 (0.268 s, core 0). Engines overlap, so these add to more than 100%:

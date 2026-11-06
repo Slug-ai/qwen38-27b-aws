@@ -2,7 +2,7 @@
 
 Runs the text part of [RedHatAI/Qwen3.8-27B-MXFP4](https://huggingface.co/RedHatAI/Qwen3.8-27B-MXFP4) on one AWS Inferentia2 chip (two NeuronCores), with its FP4 weights converted to FP8 and greedy decoding.
 
-**Status: runs end to end on a real `inf2.xlarge`.** Currently 156.20 generated tokens/s at batch 63 with a maximum of 512 tokens per sequence, measured. See [the throughput log](docs/throughput.md) and [the field notes](docs/field_notes.md), which cover setup on the Amazon Linux Neuron AMI.
+**Status: runs end to end on a real `inf2.xlarge`.** On coding-agent requests of 8K to 30K prompt tokens with a 32K context, 571 tokens/s in all, 114 requests per hour, measured. With prompt plus output capped at 512 tokens, which no agent request fits, 156.20 generated tokens/s at batch 63. See [the throughput log](docs/throughput.md) and [the field notes](docs/field_notes.md), which cover setup on the Amazon Linux Neuron AMI.
 
 **Goal: maximum throughput, not latency.** Every design choice is judged by total tokens per second across all sequences. Time per token doesn't matter, so large batches and slow steps are fine.
 
@@ -26,7 +26,8 @@ This describes the build measured in [the throughput log](docs/throughput.md), w
 
 - **Text only.** The vision tower, MTP head and KV-cache FP8 scales are never read.
 - **Two cores.** Each core owns a slice of the attention heads. Only the output projections need a collective, so there are two all-reduces per layer. Each core also holds half of `lm_head`'s tokens, and one more all-reduce joins the two halves of its output.
-- **One graph, one token per row.** Each row of the fixed batch is an independent sequence at its own position. A prompt is fed token by token through the same graph, in the recurrent form of the gated delta rule, so there is no prefill graph or chunked solve. A row that finishes takes the next waiting prompt. Prompt plus output is limited to 512 tokens, because a shorter KV cache leaves room for more rows.
+- **Decode: one token per row.** Each row of the fixed batch is an independent sequence at its own position, and decode runs the recurrent form of the gated delta rule. A row that finishes takes the next waiting prompt.
+- **Prefill: 512 prompt tokens of one row per call** (`--chunk 512`), in a second graph that shares the first's weights and caches. Prompts are no longer fed one token per step. The chunked form of the gated delta rule and flash attention against the row's cache are NKI kernels ([kernels.py](qwen38_inf2/kernels.py)), and its matmuls reach the Tensor Engine's peak. `qwen38_inf2/scheduler.py` prefills every free row before each decode step. The long-context build allows 32768 positions per row, 2 rows.
 - **16 layers at a time, loaded 4 times.** The model is 16 repeats of the same 4 layers (3 gated delta, 1 full attention). We compile 16 layers once and load that graph 4 times, each with its own weights and caches. Each loaded graph costs chip memory for code and collective rings, so 4 graphs leave more room for rows than 16 did. Larger graphs aren't practical on `inf2.xlarge`. Both cores' weights sit in host RAM together while a graph loads, which is about 24 GB for a whole-model graph against 15 GB of RAM, and preparing 32-layer weights was killed for running out of memory.
 - **`lm_head` on the chip, checked on the host.** A kernel returns the largest logit in each group of 32 tokens, using an FP8 copy of `lm_head`. The host then reads the top 4 groups from the checkpoint and picks the exact token, so it needs no 5 GB copy of `lm_head`, and the FP8 copy only has to keep the right group in the top 4.
 - **Host side.** Embeddings and the greedy loop run on the host, reading embeddings from the mapped checkpoint. `scripts/batch_generate.py` reads `lm_head` and the embeddings once after loading, in about 32 s, because otherwise each step waits on the disk. It also sets 64 MB scratchpad pages, which reserve less chip memory than the runtime's default.
@@ -40,7 +41,20 @@ Weights are FP8, converted from the checkpoint's FP4. Matmul inputs are rounded 
 
 These choices change some outputs. Against an earlier float32-state build at batch 20, 33 of 40 sequences are identical, and part of that difference comes from batch size. On 324 tokens of well-known English text, BF16 and float32 state both get the real next token at 315 of 323 positions and pick the same token at 323 of 324 (`scripts/quality_check.py`). Famous text is an easy test, so this rules out large damage but not subtle damage. With FP8 matmul inputs the same check gives 316 of 323, and the same top token as the BF16-input build at 322 of 324. Nothing on real weights has been compared with MXFP4 activations and an FP8 cache.
 
-## Run the measured build
+## Run the agentic build
+
+32K context, 2 rows, with a prefill graph. The layers compile in about 12 minutes on the `inf2.xlarge` itself. Run long jobs there with a memory cap, for example `systemd-run --scope -p MemoryMax=12G`, because running out of memory makes that instance stop answering instead of killing the job.
+
+```bash
+python scripts/compile.py --config model/config.json --layers 16 --max-seq-len 32768 --batch-size 2 \
+  --weight-format fp8 --recurrent-state bf16 --chunk 512 --output artifacts/block16_b2_s32k_c512
+python scripts/compile.py --config model/config.json --head --head-format fp8 --batch-size 2 --output artifacts/head_fp8_b2
+python scripts/agentic_benchmark.py --model-dir model --compiled artifacts/block16_b2_s32k_c512 --head artifacts/head_fp8_b2 --weights weights_fp8
+```
+
+The weights are the same files as the 512-token build's, prepared as below. `scripts/quality_check.py` with the same arguments also checks the prefill path against decode.
+
+## Run the 512-token build
 
 These commands give the 156.20 tok/s build. The rest of this README covers the batch-1 FP4 graph used for first bring-up, which is what `scripts/generate.py` and `scripts/chip_check.py` take, and it explains how to set up the compiler, checkpoint and instance used here. [The field notes](docs/field_notes.md) cover installing the runtime and Python packages on the Amazon Linux Neuron AMI.
 

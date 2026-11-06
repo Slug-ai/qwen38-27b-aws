@@ -15,36 +15,7 @@ from dataclasses import dataclass, field
 import torch
 
 from .config import TextConfig
-
-
-def rotary(cfg: TextConfig, positions: torch.Tensor, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
-    """cos and sin for each position, ``[len(positions), rotary_dim]``. Text-only MRoPE is plain RoPE."""
-    dim = cfg.rotary_dim
-    inv_freq = 1.0 / (cfg.rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-    freqs = positions.float().unsqueeze(-1) * inv_freq
-    return freqs.cos().repeat(1, 2).to(dtype), freqs.sin().repeat(1, 2).to(dtype)
-
-
-def decode_inputs(cfg: TextConfig, positions: Sequence[int], active: Sequence[bool], dtype: torch.dtype) -> dict[str, torch.Tensor]:
-    position = torch.as_tensor(positions, dtype=torch.int32)
-    cos, sin = rotary(cfg, position, dtype)
-    return {
-        "cos": cos.unsqueeze(1),
-        "sin": sin.unsqueeze(1),
-        "position": position,
-        "active": torch.as_tensor(active, dtype=torch.float32),
-    }
-
-
-def prefill_inputs(cfg: TextConfig, slot: int, start: int, n_valid: int, chunk: int, dtype: torch.dtype) -> dict[str, torch.Tensor]:
-    cos, sin = rotary(cfg, start + torch.arange(chunk), dtype)
-    return {
-        "cos": cos.unsqueeze(0),
-        "sin": sin.unsqueeze(0),
-        "slot": torch.tensor([slot], dtype=torch.int32),
-        "start": torch.tensor([start], dtype=torch.int32),
-        "n_valid": torch.tensor([n_valid], dtype=torch.int32),
-    }
+from .generate import batch_step_inputs, prefill_inputs
 
 
 @dataclass
@@ -105,15 +76,15 @@ class Scheduler:
         return self.head.next_tokens(hidden[:, n_valid - 1 : n_valid])[0]
 
     def _finished(self, row: _Row, token_id: int, max_new_tokens: int) -> bool:
-        # The next decode step would write position row.written, which must fit the cache.
-        return token_id in self.eos or row.new >= max_new_tokens or row.written >= self.max_seq_len
+        # The next decode step would write position row.written. The cache's last `chunk` positions take junk writes.
+        return token_id in self.eos or row.new >= max_new_tokens or row.written >= self.max_seq_len - self.chunk
 
     def run(self, prompts: Sequence[Sequence[int]], max_new_tokens: int) -> Iterator[tuple[int, int]]:
         """Yield (prompt index, token id) as tokens are chosen."""
         for prompt in prompts:
             if not prompt:
                 raise ValueError("a prompt is empty")
-            if len(prompt) >= self.max_seq_len:
+            if len(prompt) >= self.max_seq_len - self.chunk:
                 raise ValueError(f"a prompt of {len(prompt)} tokens leaves no room in max_seq_len {self.max_seq_len}")
         waiting = list(range(len(prompts)))[::-1]
         slots: list[_Row | None] = [None] * self.batch_size
@@ -136,7 +107,7 @@ class Scheduler:
             positions = [row.written if row else 0 for row in slots]
             active = [row is not None for row in slots]
             last = [row.ids[-1] if row else 0 for row in slots]
-            hidden = self.decode(inputs_embeds=self.head.embed_batch(last, self.dtype), **decode_inputs(self.cfg, positions, active, self.dtype))
+            hidden = self.decode(inputs_embeds=self.head.embed_batch(last, self.dtype), **batch_step_inputs(self.cfg, positions, self.max_seq_len, self.dtype, active))
             self.decode_calls += 1
             ready = [slot for slot, row in enumerate(slots) if row]
             for slot, token_id in zip(ready, self.head.next_tokens(hidden[ready])):

@@ -10,7 +10,7 @@ import torch
 
 from . import checkpoint
 from .config import TextConfig
-from .model import MASKED_SCORE, rms_norm
+from .model import rms_norm
 
 # From the checkpoint's generation_config.json: <|im_end|> and <|endoftext|>.
 EOS_TOKEN_IDS = (248046, 248044)
@@ -22,52 +22,62 @@ def chat_prompt(user_message: str, thinking: bool = False) -> str:
     return f"<|im_start|>user\n{user_message}<|im_end|>\n<|im_start|>assistant\n{opening}"
 
 
-def rotary_terms(cfg: TextConfig, position: int, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
-    """cos and sin for one position. With text-only input the T/H/W grids coincide, so MRoPE is plain RoPE."""
+def rotary(cfg: TextConfig, positions: torch.Tensor, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    """cos and sin for each position, ``[len(positions), rotary_dim]``. With text-only input the T/H/W grids
+    coincide, so MRoPE is plain RoPE."""
     dim = cfg.rotary_dim
     inv_freq = 1.0 / (cfg.rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-    freqs = position * inv_freq
-    cos, sin = freqs.cos(), freqs.sin()
-    return (
-        torch.cat((cos, cos)).reshape(1, 1, -1).to(dtype),
-        torch.cat((sin, sin)).reshape(1, 1, -1).to(dtype),
-    )
+    freqs = positions.float().unsqueeze(-1) * inv_freq
+    return freqs.cos().repeat(1, 2).to(dtype), freqs.sin().repeat(1, 2).to(dtype)
 
 
 def step_inputs(cfg: TextConfig, position: int, max_seq_len: int, dtype: torch.dtype) -> dict[str, torch.Tensor]:
-    if position >= max_seq_len:
-        raise ValueError(f"position {position} is past the compiled max_seq_len of {max_seq_len}")
-    cos, sin = rotary_terms(cfg, position, dtype)
-    write_mask = torch.zeros(1, 1, max_seq_len, 1, dtype=torch.float32)
-    write_mask[0, 0, position, 0] = 1.0
-    attn_mask = torch.full((1, 1, 1, max_seq_len), MASKED_SCORE, dtype=torch.float32)
-    attn_mask[..., : position + 1] = 0.0
+    return batch_step_inputs(cfg, [position], max_seq_len, dtype)
+
+
+def batch_step_inputs(
+    cfg: TextConfig, positions: Sequence[int], max_seq_len: int, dtype: torch.dtype, active: Sequence[bool] | None = None
+) -> dict[str, torch.Tensor]:
+    """Decode inputs with one row per sequence, each at its own position. Rows with `active` False are left alone.
+
+    The cache's last position is where inactive rows write, so a sequence can use `max_seq_len - 1` positions.
+    """
+    position = torch.as_tensor(positions, dtype=torch.int32)
+    on = torch.ones(len(positions), dtype=torch.bool) if active is None else torch.as_tensor(active, dtype=torch.bool)
+    if bool((position[on] >= max_seq_len - 1).any()):
+        raise ValueError(f"position {int(position[on].max())} is past the last usable one of max_seq_len {max_seq_len}")
+    cos, sin = rotary(cfg, position, dtype)
     return {
-        "cos": cos,
-        "sin": sin,
-        "write_mask": write_mask,
-        "attn_mask": attn_mask,
-        "keep_state": torch.tensor([0.0 if position == 0 else 1.0], dtype=torch.float32),
+        "cos": cos.unsqueeze(1),
+        "sin": sin.unsqueeze(1),
+        "position": position,
+        "active": on.float(),
     }
 
 
-def batch_step_inputs(cfg: TextConfig, positions: Sequence[int], max_seq_len: int, dtype: torch.dtype) -> dict[str, torch.Tensor]:
-    """`step_inputs` with one row per sequence, each at its own position."""
-    position = torch.as_tensor(positions, dtype=torch.long)
-    if int(position.max()) >= max_seq_len:
-        raise ValueError(f"position {int(position.max())} is past the compiled max_seq_len of {max_seq_len}")
-    dim = cfg.rotary_dim
-    inv_freq = 1.0 / (cfg.rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-    freqs = position.float().unsqueeze(-1) * inv_freq
-    slots = torch.arange(max_seq_len)
-    filled = slots.unsqueeze(0) <= position.unsqueeze(-1)
+def prefill_inputs(cfg: TextConfig, slot: int, start: int, n_valid: int, chunk: int, dtype: torch.dtype) -> dict[str, torch.Tensor]:
+    """Prefill inputs for `n_valid` tokens of one row from position `start`, padded to a full chunk."""
+    if start % chunk or not 0 < n_valid <= chunk:
+        raise ValueError(f"a chunk must start at a multiple of {chunk} and hold 1 to {chunk} tokens")
+    cos, sin = rotary(cfg, start + torch.arange(chunk), dtype)
     return {
-        "cos": freqs.cos().repeat(1, 2).unsqueeze(1).to(dtype),
-        "sin": freqs.sin().repeat(1, 2).unsqueeze(1).to(dtype),
-        "write_mask": (slots.unsqueeze(0) == position.unsqueeze(-1)).float().reshape(-1, 1, max_seq_len, 1),
-        "attn_mask": torch.where(filled, 0.0, MASKED_SCORE).float().reshape(-1, 1, 1, max_seq_len),
-        "keep_state": (position != 0).float(),
+        "cos": cos.unsqueeze(0),
+        "sin": sin.unsqueeze(0),
+        "slot": torch.tensor([slot], dtype=torch.int32),
+        "start": torch.tensor([start], dtype=torch.int32),
+        "n_valid": torch.tensor([n_valid], dtype=torch.int32),
     }
+
+
+def prefill_prompt(prefill, head, cfg: TextConfig, slot: int, prompt_ids: Sequence[int], chunk: int, dtype: torch.dtype) -> torch.Tensor:
+    """Write a whole prompt into `slot` a chunk at a time, and return the last token's hidden state ``[1, 1, hidden]``."""
+    hidden = None
+    for start in range(0, len(prompt_ids), chunk):
+        ids = list(prompt_ids[start : start + chunk])
+        embeds = head.embed_batch(ids + [0] * (chunk - len(ids)), dtype).reshape(1, chunk, -1)
+        hidden = prefill(inputs_embeds=embeds, **prefill_inputs(cfg, slot, start, len(ids), chunk, dtype))
+    last = (len(prompt_ids) - 1) % chunk
+    return hidden[:, last : last + 1]
 
 
 class HostHead:
@@ -143,6 +153,8 @@ class ChipHead:
                 logit, index = (candidates @ norm[row]).max(dim=0)
                 if logit > best_logit:
                     best_token, best_logit = first + int(index), logit
+            if best_token < 0:
+                raise FloatingPointError(f"row {row}'s logits are not finite, so the graph produced NaN or infinity")
             tokens.append(best_token)
         return tokens
 
@@ -169,20 +181,30 @@ def greedy_generate(
     max_seq_len: int,
     eos_token_ids: Sequence[int] = (),
     dtype: torch.dtype = torch.bfloat16,
+    prefill: Callable[..., torch.Tensor] | None = None,
+    chunk: int | None = None,
 ) -> Iterator[int]:
-    """Yield greedily decoded token ids, one at a time."""
+    """Yield greedily decoded token ids, one at a time.
+
+    With `prefill`, the prompt goes through the prefill graph `chunk` tokens at a time, into row 0. Otherwise
+    each prompt token is a decode step.
+    """
     if not prompt_ids:
         raise ValueError("prompt_ids is empty")
-    hidden = None
-    position = 0
-    for token_id in prompt_ids:
-        hidden = step(inputs_embeds=head.embed(token_id, dtype), **step_inputs(cfg, position, max_seq_len, dtype))
-        position += 1
+    if prefill is not None:
+        hidden = prefill_prompt(prefill, head, cfg, 0, prompt_ids, chunk, dtype)
+        position = len(prompt_ids)
+    else:
+        hidden = None
+        position = 0
+        for token_id in prompt_ids:
+            hidden = step(inputs_embeds=head.embed(token_id, dtype), **step_inputs(cfg, position, max_seq_len, dtype))
+            position += 1
 
     for _ in range(max_new_tokens):
         next_id = int(torch.argmax(head.logits(hidden)))
         yield next_id
-        if next_id in eos_token_ids or position >= max_seq_len:
+        if next_id in eos_token_ids or position >= max_seq_len - 1:
             return
         hidden = step(inputs_embeds=head.embed(next_id, dtype), **step_inputs(cfg, position, max_seq_len, dtype))
         position += 1
@@ -202,7 +224,7 @@ def batched_greedy_generate(
     """Run many prompts through a fixed batch, and yield (prompt index, token id) as tokens are chosen.
 
     A row that finishes takes the next waiting prompt on the following step. Its first token clears the
-    row's state, and an idle row just rewrites position 0 of its own cache, so rows never affect each other.
+    row's state, and an idle row is inactive, so rows never affect each other.
     """
     if any(not prompt for prompt in prompts):
         raise ValueError("a prompt is empty")
@@ -217,7 +239,8 @@ def batched_greedy_generate(
 
         positions = [row["position"] if row else 0 for row in rows]
         token_ids = [row["ids"][row["position"]] if row else 0 for row in rows]
-        hidden = step(inputs_embeds=head.embed_batch(token_ids, dtype), **batch_step_inputs(cfg, positions, max_seq_len, dtype))
+        active = [row is not None for row in rows]
+        hidden = step(inputs_embeds=head.embed_batch(token_ids, dtype), **batch_step_inputs(cfg, positions, max_seq_len, dtype, active))
 
         # Only rows that have fed their last known token need lm_head, which is the costly part on the host.
         ready = []
@@ -232,5 +255,5 @@ def batched_greedy_generate(
                 row["ids"].append(token_id)
                 row["new"] += 1
                 yield row["index"], token_id
-                if token_id in eos_token_ids or row["new"] >= max_new_tokens or row["position"] >= max_seq_len:
+                if token_id in eos_token_ids or row["new"] >= max_new_tokens or row["position"] >= max_seq_len - 1:
                     rows[r] = None

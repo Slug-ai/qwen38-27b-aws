@@ -1,0 +1,22 @@
+{
+ "requests": 17,
+ "batch_size": 2,
+ "max_seq_len": 32768,
+ "prompt_tokens": 304969,
+ "prompt_tokens_min": 5,
+ "prompt_tokens_max": 29960,
+ "generated_tokens": 1299,
+ "wall_seconds": 536.368020736998,
+ "input_tokens_per_second": 568.5816234550234,
+ "output_tokens_per_second": 2.421844610003231,
+ "total_tokens_per_second": 571.0034680650267,
+ "requests_per_hour": 114.10076222648019,
+ "golden_row_matches": true,
+ "needle_found": true,
+ "prompt_path": "prefill",
+ "prefill_calls": 604,
+ "decode_calls": 760,
+ "load_seconds": 176.79205264799748,
+ "prompt_digest": "b07333738230830e",
+ "python": "3.12.12"
+}

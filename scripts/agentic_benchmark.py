@@ -25,9 +25,9 @@ from qwen38_inf2.runner import generate, load
 from qwen38_inf2.scheduler import Scheduler
 
 
-def run(loaded, prompts, max_new_tokens: int) -> tuple[list[list[int]], float, dict]:
+def run(loaded, prompts, max_new_tokens: int, use_prefill: bool = True) -> tuple[list[list[int]], float, dict]:
     """With a prefill graph, prompts go through it in chunks. Without one, they're fed token by token through decode."""
-    if getattr(loaded, "prefill", None) is None:
+    if not use_prefill or getattr(loaded, "prefill", None) is None:
         outputs, seconds = generate(loaded.step, loaded.head, loaded.cfg, prompts, loaded.batch_size, max_new_tokens, loaded.max_seq_len)
         return outputs, seconds, {"prompt_path": "decode"}
     scheduler = Scheduler(
@@ -96,19 +96,22 @@ def main():
     parser.add_argument("--golden", type=Path, default=Path("tests/golden/model.json"), help="Saved greedy result, run as an extra request.")
     parser.add_argument("--output", type=Path, help="Write the results as JSON here.")
     parser.add_argument("--simulate", action="store_true", help="Run on CPU instead of a chip.")
+    parser.add_argument("--no-prefill", action="store_true", help="Feed prompts token by token through decode even if the build has a prefill graph.")
     args = parser.parse_args()
 
     loaded = load(args.model_dir, args.compiled, args.weights, args.head, args.simulate)
     longest = args.max_prompt_tokens + args.max_new_tokens
-    if longest > loaded.max_seq_len:
-        parser.error(f"prompts of {args.max_prompt_tokens} tokens plus {args.max_new_tokens} new need max_seq_len {longest}, the build has {loaded.max_seq_len}")
+    # The cache's last positions take junk writes: one for decode, a chunk with a prefill graph.
+    usable = loaded.max_seq_len - (loaded.chunk or 1)
+    if longest > usable:
+        parser.error(f"prompts of {args.max_prompt_tokens} tokens plus {args.max_new_tokens} new need {longest} positions, the build has {usable}")
 
     requests = benchmark_requests(loaded.tokenizer, args.requests, args.min_prompt_tokens, args.max_prompt_tokens)
     golden = json.loads(args.golden.read_text())
     prompts = [r.ids for r in requests] + [golden["prompt"]]
 
     with torch.no_grad():
-        outputs, seconds, path = run(loaded, prompts, args.max_new_tokens)
+        outputs, seconds, path = run(loaded, prompts, args.max_new_tokens, not args.no_prefill)
     golden_ok = outputs[-1][: len(golden["output"])] == golden["output"]
     needle_index = next(i for i, r in enumerate(requests) if r.has_needle)
     answer = loaded.tokenizer.decode(outputs[needle_index], skip_special_tokens=True)

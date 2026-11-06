@@ -324,7 +324,7 @@ def test_bf16_recurrent_state_stays_close_to_float32():
 
 def test_batch_inputs_match_one_row_at_a_time():
     cfg = tiny_config()
-    positions = [0, 1, 5, 63, 17, 0]
+    positions = [0, 1, 5, 62, 17, 0]
     got = batch_step_inputs(cfg, positions, MAX_SEQ_LEN, torch.bfloat16)
     rows = [step_inputs(cfg, position, MAX_SEQ_LEN, torch.bfloat16) for position in positions]
     for name, value in got.items():
@@ -332,7 +332,7 @@ def test_batch_inputs_match_one_row_at_a_time():
         assert value.dtype == want.dtype and value.shape == want.shape, name
         assert torch.equal(value, want), name
     with pytest.raises(ValueError):
-        batch_step_inputs(cfg, [MAX_SEQ_LEN], MAX_SEQ_LEN, torch.bfloat16)
+        batch_step_inputs(cfg, [MAX_SEQ_LEN - 1], MAX_SEQ_LEN, torch.bfloat16)
 
 
 def test_all_text_tensors_are_consumed():
