@@ -49,7 +49,7 @@ def main():
     scheduler = Scheduler(
         loaded.step, loaded.prefill, loaded.head, loaded.cfg, loaded.batch_size, loaded.max_seq_len, loaded.chunk, EOS_TOKEN_IDS,
         copy_states=loaded.step, reuse_prefixes=not args.no_reuse,
-        verify=None if args.no_speculation else loaded.verify, verify_tokens=loaded.verify_tokens,
+        verify=None if args.no_speculation else loaded.verify, verify_tokens=loaded.verify_tokens, pages=loaded.pages,
     )
     outputs: dict[tuple[int, int], list[int]] = {}
     started = time.perf_counter()

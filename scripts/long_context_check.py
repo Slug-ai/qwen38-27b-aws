@@ -19,7 +19,7 @@ import torch
 
 from qwen38_inf2 import checkpoint
 from qwen38_inf2.agentic import long_context_requests
-from qwen38_inf2.generate import batch_step_inputs, prefill_prompt
+from qwen38_inf2.generate import batch_step_inputs, page_table, prefill_prompt
 from qwen38_inf2.model import rms_norm
 from qwen38_inf2.runner import load
 
@@ -40,7 +40,9 @@ def host_logits(head, cfg, hidden: torch.Tensor) -> torch.Tensor:
 def key_logprob(loaded, ids: list[int], answer: list[int]) -> dict:
     """Prefill `ids` into row 0, then feed `answer` through decode, scoring each of its tokens."""
     cfg, dtype = loaded.cfg, torch.bfloat16
-    hidden = prefill_prompt(loaded.prefill, loaded.head, cfg, 0, ids, loaded.chunk, dtype)
+    # With a paged cache, row 0 takes the pages the prompt and answer need.
+    paged = {"pages": page_table([len(ids) + len(answer) + 1] + [0] * (loaded.batch_size - 1), loaded.max_seq_len, loaded.pages)} if loaded.pages else {}
+    hidden = prefill_prompt(lambda **inputs: loaded.prefill(**inputs, **paged), loaded.head, cfg, 0, ids, loaded.chunk, dtype)
     position, total, first = len(ids), 0.0, None
     others = loaded.batch_size - 1
     for index, token in enumerate(answer):
@@ -50,7 +52,7 @@ def key_logprob(loaded, ids: list[int], answer: list[int]) -> dict:
             first = {"rank": int((logits > logits[token]).sum()) + 1, "p": logits.softmax(0)[token].item()}
         embeds = loaded.head.embed_batch([token] + [0] * others, dtype)
         inputs = batch_step_inputs(cfg, [position] + [0] * others, loaded.max_seq_len, dtype, [True] + [False] * others)
-        hidden = loaded.step(inputs_embeds=embeds, **inputs)[0:1]
+        hidden = loaded.step(inputs_embeds=embeds, **inputs, **paged)[0:1]
         position += 1
     return {"key_logprob": total, "first_token_rank": first["rank"], "first_token_p": first["p"]}
 

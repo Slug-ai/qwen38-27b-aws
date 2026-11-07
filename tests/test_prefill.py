@@ -287,3 +287,45 @@ def test_speculative_decoding_gives_the_tokens_plain_greedy_decoding_gives():
     assert got[4][0] == got[1][0]
     # The tiny model's tokens are near random, so few drafts match, but some must, and they never cost steps.
     assert got[4][2] > 0 and got[4][1] <= got[1][1]
+
+
+def test_a_paged_cache_gives_what_a_row_per_sequence_cache_gives(monkeypatch):
+    """Rows reading and writing their positions through a page table, pages scattered across the pool, must see
+    exactly what rows with their own stretch of cache see, through prefill, decode with a row idle, and verify."""
+    from qwen38_inf2 import checkpoint
+    from qwen38_inf2 import model as model_module
+    from qwen38_inf2.generate import verify_inputs
+    from qwen38_inf2.model import Qwen38Step
+
+    monkeypatch.setattr(model_module, "PAGE", 16)
+    cfg = tiny_config()
+    _, tensors = build_reference(cfg)
+    head = host_head(tensors)
+    weights = checkpoint.rank_weights(checkpoint.DictSource(tensors), cfg, 0, 1, torch.float32)
+    table = torch.tensor([[5, 2, 7, 1], [3, 8, 4, 6]], dtype=torch.int32)
+    models = {}
+    for pages in (0, 9):
+        model = Qwen38Step(cfg, MAX_SEQ_LEN, dtype=torch.float32, batch_size=2, verify_tokens=4, saved_states=True, pages=pages).eval()
+        model.load_state_dict(weights, strict=False)
+        models[pages] = model
+    paged = {"pages": table}
+    second = [60, 61, 62] * 6
+    outs = {}
+    with torch.no_grad():
+        for pages, model in models.items():
+            extra = paged if pages else {}
+            call = lambda **inputs: model(**inputs, **extra)  # noqa: B023, E731
+            got = [prefill_prompt(call, head, cfg, 1, PROMPT, CHUNK, torch.float32), prefill_prompt(call, head, cfg, 0, second, CHUNK, torch.float32)]
+            positions = [len(second), len(PROMPT)]
+            for i in range(3):
+                active = [True, i != 1]
+                embeds = head.embed_batch([9 + i, 30 + i], torch.float32)
+                got.append(call(inputs_embeds=embeds, **batch_step_inputs(cfg, positions, MAX_SEQ_LEN, torch.float32, active)))
+                positions = [p + a for p, a in zip(positions, active)]
+            embeds = head.embed_batch([4, 5, 6, 7, 8, 9, 10, 11], torch.float32).reshape(2, 4, -1)
+            got.append(call(inputs_embeds=embeds, **verify_inputs(cfg, positions, 4, MAX_SEQ_LEN, torch.float32, [True, True], [0, 0])))
+            embeds = head.embed_batch([12, 13, 14, 15, 16, 17, 18, 19], torch.float32).reshape(2, 4, -1)
+            got.append(call(inputs_embeds=embeds, **verify_inputs(cfg, [p + 2 for p in positions], 4, MAX_SEQ_LEN, torch.float32, [True, True], [2, 2])))
+            outs[pages] = got
+    for a, b in zip(outs[0], outs[9]):
+        assert torch.allclose(a, b, atol=1e-5, rtol=1e-5), (a - b).abs().max()

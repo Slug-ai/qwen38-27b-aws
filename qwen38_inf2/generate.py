@@ -87,6 +87,22 @@ def verify_inputs(
     }
 
 
+def page_table(lengths: Sequence[int], max_seq_len: int, pages: int) -> torch.Tensor:
+    """A paged cache's table (`model.Qwen38Step`) for rows needing `lengths` positions each: their pages in order
+    from page 1, and page 0, which no sequence reads, where a row needs none."""
+    from .model import PAGE
+
+    table = torch.zeros(len(lengths), max_seq_len // PAGE, dtype=torch.int32)
+    free = 1
+    for row, length in enumerate(lengths):
+        need = -(-length // PAGE)
+        if free + need > pages:
+            raise ValueError(f"rows needing {list(lengths)} positions take more than the cache's {pages - 1} pages")
+        table[row, :need] = torch.arange(free, free + need, dtype=torch.int32)
+        free += need
+    return table
+
+
 def state_copy_inputs(cfg: TextConfig, slot: int, save: bool, dtype: torch.dtype) -> dict[str, torch.Tensor]:
     """Inputs that save one row's recurrent states, or restore them (`model.Qwen38Step`)."""
     return {

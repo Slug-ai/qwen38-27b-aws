@@ -183,3 +183,66 @@ def test_the_drafter_drafts_what_a_scan_of_the_history_drafts():
     for end in range(50, 400):
         assert drafter.draft(3) == lookup_draft(history[:end], 3), end
         drafter.extend([history[end]])
+
+
+class PagedDevice(FakeDevice):
+    """A device whose cache is pages shared by the rows: tokens live at physical places, and each row reads its
+    history back through the page table, so a page given to two rows, or reused while a saved prefix still
+    needed it, changes what a row sees."""
+
+    def __init__(self, batch_size: int, max_seq_len: int, page: int):
+        super().__init__(batch_size, max_seq_len)
+        self.page = page
+        self.memory = {}
+
+    def _read(self, pages, slot: int, n: int) -> list[int]:
+        return [self.memory.get((int(pages[slot, p // self.page]), p % self.page)) for p in range(n)]
+
+    def _write(self, pages, slot: int, position: int, token: int) -> None:
+        page = int(pages[slot, position // self.page])
+        assert page, "a row writes outside its pages"
+        self.memory[(page, position % self.page)] = token
+
+    def _check(self, pages) -> None:
+        held = [p for row in pages.tolist() for p in row if p]
+        assert len(held) == len(set(held)), "two rows hold the same page"
+
+    def prefill(self, inputs_embeds, cos, sin, slot, start, n_valid, pages):
+        self._check(pages)
+        row, at = int(slot[0]), int(start[0])
+        if at:
+            assert self._read(pages, row, at) == self.cache[row][:at], "a row's earlier tokens changed under it"
+        hidden = super().prefill(inputs_embeds, cos, sin, slot, start, n_valid)
+        for i in range(int(n_valid[0])):
+            self._write(pages, row, at + i, self.cache[row][at + i])
+        return hidden
+
+    def decode(self, inputs_embeds, cos, sin, position, active, pages):
+        self._check(pages)
+        hidden = super().decode(inputs_embeds, cos, sin, position, active)
+        for slot, (pos, on) in enumerate(zip(position.tolist(), active.tolist())):
+            if on:
+                self._write(pages, slot, pos, self.cache[slot][pos])
+                assert self._read(pages, slot, pos + 1) == self.cache[slot], "a row's history changed under it"
+        return hidden
+
+
+@pytest.mark.parametrize("pages", [19, 12])
+def test_rows_sharing_a_paged_cache_get_the_tokens_they_would_alone(monkeypatch, pages):
+    from qwen38_inf2 import model
+
+    monkeypatch.setattr(model, "PAGE", 8)
+    max_seq_len, max_new = 160, 6
+    sessions = [session_prompts(seed, 5) for seed in range(4)]
+    device = PagedDevice(3, max_seq_len, 8)
+    # 3 rows, with pages for about two sessions' longest turns at once, or fewer, so that idle slots give theirs up.
+    scheduler = Scheduler(
+        device.decode, device.prefill, FakeHead(device), tiny_config(), 3, max_seq_len, CHUNK, [EOS], torch.float32, device.copy_states,
+        pages=pages,
+    )
+    got = {}
+    for session, turn, token in scheduler.run_sessions(sessions, max_new):
+        got.setdefault((session, turn), []).append(token)
+    assert got == {(s, t): alone(p, max_new, max_seq_len) for s, turns in enumerate(sessions) for t, p in enumerate(turns)}
+    assert scheduler.page_waits > 0 and scheduler.reused_tokens > 0 and (scheduler.evictions > 0) == (pages == 12)
+    assert sorted(scheduler.free_pages) == list(range(1, pages)), "every page comes back"

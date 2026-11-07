@@ -23,6 +23,7 @@ def main():
     parser.add_argument("--kv-cache", choices=("bf16", "fp8"), default="bf16", help="fp8 uses the checkpoint's KV-cache scales and half the memory.")
     parser.add_argument("--chunk", type=int, help="Also compile a prefill graph taking this many prompt tokens of one row per call.")
     parser.add_argument("--verify-tokens", type=int, default=0, help="Also compile a verify graph of this many tokens per row, for speculative decoding.")
+    parser.add_argument("--pages", type=int, default=0, help="A KV cache of this many 2048-position pages shared by the rows, instead of max-seq-len positions for each.")
     parser.add_argument("--compiler-args", default="")
     parser.add_argument("--optimize-layout", action="store_true", help="Use NxD's weight layout optimization.")
     parser.add_argument("--output", required=True)
@@ -47,7 +48,7 @@ def main():
 
     path = build(
         cfg, args.max_seq_len, args.output, args.tp_degree, args.target, args.compiler_args, workdir, args.optimize_layout, args.batch_size, args.chunk,
-        args.verify_tokens,
+        args.verify_tokens, args.pages,
     )
     print(f"compiled {cfg.num_hidden_layers} layers for {args.target} in {time.time() - started:.0f}s: {path}")
 

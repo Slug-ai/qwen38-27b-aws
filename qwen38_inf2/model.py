@@ -521,6 +521,10 @@ class GatedDeltaNetStep(nn.Module):
         return self.all_reduce(self._finish(out.transpose(0, 1).to(dtype), z, dtype).reshape(1, tokens, -1))
 
 
+# Positions per page of a paged KV cache, the attention kernels' blocks.
+PAGE = 2048
+
+
 class FullAttentionStep(nn.Module):
     """Gated softmax attention with a KV cache of `max_seq_len` positions per row.
 
@@ -534,10 +538,16 @@ class FullAttentionStep(nn.Module):
     `cfg.kv_cache_format` "fp8" stores the cache as FP8 e4m3 with the checkpoint's static per-layer scales, the
     format it was calibrated for, at half the memory. The compiler accepts FP8 only inside NKI kernels, so the cache
     holds the bytes as uint8: on the chip `kernels.fp8_encode` makes them and the attention kernels read them.
+
+    With `pages`, the cache is that many pages of `PAGE` positions, ``[kv_heads, pages * PAGE, head]``, shared by
+    every row through a table per row (the calls' `pages` input), so rows take only the positions they use and
+    more rows fit. Page 0 takes the writes no sequence reads, each at its own position: a prefill chunk's padding
+    and rows not running. Each row can still hold `max_seq_len` positions.
     """
 
     def __init__(
-        self, cfg: TextConfig, tp_degree: int, max_seq_len: int, dtype: torch.dtype, all_reduce: Callable, batch_size: int = 1
+        self, cfg: TextConfig, tp_degree: int, max_seq_len: int, dtype: torch.dtype, all_reduce: Callable, batch_size: int = 1,
+        pages: int = 0,
     ):
         super().__init__()
         self.cfg = cfg
@@ -559,8 +569,43 @@ class FullAttentionStep(nn.Module):
         if self.fp8_cache:
             self.k_scale = _frozen(1, dtype=dtype)
             self.v_scale = _frozen(1, dtype=dtype)
-        self.register_buffer("k_cache", torch.zeros(batch_size, self.num_kv_heads, max_seq_len, head, dtype=cache_dtype))
-        self.register_buffer("v_cache", torch.zeros(batch_size, self.num_kv_heads, max_seq_len, head, dtype=cache_dtype))
+        self.pages = pages
+        if pages and max_seq_len % PAGE:
+            raise ValueError(f"max_seq_len {max_seq_len} must be a multiple of the page's {PAGE} positions")
+        shape = (self.num_kv_heads, pages * PAGE, head) if pages else (batch_size, self.num_kv_heads, max_seq_len, head)
+        self.register_buffer("k_cache", torch.zeros(*shape, dtype=cache_dtype))
+        self.register_buffer("v_cache", torch.zeros(*shape, dtype=cache_dtype))
+
+    def _tables(self, pages, device, slot=None):
+        """For the attention kernels: the cache block holding each row's `PAGE` positions for KV head 0, ``[rows,
+        max_seq_len / PAGE]`` or the one row `slot`, and how many blocks on KV head h's are."""
+        blocks = self.max_seq_len // PAGE
+        if self.pages:
+            table, stride = pages.int(), self.pages
+        else:
+            # Each row's positions in order, KV head by KV head: a constant made on the CPU.
+            rows = torch.arange(self.k_cache.shape[0], dtype=torch.int32).unsqueeze(-1) * (self.num_kv_heads * blocks)
+            table, stride = (rows + torch.arange(blocks, dtype=torch.int32)).to(device), blocks
+        return (table if slot is None else table.index_select(0, slot.long())), stride
+
+    def _cached(self, cache, pages, rows=None):
+        """Every row's cache, or those in `rows`, as ``[rows, kv_heads, max_seq_len, head]``."""
+        if not self.pages:
+            return cache if rows is None else cache.index_select(0, rows.long())
+        table = pages if rows is None else pages.index_select(0, rows.long())
+        index = (table.long().unsqueeze(-1) * PAGE + torch.arange(PAGE, device=cache.device)).reshape(-1)
+        gathered = cache.index_select(1, index).reshape(self.num_kv_heads, table.shape[0], self.max_seq_len, -1)
+        return gathered.transpose(0, 1)
+
+    def _write_pages(self, key, value, positions, valid, pages):
+        """Into a paged cache, `_store`d keys and values ``[rows, kv_heads, n, head]`` at each row's ``positions``
+        ``[rows, n]`` where `valid`, and elsewhere each at its own position of page 0."""
+        rows, kv_heads, n, head = key.shape
+        at = pages.long().gather(1, positions // PAGE) * PAGE + positions % PAGE
+        at = torch.where(valid, at, torch.arange(rows * n, device=key.device).reshape(rows, n))
+        at = at.reshape(1, rows * n, 1).expand(kv_heads, -1, head)
+        self.k_cache = self.k_cache.scatter(1, at, key.transpose(0, 1).reshape(kv_heads, rows * n, head))
+        self.v_cache = self.v_cache.scatter(1, at, value.transpose(0, 1).reshape(kv_heads, rows * n, head))
 
     def _project(self, x, cos, sin):
         """Query ``[rows, heads, tokens, head]``, key and value ``[rows, kv_heads, tokens, head]``, and the output gate."""
@@ -607,7 +652,7 @@ class FullAttentionStep(nn.Module):
         self.k_cache = self.k_cache.scatter(2, at, key)
         self.v_cache = self.v_cache.scatter(2, at, value)
 
-    def forward(self, x, cos, sin, position, active) -> torch.Tensor:
+    def forward(self, x, cos, sin, position, active, pages=None) -> torch.Tensor:
         """One token per row at `position`. A row with `active` 0 leaves its cache unchanged."""
         cfg = self.cfg
         head = cfg.head_dim
@@ -619,13 +664,17 @@ class FullAttentionStep(nn.Module):
         groups = cfg.num_key_value_groups
         grouped = query.reshape(batch, self.num_kv_heads, groups, head)
         where = torch.where(active > 0.5, position.long(), self.max_seq_len - 1).unsqueeze(-1)
+        if self.pages:
+            write = lambda k, v: self._write_pages(k, v, position.long().unsqueeze(-1), (active > 0.5).unsqueeze(-1), pages)  # noqa: E731
+        else:
+            write = lambda k, v: self._write_both(k, v, where)  # noqa: E731
         if self.fp8_cache and device.type != "cpu":
-            out, k_coded, v_coded = self._decode_fp8(grouped, key, value, position, scales)
-            self._write_both(k_coded, v_coded, where)
+            out, k_coded, v_coded = self._decode_fp8(grouped, key, value, position, scales, pages)
+            write(k_coded, v_coded)
             return self.all_reduce(self.o_proj(out * torch.sigmoid(gate)))
 
-        keys = self._load(self.k_cache, scales[0], x.dtype)
-        values = self._load(self.v_cache, scales[1], x.dtype)
+        keys = self._load(self._cached(self.k_cache, pages), scales[0], x.dtype)
+        values = self._load(self._cached(self.v_cache, pages), scales[1], x.dtype)
         earlier = torch.arange(self.max_seq_len, device=device) < position.unsqueeze(-1)
         cached = torch.matmul(grouped, keys.transpose(2, 3)).float() + torch.where(earlier, 0.0, MASKED_SCORE).reshape(batch, 1, 1, -1)
         own_key = self._round_trip(key, scales[0], x.dtype)
@@ -635,10 +684,10 @@ class FullAttentionStep(nn.Module):
         out = torch.matmul(weights[..., :-1], values) + weights[..., -1:] * own_value
         out = out.reshape(batch, 1, self.num_heads * head)
 
-        self._write_both(self._store(key, scales[0]), self._store(value, scales[1]), where)
+        write(self._store(key, scales[0]), self._store(value, scales[1]))
         return self.all_reduce(self.o_proj(out * torch.sigmoid(gate)))
 
-    def verify(self, x, cos, sin, position, active) -> torch.Tensor:
+    def verify(self, x, cos, sin, position, active, pages=None) -> torch.Tensor:
         """K tokens per row from `position`, ``x`` ``[batch, K, hidden]``, for speculative decoding: each against
         the row's cache before `position` and the step's own tokens up to itself. Their keys and values are written
         from `position` on; the next step overwrites those of tokens not accepted."""
@@ -652,13 +701,18 @@ class FullAttentionStep(nn.Module):
         # Rows not running write junk at the cache's last positions, as in decode.
         steps = torch.arange(tokens, device=device)
         where = torch.where(active.unsqueeze(-1) > 0.5, position.long().unsqueeze(-1) + steps, self.max_seq_len - tokens + steps)
+        if self.pages:
+            valid = (active.unsqueeze(-1) > 0.5).expand(-1, tokens)
+            write = lambda k, v: self._write_pages(k, v, position.long().unsqueeze(-1) + steps, valid, pages)  # noqa: E731
+        else:
+            write = lambda k, v: self._write_both(k, v, where)  # noqa: E731
         if self.fp8_cache and device.type != "cpu":
-            out, k_coded, v_coded = self._verify_fp8(query, key, value, position, scales)
-            self._write_both(k_coded, v_coded, where)
+            out, k_coded, v_coded = self._verify_fp8(query, key, value, position, scales, pages)
+            write(k_coded, v_coded)
             return self.all_reduce(self.o_proj(out * torch.sigmoid(gate)))
         grouped = query.reshape(batch, self.num_kv_heads, groups, tokens, head)
-        keys = self._load(self.k_cache, scales[0], x.dtype).unsqueeze(2)
-        values = self._load(self.v_cache, scales[1], x.dtype).unsqueeze(2)
+        keys = self._load(self._cached(self.k_cache, pages), scales[0], x.dtype).unsqueeze(2)
+        values = self._load(self._cached(self.v_cache, pages), scales[1], x.dtype).unsqueeze(2)
         earlier = torch.arange(self.max_seq_len, device=device) < position.unsqueeze(-1)
         cached = torch.matmul(grouped, keys.transpose(-1, -2)).float() + torch.where(earlier, 0.0, MASKED_SCORE).reshape(batch, 1, 1, 1, -1)
         own_key = self._round_trip(key, scales[0], x.dtype).unsqueeze(2)
@@ -668,10 +722,10 @@ class FullAttentionStep(nn.Module):
         weights = torch.softmax(torch.cat((cached, own), dim=-1) * head**-0.5, dim=-1).to(x.dtype)
         out = torch.matmul(weights[..., : self.max_seq_len], values) + torch.matmul(weights[..., self.max_seq_len :], own_value)
         out = out.permute(0, 3, 1, 2, 4).reshape(batch, tokens, self.num_heads * head)
-        self._write_both(self._store(key, scales[0]), self._store(value, scales[1]), where)
+        write(self._store(key, scales[0]), self._store(value, scales[1]))
         return self.all_reduce(self.o_proj(out * torch.sigmoid(gate)))
 
-    def _verify_fp8(self, query, key, value, position, scales):
+    def _verify_fp8(self, query, key, value, position, scales, pages):
         """Verify attention on the chip over the FP8 cache, through `kernels.verify_attention`. A row's K tokens are
         query heads of its pairs, and calls take as many rows as fit 128 query rows. Returns the output
         ``[batch, K, heads * head]`` and the tokens' keys and values as cache bytes."""
@@ -689,6 +743,7 @@ class FullAttentionStep(nn.Module):
         limit = position.float().reshape(batch, 1).expand(-1, kv_heads * per_pair)
         blocks = torch.div(position.max().int() + DECODE_STEP - 1, DECODE_STEP, rounding_mode="floor").reshape(1, 1)
         rows_per_call = max(1, 128 // (kv_heads * per_pair))
+        table, stride = self._tables(pages, device)
         outs = []
         for first in range(0, batch, rows_per_call):
             rows = min(rows_per_call, batch - first)
@@ -702,13 +757,14 @@ class FullAttentionStep(nn.Module):
                 verify_attention(
                     q[first : first + rows].reshape(-1, head), self.k_cache.reshape(-1, head), self.v_cache.reshape(-1, head),
                     k_held[first : first + rows].reshape(-1, head), v_held[first : first + rows].reshape(-1, head), own_mask,
-                    limit[first : first + rows].reshape(-1, 1), blocks, groups=per_pair, positions=self.max_seq_len, pair_offset=first * kv_heads,
+                    limit[first : first + rows].reshape(-1, 1), blocks, table, groups=per_pair, kv_heads=kv_heads, head_stride=stride,
+                    pair_offset=first * kv_heads,
                 )
             )
         out = (torch.cat(outs).float() * v_scale.float()).to(query.dtype).reshape(batch, kv_heads, groups, tokens, head)
         return out.permute(0, 3, 1, 2, 4).reshape(batch, tokens, heads * head), k_coded, v_coded
 
-    def _decode_fp8(self, grouped, key, value, position, scales):
+    def _decode_fp8(self, grouped, key, value, position, scales, pages):
         """Decode attention on the chip over the FP8 cache, in the kernel since XLA can't read FP8. Returns the output
         ``[batch, 1, heads * head]`` and the step's key and value as cache bytes."""
         from .kernels import DECODE_STEP, decode_attention
@@ -722,16 +778,18 @@ class FullAttentionStep(nn.Module):
         per_query = lambda t: t.reshape(batch * kv_heads, 1, head).expand(-1, groups, -1).reshape(-1, head)  # noqa: E731
         limit = position.float().reshape(batch, 1).expand(-1, kv_heads * groups).reshape(-1, 1)
         blocks = torch.div(position.max().int() + DECODE_STEP - 1, DECODE_STEP, rounding_mode="floor").reshape(1, 1)
+        table, stride = self._tables(pages, q.device)
         out = decode_attention(
-            q, self.k_cache.reshape(-1, head), self.v_cache.reshape(-1, head), per_query(k_held), per_query(v_held), limit, blocks,
-            groups=groups, positions=self.max_seq_len,
+            q, self.k_cache.reshape(-1, head), self.v_cache.reshape(-1, head), per_query(k_held), per_query(v_held), limit, blocks, table,
+            groups=groups, kv_heads=kv_heads, head_stride=stride,
         )
         out = (out.float() * v_scale.float()).to(grouped.dtype).reshape(batch, 1, kv_heads * groups * head)
         return out, k_coded, v_coded
 
-    def prefill(self, x, cos, sin, slot, start, n_valid) -> torch.Tensor:
+    def prefill(self, x, cos, sin, slot, start, n_valid, pages=None) -> torch.Tensor:
         """A chunk of one row's tokens from position `start`. Padding past `n_valid` is written but never read
-        before decode overwrites it, because each step reads only positions up to its own."""
+        before decode overwrites it, because each step reads only positions up to its own; with a paged cache it is
+        written to page 0 instead."""
         cfg = self.cfg
         head = cfg.head_dim
         tokens = x.shape[1]
@@ -753,8 +811,8 @@ class FullAttentionStep(nn.Module):
             own_keys = self._round_trip(key[0], scales[0], x.dtype)
             own_values = self._round_trip(value[0], scales[1], x.dtype)
         if device.type == "cpu":
-            cache_keys = self._load(self.k_cache.index_select(0, slot.long())[0], scales[0], x.dtype)
-            cache_values = self._load(self.v_cache.index_select(0, slot.long())[0], scales[1], x.dtype)
+            cache_keys = self._load(self._cached(self.k_cache, pages, slot)[0], scales[0], x.dtype)
+            cache_values = self._load(self._cached(self.v_cache, pages, slot)[0], scales[1], x.dtype)
             # The same visibility as the kernel: cached positions before `start`, then the chunk causally.
             index = torch.arange(groups * tokens) % tokens
             visible = torch.cat(
@@ -771,17 +829,22 @@ class FullAttentionStep(nn.Module):
             from .kernels import KEY_BLOCK, prefill_attention
 
             starts = start.float().reshape(1, 1).expand(128, 1)
-            first_block = (slot.int() * (self.num_kv_heads * self.max_seq_len // KEY_BLOCK)).reshape(1, 1)
+            table, stride = self._tables(pages, device, slot)
             # Only the cache blocks before `start` hold this row's keys, and the kernel visits only those.
             blocks = torch.div(start.int() + KEY_BLOCK - 1, KEY_BLOCK, rounding_mode="floor").reshape(1, 1)
             out = prefill_attention(
                 grouped.transpose(1, 2), self.k_cache.reshape(-1, head), self.v_cache.reshape(-1, head),
-                own_keys.transpose(1, 2), own_values, starts, first_block, blocks, positions=self.max_seq_len,
+                own_keys.transpose(1, 2), own_values, starts, table, blocks, head_stride=stride,
             )
             if self.fp8_cache:
                 out = out.float() * scales[1].float()
         out = out.to(x.dtype).reshape(self.num_heads, tokens, head).transpose(0, 1).reshape(1, tokens, self.num_heads * head)
 
+        if self.pages:
+            positions = (start.long() + torch.arange(tokens, device=device)).unsqueeze(0)
+            valid = (torch.arange(tokens, device=device) < n_valid).unsqueeze(0)
+            self._write_pages(k_coded, v_coded, positions, valid, pages.index_select(0, slot.long()))
+            return self.all_reduce(self.o_proj(out * torch.sigmoid(gate)))
         # Every row gets a chunk of positions: `slot` its own, the others the junk positions at the end.
         rows = self.k_cache.shape[0]
         positions = start.long() + torch.arange(tokens, device=device)
@@ -833,31 +896,31 @@ class HeadStep(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, cfg, layer_type, tp_degree, max_seq_len, dtype, all_reduce, batch_size=1, verify_tokens=0, saved_states=False):
+    def __init__(self, cfg, layer_type, tp_degree, max_seq_len, dtype, all_reduce, batch_size=1, verify_tokens=0, saved_states=False, pages=0):
         super().__init__()
         self.cfg = cfg
         self.layer_type = layer_type
         if layer_type == LINEAR:
             self.linear_attn = GatedDeltaNetStep(cfg, tp_degree, dtype, all_reduce, batch_size, verify_tokens, saved_states)
         elif layer_type == FULL:
-            self.self_attn = FullAttentionStep(cfg, tp_degree, max_seq_len, dtype, all_reduce, batch_size)
+            self.self_attn = FullAttentionStep(cfg, tp_degree, max_seq_len, dtype, all_reduce, batch_size, pages)
         else:
             raise ValueError(f"Unknown layer type {layer_type}")
         self.mlp = MLP(cfg, tp_degree, all_reduce)
         self.input_layernorm_weight = _frozen(cfg.hidden_size, dtype=dtype)
         self.post_attention_layernorm_weight = _frozen(cfg.hidden_size, dtype=dtype)
 
-    def forward(self, x, cos, sin, position=None, active=None, slot=None, start=None, n_valid=None, accepted=None):
+    def forward(self, x, cos, sin, position=None, active=None, slot=None, start=None, n_valid=None, accepted=None, pages=None):
         eps = self.cfg.rms_norm_eps
         h = rms_norm(x, self.input_layernorm_weight, eps)
         if accepted is not None:
-            mixer = self.linear_attn.verify(h, position, active, accepted) if self.layer_type == LINEAR else self.self_attn.verify(h, cos, sin, position, active)
+            mixer = self.linear_attn.verify(h, position, active, accepted) if self.layer_type == LINEAR else self.self_attn.verify(h, cos, sin, position, active, pages)
         elif slot is not None:
-            mixer = self.linear_attn.prefill(h, slot, start, n_valid) if self.layer_type == LINEAR else self.self_attn.prefill(h, cos, sin, slot, start, n_valid)
+            mixer = self.linear_attn.prefill(h, slot, start, n_valid) if self.layer_type == LINEAR else self.self_attn.prefill(h, cos, sin, slot, start, n_valid, pages)
         elif self.layer_type == LINEAR:
             mixer = self.linear_attn(h, position, active)
         else:
-            mixer = self.self_attn(h, cos, sin, position, active)
+            mixer = self.self_attn(h, cos, sin, position, active, pages)
         x = x + mixer
         return x + self.mlp(rms_norm(x, self.post_attention_layernorm_weight, eps))
 
@@ -891,6 +954,10 @@ class Qwen38Step(nn.Module):
     extends one already prefilled can start where that one ended:
         inputs_embeds: ``[1, 1, hidden]``, returned as it is, so blocks chain as for the other calls.
         save_slot or restore_slot: int32 ``[1]``, the row.
+
+    With `pages`, the KV cache is a pool of that many pages (`FullAttentionStep`), and decode, prefill and verify
+    also take pages: int32 ``[batch, max_seq_len / PAGE]``, each row's page for each `PAGE` of its positions, 0
+    where it has none.
     """
 
     def __init__(
@@ -903,18 +970,20 @@ class Qwen38Step(nn.Module):
         batch_size: int = 1,
         verify_tokens: int = 0,
         saved_states: bool = False,
+        pages: int = 0,
     ):
         super().__init__()
         cfg.validate_tp(tp_degree)
         self.cfg = cfg
         self.layers = nn.ModuleList(
-            DecoderLayer(cfg, layer_type, tp_degree, max_seq_len, dtype, all_reduce, batch_size, verify_tokens, saved_states)
+            DecoderLayer(cfg, layer_type, tp_degree, max_seq_len, dtype, all_reduce, batch_size, verify_tokens, saved_states, pages)
             for layer_type in cfg.layer_types
         )
 
     def forward(
         self, inputs_embeds, cos=None, sin=None, position=None, active=None, slot=None, start=None, n_valid=None, save_slot=None, restore_slot=None,
         accepted=None,
+        pages=None,
     ):
         if save_slot is not None or restore_slot is not None:
             for layer in self.layers:
@@ -923,5 +992,5 @@ class Qwen38Step(nn.Module):
             return inputs_embeds
         x = inputs_embeds
         for layer in self.layers:
-            x = layer(x, cos, sin, position, active, slot, start, n_valid, accepted)
+            x = layer(x, cos, sin, position, active, slot, start, n_valid, accepted, pages)
         return x

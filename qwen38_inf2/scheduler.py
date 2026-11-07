@@ -12,6 +12,11 @@ Sessions, as a coding agent sends them, are turns whose prompts each extend the 
 in the slot its last turn used, and when a slot's saved states match the start of a new prompt, its prefill starts
 from there: the KV cache still holds those positions, and the recurrent states were saved at the end of the prompt
 they belong to.
+
+With a paged KV cache, the rows share its pages, so more rows fit than if each had `max_seq_len` positions. A turn
+starts only once its slot holds pages for its prompt, its new tokens and a verify step's, taken from the free ones;
+a session keeps its pages between turns, and its last turn gives them back. When nothing is running and no turn
+fits, idle slots give up their saved prefixes and pages, largest first, and their next turns start from scratch.
 """
 
 import time
@@ -48,6 +53,7 @@ class Scheduler:
         chunk: C, the prefill graph's tokens per call.
         copy_states: the graph that saves or restores one slot's recurrent states, called with
             `generate.state_copy_inputs`. Without one, or with `reuse_prefixes` False, every prompt is prefilled whole.
+        pages: the KV cache's pages if it is paged (`model.Qwen38Step`), else 0.
         verify, verify_tokens: with these, every decode step is a verify step of `verify_tokens` tokens per row
             (`generate.verify_inputs`): each row's last token and the next ones drafted from its own history by
             `drafting.lookup_draft`. The drafted tokens the model would have chosen itself are kept, with the
@@ -70,6 +76,7 @@ class Scheduler:
         reuse_prefixes: bool = True,
         verify: Callable[..., torch.Tensor] | None = None,
         verify_tokens: int = 1,
+        pages: int = 0,
     ):
         self.decode = decode
         self.prefill = prefill
@@ -97,6 +104,45 @@ class Scheduler:
         self.prefill_seconds = 0.0
         self.decode_seconds = 0.0
         self.decode_rows = 0
+        self.pages = pages
+        if pages:
+            from .model import PAGE
+
+            self.page = PAGE
+            self.page_table = torch.zeros(batch_size, max_seq_len // PAGE, dtype=torch.int32)
+            # Page 0 takes the writes no sequence reads.
+            self.free_pages = list(range(pages - 1, 0, -1))
+            self.held: list[list[int]] = [[] for _ in range(batch_size)]
+        # Turns that waited for pages, and saved prefixes given up for them.
+        self.page_waits = 0
+        self.evictions = 0
+
+    def _page_inputs(self) -> dict[str, torch.Tensor]:
+        return {"pages": self.page_table.clone()} if self.pages else {}
+
+    def _pages_needed(self, prompt_len: int, max_new_tokens: int) -> int:
+        return -(-min(self.max_seq_len, prompt_len + max_new_tokens + self.step_tokens) // self.page)
+
+    def _reserve(self, slot: int, row: _Row, max_new_tokens: int) -> bool:
+        """Give `slot` the pages `row` will write, if there are enough free. Without paging there always are."""
+        if not self.pages:
+            return True
+        held, need = self.held[slot], self._pages_needed(row.prompt_len, max_new_tokens)
+        if need - len(held) > len(self.free_pages):
+            return False
+        while len(held) < need:
+            held.append(self.free_pages.pop())
+        self.page_table[slot] = 0
+        self.page_table[slot, : len(held)] = torch.tensor(held, dtype=torch.int32)
+        return True
+
+    def _release(self, slot: int) -> None:
+        """Give back `slot`'s pages, and with them the prefix its saved states stand for."""
+        if self.pages:
+            self.free_pages += self.held[slot][::-1]
+            self.held[slot] = []
+            self.page_table[slot] = 0
+            self.saved[slot] = []
 
     def _prefill(self, slot: int, row: _Row) -> int:
         """Write the prompt to `slot` in chunks, from the slot's saved states when they match its start, and return
@@ -112,7 +158,7 @@ class Scheduler:
             ids = row.ids[start : start + self.chunk]
             n_valid = len(ids)
             embeds = self.head.embed_batch(ids + [0] * (self.chunk - n_valid), self.dtype).reshape(1, self.chunk, -1)
-            hidden = self.prefill(inputs_embeds=embeds, **prefill_inputs(self.cfg, slot, start, n_valid, self.chunk, self.dtype))
+            hidden = self.prefill(inputs_embeds=embeds, **prefill_inputs(self.cfg, slot, start, n_valid, self.chunk, self.dtype), **self._page_inputs())
             self.prefill_calls += 1
             self.prefilled_tokens += n_valid
         # The states at the prompt's end are saved, for a later prompt that extends this one. Padding past a
@@ -144,6 +190,8 @@ class Scheduler:
                     raise ValueError("a prompt is empty")
                 if len(prompt) >= self.max_seq_len - self.chunk:
                     raise ValueError(f"a prompt of {len(prompt)} tokens leaves no room in max_seq_len {self.max_seq_len}")
+                if self.pages and self._pages_needed(len(prompt), max_new_tokens) > self.pages - 1:
+                    raise ValueError(f"a prompt of {len(prompt)} tokens needs more than the cache's {self.pages - 1} pages")
         waiting = list(range(len(sessions)))[::-1]
         slots: list[_Row | None] = [None] * self.batch_size
         # Per slot, the next turn of the session that last ran there.
@@ -153,17 +201,23 @@ class Scheduler:
             session, turn = row.index
             if turn + 1 < len(sessions[session]):
                 follow[slot] = (session, turn + 1)
+            else:
+                self._release(slot)
 
         while waiting or any(slots) or any(follow):
             # Prefill first: every free slot gets a request before the next decode step, its own session's next
             # turn before a new session.
             for slot in range(self.batch_size):
                 while slots[slot] is None and (follow[slot] or waiting):
-                    if follow[slot]:
-                        (session, turn), follow[slot] = follow[slot], None
-                    else:
-                        session, turn = waiting.pop(), 0
+                    session, turn = follow[slot] or (waiting[-1], 0)
                     row = _Row((session, turn), list(sessions[session][turn]), len(sessions[session][turn]))
+                    if not self._reserve(slot, row, max_new_tokens):
+                        self.page_waits += 1
+                        break
+                    if follow[slot]:
+                        follow[slot] = None
+                    else:
+                        waiting.pop()
                     token_id = self._prefill(slot, row)
                     row.new = 1
                     row.ids.append(token_id)
@@ -174,6 +228,11 @@ class Scheduler:
                         slots[slot] = row
 
             if not any(slots):
+                if self.pages and (waiting or any(follow)):
+                    # Nothing runs to give pages back, so an idle slot gives up its saved prefix.
+                    idle = [s for s in range(self.batch_size) if self.held[s] and slots[s] is None]
+                    self._release(max(idle, key=lambda s: len(self.held[s])))
+                    self.evictions += 1
                 continue
             positions = [row.written if row else 0 for row in slots]
             active = [row is not None for row in slots]
@@ -183,7 +242,9 @@ class Scheduler:
                 emitted = self._verify_step(slots, positions, active, ready)
             else:
                 last = [row.ids[-1] if row else 0 for row in slots]
-                hidden = self.decode(inputs_embeds=self.head.embed_batch(last, self.dtype), **batch_step_inputs(self.cfg, positions, self.max_seq_len, self.dtype, active))
+                hidden = self.decode(
+                    inputs_embeds=self.head.embed_batch(last, self.dtype), **batch_step_inputs(self.cfg, positions, self.max_seq_len, self.dtype, active), **self._page_inputs()
+                )
                 emitted = [[token] for token in self.head.next_tokens(hidden[ready])]
             self.decode_calls += 1
             self.decode_seconds += time.perf_counter() - started
@@ -218,7 +279,7 @@ class Scheduler:
                 tokens += [0] * k
         accepted = [self.accepted[slot] if slots[slot] else 0 for slot in range(self.batch_size)]
         embeds = self.head.embed_batch(tokens, self.dtype).reshape(self.batch_size, k, -1)
-        hidden = self.verify(inputs_embeds=embeds, **verify_inputs(self.cfg, positions, k, self.max_seq_len, self.dtype, active, accepted))
+        hidden = self.verify(inputs_embeds=embeds, **verify_inputs(self.cfg, positions, k, self.max_seq_len, self.dtype, active, accepted), **self._page_inputs())
         chosen = self.head.next_tokens(hidden[ready].reshape(len(ready) * k, 1, -1))
         out = []
         for i, slot in enumerate(ready):

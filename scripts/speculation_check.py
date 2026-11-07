@@ -18,7 +18,7 @@ from pathlib import Path
 
 import torch
 
-from qwen38_inf2.generate import batch_step_inputs, prefill_prompt, verify_inputs
+from qwen38_inf2.generate import batch_step_inputs, page_table, prefill_prompt, verify_inputs
 from qwen38_inf2.runner import load
 
 
@@ -52,17 +52,20 @@ def main():
     cfg, rows, k, dtype = loaded.cfg, loaded.batch_size, loaded.verify_tokens, torch.bfloat16
     prompt, n = args.prompt_tokens, args.tokens - args.tokens % k
     seqs = texts(loaded.tokenizer, rows, prompt + n + 1)
+    # A paged cache's rows each take the pages they write.
+    paged = {"pages": page_table([prompt + n + k] * rows, loaded.max_seq_len, loaded.pages)} if loaded.pages else {}
+    prefill = lambda **inputs: loaded.prefill(**inputs, **paged)  # noqa: E731
 
     def prefill_all():
         for slot, ids in enumerate(seqs):
-            prefill_prompt(loaded.prefill, loaded.head, cfg, slot, ids[:prompt], loaded.chunk, dtype)
+            prefill_prompt(prefill, loaded.head, cfg, slot, ids[:prompt], loaded.chunk, dtype)
 
     with torch.no_grad():
         prefill_all()
         decode = []
         for i in range(n):
             embeds = loaded.head.embed_batch([ids[prompt + i] for ids in seqs], dtype)
-            hidden = loaded.step(inputs_embeds=embeds, **batch_step_inputs(cfg, [prompt + i] * rows, loaded.max_seq_len, dtype))
+            hidden = loaded.step(inputs_embeds=embeds, **batch_step_inputs(cfg, [prompt + i] * rows, loaded.max_seq_len, dtype), **paged)
             decode.append(loaded.head.next_tokens(hidden))
         prefill_all()
         verify = [[] for _ in range(n)]
@@ -70,7 +73,7 @@ def main():
             start = prompt + step * k
             embeds = loaded.head.embed_batch([t for ids in seqs for t in ids[start : start + k]], dtype).reshape(rows, k, -1)
             inputs = verify_inputs(cfg, [start] * rows, k, loaded.max_seq_len, dtype, [True] * rows, [0 if step == 0 else k] * rows)
-            picks = loaded.head.next_tokens(loaded.verify(inputs_embeds=embeds, **inputs).reshape(rows * k, 1, -1))
+            picks = loaded.head.next_tokens(loaded.verify(inputs_embeds=embeds, **inputs, **paged).reshape(rows * k, 1, -1))
             for r in range(rows):
                 for t in range(k):
                     verify[step * k + t].append(picks[r * k + t])

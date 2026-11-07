@@ -32,6 +32,8 @@ class Loaded:
     # The verify graph for speculative decoding and its tokens per row, with a head for that many rows each.
     verify: Callable[..., torch.Tensor] | None = None
     verify_tokens: int = 0
+    # With a paged KV cache, its pages, which every decode, prefill and verify call's page table points into.
+    pages: int = 0
 
 
 def load(model_dir, compiled, weights, head_dir=None, simulate: bool = False, log: Callable[[str], None] = _log) -> Loaded:
@@ -75,7 +77,7 @@ def load(model_dir, compiled, weights, head_dir=None, simulate: bool = False, lo
         raise ValueError(f"a verify graph of {verify_tokens} tokens for {batch_size} rows needs a head for {batch_size * verify_tokens} rows")
     return Loaded(
         cfg, tokenizer, head, step, batch_size, info["max_seq_len"], load_seconds, step if chunk else None, chunk,
-        step if verify_tokens else None, verify_tokens,
+        step if verify_tokens else None, verify_tokens, info.get("pages", 0),
     )
 
 

@@ -26,6 +26,13 @@ def example_inputs(cfg: TextConfig, max_seq_len: int, batch_size: int = 1) -> di
     }
 
 
+def page_example_inputs(max_seq_len: int, batch_size: int) -> dict[str, torch.Tensor]:
+    """The page table every decode, prefill and verify call of a paged build takes (`model.Qwen38Step`)."""
+    from .model import PAGE
+
+    return {"pages": torch.zeros(batch_size, max_seq_len // PAGE, dtype=torch.int32)}
+
+
 def verify_example_inputs(cfg: TextConfig, max_seq_len: int, batch_size: int, tokens: int) -> dict[str, torch.Tensor]:
     return {
         "inputs_embeds": torch.zeros(batch_size, tokens, cfg.hidden_size, dtype=DTYPE),
@@ -95,18 +102,21 @@ def build(
     batch_size: int = 1,
     chunk: int | None = None,
     verify_tokens: int = 0,
+    pages: int = 0,
 ) -> Path:
     """Compile the one-token-per-row graph for the layers in `cfg`, plus a prefill graph of `chunk` tokens if given,
-    and a verify graph of `verify_tokens` tokens per row for speculative decoding if given."""
+    a verify graph of `verify_tokens` tokens per row for speculative decoding if given, and with `pages` a KV cache
+    of that many pages shared by the rows instead of `max_seq_len` positions for each."""
+    table = page_example_inputs(max_seq_len, batch_size) if pages else {}
     # NxD allocates the state buffers the first graph uses, so the graph using the most of them goes first.
-    traces = {"verify": verify_example_inputs(cfg, max_seq_len, batch_size, verify_tokens)} if verify_tokens else {}
-    traces["decode"] = example_inputs(cfg, max_seq_len, batch_size)
+    traces = {"verify": verify_example_inputs(cfg, max_seq_len, batch_size, verify_tokens) | table} if verify_tokens else {}
+    traces["decode"] = example_inputs(cfg, max_seq_len, batch_size) | table
     if chunk:
         from .kernels import KEY_BLOCK
 
         if max_seq_len % chunk or max_seq_len % KEY_BLOCK:
             raise ValueError(f"max_seq_len {max_seq_len} must be a multiple of the chunk {chunk} and of {KEY_BLOCK}")
-        traces["prefill"] = prefill_example_inputs(cfg, chunk)
+        traces["prefill"] = prefill_example_inputs(cfg, chunk) | table
         # Saving and restoring a row's recurrent states, so a prompt extending an earlier one skips what they share.
         traces["save"] = state_copy_inputs(cfg, 0, True, DTYPE)
         traces["restore"] = state_copy_inputs(cfg, 0, False, DTYPE)
@@ -120,6 +130,7 @@ def build(
             batch_size=batch_size,
             verify_tokens=verify_tokens,
             saved_states=bool(chunk),
+            pages=pages,
         ),
         traces,
         output_dir,
@@ -132,6 +143,7 @@ def build(
             "kv_cache_format": cfg.kv_cache_format,
             **({"chunk": chunk} if chunk else {}),
             **({"verify_tokens": verify_tokens} if verify_tokens else {}),
+            **({"pages": pages} if pages else {}),
         },
         tp_degree,
         target,

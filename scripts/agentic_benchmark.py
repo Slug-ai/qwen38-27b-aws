@@ -32,7 +32,7 @@ def run(loaded, prompts, max_new_tokens: int, use_prefill: bool = True, eos=EOS_
         return outputs, seconds, {"prompt_path": "decode"}
     scheduler = Scheduler(
         loaded.step, loaded.prefill, loaded.head, loaded.cfg, loaded.batch_size, loaded.max_seq_len, loaded.chunk, eos,
-        verify=loaded.verify if speculate else None, verify_tokens=loaded.verify_tokens,
+        verify=loaded.verify if speculate else None, verify_tokens=loaded.verify_tokens, pages=getattr(loaded, "pages", 0),
     )
     outputs = [[] for _ in prompts]
     started = time.perf_counter()
@@ -43,6 +43,7 @@ def run(loaded, prompts, max_new_tokens: int, use_prefill: bool = True, eos=EOS_
         "prompt_path": "prefill",
         "prefill_calls": scheduler.prefill_calls,
         "decode_calls": scheduler.decode_calls,
+        "page_waits": scheduler.page_waits,
         "prefill_seconds": scheduler.prefill_seconds,
         "decode_seconds": scheduler.decode_seconds,
         "mean_rows_per_decode_step": scheduler.decode_rows / max(scheduler.decode_calls, 1),
