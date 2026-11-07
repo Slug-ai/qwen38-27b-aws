@@ -631,10 +631,11 @@ def _delta_head(h, c):
 
     A generator that yields between dependent steps, so `_interleave` can emit several heads' steps in turn: the
     engines take instructions in order, and one head alone kept each engine waiting on the others at every step.
-    `c` holds the kernel's inputs, constants and conv outputs.
+    `c` holds the kernel's inputs, constants and conv outputs. A piece's key transposes and its keys' products with
+    keys and queries depend only on the key head, so the first of its value heads to need them makes them for all.
     """
     (state, decay, beta, z, gated, final, q_t, k_t, v_p, mask, eye, ones, epsilon_column, weight_row, i_p, i_f,
-     repeat, pieces, k_head, v_head) = c
+     repeat, pieces, k_head, v_head, shared) = c
     mm = DELTA_MATMUL_DTYPE
     kh = h // repeat
     s = nisa.tensor_copy(nl.load(state[h]), dtype=mm)
@@ -642,15 +643,22 @@ def _delta_head(h, c):
         cols = slice(t * PIECE, (t + 1) * PIECE)
         q_tp = q_t[kh][:, cols]
         k_tp = k_t[kh][:, cols]
-        k_p = nl.ndarray((nl.par_dim(PIECE), k_head), dtype=nl.float32, buffer=nl.sbuf)
-        k_p[...] = nisa.nc_transpose(k_tp)
+        if (kh, t) not in shared:
+            k_p = nl.ndarray((nl.par_dim(PIECE), k_head), dtype=nl.float32, buffer=nl.sbuf)
+            k_p[...] = nisa.nc_transpose(k_tp)
+            shared[(kh, t)] = (k_p, _to_sbuf(_matmul(k_tp, k_tp, PIECE, PIECE), PIECE, PIECE), _to_sbuf(_matmul(k_tp, q_tp, PIECE, PIECE), PIECE, PIECE))
+        k_p, kk, qk = shared[(kh, t)]
         v_now = v_p[(h * pieces) + t]
-        # Rows of the piece's log decays and betas, broadcast to every partition by a one-row matmul, and their
-        # diagonals as columns, one value per token.
-        g_row = _to_sbuf(_matmul(ones, nisa.tensor_copy(nl.load(decay[h : h + 1, cols]), dtype=mm), PIECE, PIECE), PIECE, PIECE)
-        b_row = _to_sbuf(_matmul(ones, nisa.tensor_copy(nl.load(beta[h : h + 1, cols]), dtype=mm), PIECE, PIECE), PIECE, PIECE)
-        g_col = nisa.tensor_reduce(nl.add, nisa.tensor_tensor(g_row, eye, op=nl.multiply), axis=[1], keepdims=True)
-        b_col = nisa.tensor_reduce(nl.add, nisa.tensor_tensor(b_row, eye, op=nl.multiply), axis=[1], keepdims=True)
+        # The piece's log decays and betas, rows broadcast to every partition by one float32 matmul so they match
+        # the columns loaded straight from HBM exactly, one value per token on each partition. Splitting them into
+        # tfloat32 parts for a one-pass broadcast was slower, from the adds it puts at the start of every piece.
+        rows_in = nl.ndarray((1, 2 * PIECE), dtype=nl.float32, buffer=nl.sbuf)
+        rows_in[:, 0:PIECE] = nl.load(decay[h : h + 1, cols])
+        rows_in[:, PIECE : 2 * PIECE] = nl.load(beta[h : h + 1, cols])
+        rows = _matmul(ones, rows_in, PIECE, 2 * PIECE)
+        g_row, b_row = _to_sbuf(rows[:, 0:PIECE], PIECE, PIECE), _to_sbuf(rows[:, PIECE : 2 * PIECE], PIECE, PIECE)
+        g_col = nl.load(decay[h, t * PIECE + i_p])
+        b_col = nl.load(beta[h, t * PIECE + i_p])
         g_last = g_row[:, PIECE - 1 : PIECE]
         yield
 
@@ -662,36 +670,39 @@ def _delta_head(h, c):
         causal_t = nisa.affine_select(i_f - i_p >= 0, between_t, 0.0)
         yield
 
-        kk = _matmul(k_tp, k_tp, PIECE, PIECE)
         negative_beta = nisa.tensor_scalar(b_col, nl.multiply, -1.0)
         lower = nisa.scalar_tensor_tensor(data=kk, op0=nl.multiply, operand0=negative_beta, op1=nl.multiply, operand1=below)
         lower_t = nisa.tensor_tensor(nisa.tensor_tensor(kk, above_t, op=nl.multiply), b_row, op=nl.multiply)
         lower_t = nisa.tensor_scalar(lower_t, nl.multiply, -1.0)
         yield
 
-        # (I - lower)^-1: 8x8 diagonal blocks by doubling, then neighbouring blocks merged. Kept with its transpose.
+        # (I - lower)^-1: 8x8 diagonal blocks by doubling, then neighbouring blocks merged, kept with its transpose
+        # because each product needs its left factor transposed. A merge's update of the transpose reuses the
+        # product it made for the inverse, and the last merge and doubling make only what is used after them.
         power = nisa.tensor_tensor(lower, mask[0], op=nl.multiply, dtype=mm)
         power_t = nisa.tensor_tensor(lower_t, mask[5], op=nl.multiply, dtype=mm)
         inverse = nisa.tensor_tensor(eye, power, op=nl.add, dtype=mm)
         inverse_t = nisa.tensor_tensor(eye, power_t, op=nl.add, dtype=mm)
-        for _ in list(range(2)):
+        for step in list(range(2)):
             squared = _to_sbuf(_matmul(power_t, power, PIECE, PIECE), PIECE, PIECE, mm)
-            squared_t = _to_sbuf(_matmul(power, power_t, PIECE, PIECE), PIECE, PIECE, mm)
+            if step == 0:
+                squared_t = _to_sbuf(_matmul(power, power_t, PIECE, PIECE), PIECE, PIECE, mm)
             yield
             inverse = nisa.tensor_tensor(inverse, _matmul(inverse_t, squared, PIECE, PIECE), op=nl.add, dtype=mm)
             inverse_t = nisa.tensor_tensor(inverse_t, _matmul(squared, inverse_t, PIECE, PIECE), op=nl.add, dtype=mm)
             yield
-            power, power_t = squared, squared_t
+            if step == 0:
+                power, power_t = squared, squared_t
         for level in list(range(4)):
-            beside = nisa.tensor_tensor(lower, mask[1 + level], op=nl.multiply, dtype=mm)
+            # inverse + inverse @ beside @ inverse, from right = beside @ inverse; its transpose from right too.
             beside_t = nisa.tensor_tensor(lower_t, mask[6 + level], op=nl.multiply, dtype=mm)
-            # inverse @ beside @ inverse, and its transpose.
             right = _to_sbuf(_matmul(beside_t, inverse, PIECE, PIECE), PIECE, PIECE, mm)
-            left_t = _to_sbuf(_matmul(beside, inverse_t, PIECE, PIECE), PIECE, PIECE, mm)
             yield
-            inverse_new = nisa.tensor_tensor(inverse, _matmul(inverse_t, right, PIECE, PIECE), op=nl.add, dtype=mm)
-            inverse_t = nisa.tensor_tensor(inverse_t, _matmul(inverse, left_t, PIECE, PIECE), op=nl.add, dtype=mm)
-            inverse = inverse_new
+            if level < 3:
+                merged = nisa.tensor_tensor(inverse, _matmul(inverse_t, right, PIECE, PIECE), op=nl.add, dtype=mm)
+            inverse_t = nisa.tensor_tensor(inverse_t, _matmul(right, inverse_t, PIECE, PIECE), op=nl.add, dtype=mm)
+            if level < 3:
+                inverse = merged
             yield
 
         v_beta = nisa.tensor_scalar(v_now, nl.multiply, b_col, dtype=mm)
@@ -705,7 +716,7 @@ def _delta_head(h, c):
         v_new = nisa.tensor_tensor(new_values, _matmul(cumulative_t, s, PIECE, v_head), op=nl.subtract, dtype=mm)
         yield
         q_scaled_t = nisa.tensor_tensor(q_tp, nisa.activation(nl.exp, g_row[0:k_head, :]), op=nl.multiply, dtype=mm)
-        attn_t = nisa.tensor_tensor(_matmul(k_tp, q_tp, PIECE, PIECE), causal_t, op=nl.multiply, dtype=mm)
+        attn_t = nisa.tensor_tensor(qk, causal_t, op=nl.multiply, dtype=mm)
         result = nl.zeros((nl.par_dim(PIECE), v_head), nl.float32, buffer=nl.psum)
         result += nisa.nc_matmul(q_scaled_t, s)
         result += nisa.nc_matmul(attn_t, v_new)
@@ -742,7 +753,7 @@ def _interleave(steps) -> None:
 
 
 # Value heads, and 128-channel tiles of the conv, whose steps the delta prefill kernel interleaves.
-DELTA_HEAD_GROUP = 4
+DELTA_HEAD_GROUP = 6
 DELTA_CONV_GROUP = 4
 
 
@@ -754,9 +765,9 @@ def delta_prefill_body(
 
     The causal conv, SiLU, query and key L2 norms, the chunked gated delta rule as `model.chunked_gated_delta`
     computes it in 128-token pieces, and the gated RMS norm all run here in SBUF, so none of it makes a round trip
-    through HBM. Each piece's triangular solve is blocked forward substitution, and the state stays in SBUF from
+    through HBM. Each piece's triangular solve is a blocked inverse, and the state stays in SBUF from
     piece to piece. Every product is arranged so its left operand is already transposed, which the Tensor Engine
-    needs. The rule's matmuls are float32.
+    needs. The rule's matmuls take tfloat32 inputs.
 
     Each tensor comes in one layout only, and the kernel transposes on the Tensor Engine where it needs another.
     Given two views of one tensor, the compiler handed one over in a layout the kernel didn't expect.
@@ -803,7 +814,8 @@ def delta_prefill_body(
         _interleave([_conv_tile(c, conv) for c in list(range(c0, min(c0 + DELTA_CONV_GROUP, channel_tiles)))])
 
     # Groups of heads, each head's steps emitted in turn with the others' so their chains overlap.
-    c = (state, decay, beta, z, gated, final, q_t, k_t, v_p, mask, eye, ones, epsilon_column, weight_row, i_p, i_f, repeat, pieces, k_head, v_head)
+    rows_ones = nl.ones((1, PIECE), dtype=nl.float32, buffer=nl.sbuf)
+    c = (state, decay, beta, z, gated, final, q_t, k_t, v_p, mask, eye, rows_ones, epsilon_column, weight_row, i_p, i_f, repeat, pieces, k_head, v_head, {})
     for g0 in list(range(0, value_heads, DELTA_HEAD_GROUP)):
         _interleave([_delta_head(h, c) for h in list(range(g0, min(g0 + DELTA_HEAD_GROUP, value_heads)))])
     return gated, final

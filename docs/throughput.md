@@ -72,6 +72,8 @@ The table above measures 21-token prompts with prompt plus output capped at 512 
 | A10 | Same build | 4 x 32768 | 2 prompts of 4K | 623.67 | 10.73 | 634.41 | yes |
 | A11 | The gated delta kernel's matmuls take tfloat32 inputs, one pass on the Tensor Engine, instead of float32's four | 4 x 32768 | 16 prompts of 8K to 30K | 953.12 | 6.10 | 959.22 | golden row yes; planted key no; recall check as A9's, see below |
 | A11 | Same build | 4 x 32768 | 2 prompts of 4K | 630.50 | 10.85 | 641.36 | yes |
+| A13 | The gated delta prefill kernel's triangular solve with fewer matmuls, and with A12's speculative decoding | 4 x 32768 | 16 prompts of 8K to 30K, every request 64 tokens | 1136.44 | 4.05 | 1140.49 | golden row yes; planted key yes; recall check below |
+| A13 | Same build | 4 x 32768 | 16 prompts of 8K to 30K | 1037.44 | 5.42 | 1042.85 | golden row yes; planted key yes, 208 requests per hour |
 
 A1 and A2 are the same build, A1 run with `--no-prefill`. A1 on the full workload would take about 3.5 hours, so both ran the small one. Only 2 rows fit: a BF16 KV cache of 32K positions takes 1.07 GB per row on each core. The FP8 cache the checkpoint was calibrated for would fit about twice as many, but the compiler accepts FP8 only inside NKI kernels.
 
@@ -95,6 +97,8 @@ In A9 the prefill attention kernel takes a block of keys for 8 query tiles at a 
 
 In A10 the MLP's gate and up projections run in one kernel, with weight tiles stationary and the tokens moving, which costs the Tensor Engine the same, and the SiLU and product are applied on the chip with each step rounded to BF16 as the separate ops round. Its output is already the down projection's input layout, so a transpose and two round trips of the 8704-wide intermediate through HBM go. Prefill took 247.2 s against 255.0 s. The 30K request answered with a tool call, reading another file, instead of the planted key: from A10 on, rounding changes are judged by the recall check below rather than by that one greedy answer, as agreed, and it finds recall unchanged.
 
+A13 changes how the gated delta prefill kernel inverts each 128-token piece's triangle. The inverse is built from 8x8 blocks merged in four levels and kept with its transpose, because every Tensor Engine product needs its left factor transposed; each merge now updates the transpose from the product it just made for the inverse, 3 matmuls instead of 4, and the last merge and doubling make only what is used after them. A piece's key transposes and its keys' products with keys and queries depend only on the key head, so they are made once for its 3 value heads. The log decays and betas are now loaded exactly as columns, instead of taken from a broadcast rounded to tfloat32, which halves the kernel's error against a float32 reference (largest output error 0.031 against 0.063, final state 1.5e-4 against 4.6e-4). The kernel alone fell from 1.445 to 1.359 ms per layer, and prefill from 242.9 to 237.2 s with every request generating 64 tokens, 1140.5 tok/s against A12's 1108.9. The 30K request now finds the planted key, which A12's build didn't; the recall check below has the build within noise of A11.
+
 A11's total is lower than A10's only because its greedy answers ran longer: 1951 tokens generated against 1229, four requests reaching the 256-token cap, so decode took 78.1 s over 632 steps. On the same prompts prefill took 241.9 s against 247.2 s, 2.1% less, and decode 40.0 ms per generated token against 42.2. The kernel's inputs keep 10 mantissa bits instead of 23, still more than the BF16 the recurrent state is stored in between chunks.
 
 ### How sure the planted key is
@@ -108,6 +112,9 @@ The agentic benchmark's planted key is one greedy answer, and a change that only
 | A9 | -0.954 | 5 of 8 | 0.414 | -0.0135 |
 | A10 | -1.202 | 3 of 8 | 0.335 | -0.0132 |
 | A11 | -1.017 | 5 of 8 | 0.399 | -0.0079 |
+| A13 | -1.201 | 4 of 8 | 0.343 | -0.0181 |
+
+A13 against A11, request by request, is -0.184 ± 0.24 (one standard error) in log p(key), the requests moving both ways (one from p = 0.165 to 0.625 for the key's first token), as A10 was at -0.185 ± 0.16.
 
 Recall itself is the same: once the key starts, both finish it with probability 0.987. Nearly all the uncertainty is in the first token, whether to answer or to read another file first, at a probability of 0.25 to 0.6 per request, and it moves by up to 0.25 per request between the two builds in both directions, a mean difference of about 1.4 standard errors. Raw results are in [throughput/long_context/](throughput/long_context/).
 
@@ -133,6 +140,7 @@ In M3 the states are saved after each prompt's last chunk, full or not, and the 
 | M1 | Turns continue from the slot's saved states | 4 x 32768 | 8 sessions, 53 turns | 654969 | 204409 | 1657 | 230.3 s | 2851.1 | key recalled; every turn's tokens the same as without |
 | M2 | Speculative decoding, 4 tokens per verify step, below | 4 x 32768 | 8 sessions, 53 turns | 654969 | 204409 | 1664 | 206.7 s | 3177.0 | key recalled; 47 of 53 turns' tokens the same as M1's |
 | M3 | States saved at each prompt's end, not its last whole chunk, so a turn prefills from there | 4 x 32768 | 8 sessions, 53 turns | 654969 | 192176 | 1641 | 198.5 s | 3307.0 | key recalled; 46 of 53 turns' tokens the same as M2's |
+| M4 | A13's gated delta prefill solve | 4 x 32768 | 8 sessions, 53 turns | 654969 | 192176 | 1633 | 194.1 s | 3382.6 | session 0's last turn searched for the key with a tool call instead of answering it; 35 of 53 turns' tokens the same as M3's |
 
 ## Speculative decoding
 
