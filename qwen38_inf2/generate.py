@@ -57,8 +57,8 @@ def batch_step_inputs(
 
 def prefill_inputs(cfg: TextConfig, slot: int, start: int, n_valid: int, chunk: int, dtype: torch.dtype) -> dict[str, torch.Tensor]:
     """Prefill inputs for `n_valid` tokens of one row from position `start`, padded to a full chunk."""
-    if start % chunk or not 0 < n_valid <= chunk:
-        raise ValueError(f"a chunk must start at a multiple of {chunk} and hold 1 to {chunk} tokens")
+    if start < 0 or not 0 < n_valid <= chunk:
+        raise ValueError(f"a chunk must start at a position and hold 1 to {chunk} tokens")
     cos, sin = rotary(cfg, start + torch.arange(chunk), dtype)
     return {
         "cos": cos.unsqueeze(0),

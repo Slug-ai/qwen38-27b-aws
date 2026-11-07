@@ -2,7 +2,7 @@
 
 Runs the text part of [RedHatAI/Qwen3.8-27B-MXFP4](https://huggingface.co/RedHatAI/Qwen3.8-27B-MXFP4) on one AWS Inferentia2 chip (two NeuronCores), with its FP4 weights converted to FP8 and greedy decoding.
 
-**Status: runs end to end on a real `inf2.xlarge`.** On coding-agent requests of 8K to 30K prompt tokens with a 32K context, 1041 tokens/s in all, nearly all of them prompt tokens, and 208 requests per hour, measured. On multi-turn agent sessions, which send the whole conversation again every turn, 3177 tokens/s with speculative decoding. With prompt plus output capped at 512 tokens, which no agent request fits, 156.20 generated tokens/s at batch 63. See [the throughput log](docs/throughput.md) and [the field notes](docs/field_notes.md), which cover setup on the Amazon Linux Neuron AMI.
+**Status: runs end to end on a real `inf2.xlarge`.** On coding-agent requests of 8K to 30K prompt tokens with a 32K context, 1041 tokens/s in all, nearly all of them prompt tokens, and 208 requests per hour, measured. On multi-turn agent sessions, which send the whole conversation again every turn, 3307 tokens/s with speculative decoding. With prompt plus output capped at 512 tokens, which no agent request fits, 156.20 generated tokens/s at batch 63. See [the throughput log](docs/throughput.md) and [the field notes](docs/field_notes.md), which cover setup on the Amazon Linux Neuron AMI.
 
 **Goal: maximum throughput, not latency.** Every design choice is judged by total tokens per second across all sequences. Time per token doesn't matter, so large batches and slow steps are fine.
 
@@ -54,7 +54,7 @@ python scripts/prepare_weights.py --model-dir model --compiled artifacts/block16
 python scripts/agentic_benchmark.py --model-dir model --compiled artifacts/block16_b4_s32k_c512_kv8 --head artifacts/head_fp8_b4 --weights weights_fp8_kv8
 ```
 
-`scripts/multi_turn_benchmark.py` with the same arguments runs coding-agent sessions whose every turn sends the whole conversation again, as Claude Code does. A session's turns reuse its slot's cache and saved states, so only the new tokens are prefilled; `--no-reuse` prefills every prompt whole, which gives the same tokens.
+`scripts/multi_turn_benchmark.py` with the same arguments runs coding-agent sessions whose every turn sends the whole conversation again, as Claude Code does. A session's turns reuse its slot's cache and the states saved at the end of the last prompt, so only the new tokens are prefilled; `--no-reuse` prefills every prompt whole, which gives the same tokens up to rounding.
 
 For speculative decoding, add `--verify-tokens 4` to the layers' compile and give the benchmarks a head for 16 rows (`--head --head-format fp8 --batch-size 16`); `--no-speculation` runs the same build without it. `scripts/speculation_check.py` with the same arguments checks the verify graph against decode on real text.
 

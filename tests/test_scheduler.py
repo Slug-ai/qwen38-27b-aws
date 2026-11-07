@@ -32,7 +32,7 @@ class FakeDevice:
     def prefill(self, inputs_embeds, cos, sin, slot, start, n_valid):
         slot, start, n_valid = int(slot[0]), int(start[0]), int(n_valid[0])
         assert inputs_embeds.shape[:2] == (1, CHUNK) and cos.shape[:2] == (1, CHUNK)
-        assert start % CHUNK == 0 and 0 < n_valid <= CHUNK
+        assert 0 < n_valid <= CHUNK
         if start == 0:
             self.cache[slot] = []
         assert len(self.cache[slot]) == start, "a chunk must continue exactly where the last one ended"
@@ -43,10 +43,9 @@ class FakeDevice:
         return hidden
 
     def copy_states(self, inputs_embeds, save_slot=None, restore_slot=None):
-        """Saved states stand for exactly the tokens up to where they were saved, at a chunk boundary."""
+        """Saved states stand for exactly the tokens up to where they were saved."""
         if save_slot is not None:
             slot = int(save_slot[0])
-            assert len(self.cache[slot]) % CHUNK == 0, "states are saved at a chunk boundary"
             self.saved[slot] = list(self.cache[slot])
         else:
             slot = int(restore_slot[0])

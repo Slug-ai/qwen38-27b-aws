@@ -213,7 +213,7 @@ def test_sessions_on_the_real_model_give_the_same_tokens_with_saved_prefixes_as_
     cfg = tiny_config()
     _, tensors = build_reference(cfg)
     head = host_head(tensors)
-    # Within MAX_SEQ_LEN less a chunk. The second turns continue from position 16, the third from 32.
+    # Within MAX_SEQ_LEN less a chunk. Each later turn continues from where the last turn's prompt ended, mid-chunk.
     base = PROMPT + [5, 9] * 2
     sessions = [
         [base, base + [7, 8, 9, 10, 11, 12, 13], base + [7, 8, 9, 10, 11, 12, 13] + [21] * 9],
@@ -229,7 +229,7 @@ def test_sessions_on_the_real_model_give_the_same_tokens_with_saved_prefixes_as_
                 out.setdefault((session, turn), []).append(token)
         got[reuse] = (out, scheduler.reused_tokens)
     assert got[True][0] == got[False][0]
-    assert got[False][1] == 0 and got[True][1] >= 2 * CHUNK
+    assert got[False][1] == 0 and got[True][1] == sum(len(turns[t - 1]) for turns in sessions for t in range(1, len(turns)))
 
 
 def test_verify_steps_give_what_decoding_the_same_tokens_one_by_one_gives():

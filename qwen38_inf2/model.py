@@ -299,7 +299,7 @@ class GatedDeltaNetStep(nn.Module):
         self.dt_bias = _frozen(self.num_v_heads, dtype=dtype)
         self.norm_weight = _frozen(cfg.linear_value_head_dim, dtype=dtype)
 
-        # With `saved_states`, rows from `batch_size` on hold each row's states as they were at a chunk boundary of
+        # With `saved_states`, rows from `batch_size` on hold each row's states as they were at the end of
         # its prompt (`copy_states`), so a later prompt extending that one can start from there: the KV cache still
         # holds those positions. They are rows of the same buffers, so every graph touching them writes them too,
         # and NxD keeps them as the shared state they are rather than taking them for weights.
@@ -877,7 +877,7 @@ class Qwen38Step(nn.Module):
         inputs_embeds: ``[1, chunk, hidden]``.
         cos, sin: ``[1, chunk, rotary_dim]``, for positions `start` onward.
         slot: int32 ``[1]``, the row whose state and cache the chunk continues.
-        start: int32 ``[1]``, the chunk's first position, a multiple of the chunk. 0 starts a new sequence.
+        start: int32 ``[1]``, the chunk's first position. 0 starts a new sequence.
         n_valid: int32 ``[1]``, how many of the chunk's tokens are real. The rest are padding.
 
     Verify, K tokens per row for speculative decoding (inputs built by `generate.verify_inputs`):
@@ -888,7 +888,7 @@ class Qwen38Step(nn.Module):
             prefill or decode step.
 
     Saving or restoring one row's recurrent states (inputs built by `generate.state_copy_inputs`), so a prompt that
-    extends one already prefilled can start from a chunk boundary they share:
+    extends one already prefilled can start where that one ended:
         inputs_embeds: ``[1, 1, hidden]``, returned as it is, so blocks chain as for the other calls.
         save_slot or restore_slot: int32 ``[1]``, the row.
     """

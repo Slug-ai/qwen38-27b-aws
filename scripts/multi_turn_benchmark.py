@@ -6,9 +6,9 @@ default 8 sessions run, of up to 12 turns and 30K tokens each, with up to 128 ne
 agent's replies are scripted reads of the next file rather than what the model wrote, so every build sees the
 same prompts; the model's own replies are generated and counted all the same.
 
-A session's turns run in one slot, and a turn's prefill starts from the slot's saved states at the last chunk
-boundary the turns share, so only new tokens are prefilled. `--no-reuse` prefills every prompt whole, which
-must give the same tokens. Session 0 plants a key in its first file and its last turn asks for it.
+A session's turns run in one slot, and a turn's prefill starts from the slot's states saved at the end of the
+last turn's prompt, so only new tokens are prefilled. `--no-reuse` prefills every prompt whole, which gives the
+same tokens up to rounding, since the chunks then start at other positions. Session 0 plants a key in its first file and its last turn asks for it.
 """
 
 import argparse

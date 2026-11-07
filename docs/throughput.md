@@ -121,15 +121,18 @@ Raw results are in [throughput/agentic/](throughput/agentic/).
 
 A coding agent sends its whole conversation again every turn, so most of each prompt is the last one. `scripts/multi_turn_benchmark.py` runs 8 such sessions of up to 12 turns and 30K tokens: turn 1 is the system prompt and task, and each later turn adds the agent's read of the next standard library file and the file itself. The reads are scripted, so every build sees the same prompts, while the model's own replies, up to 128 tokens, are generated and counted. Session 0 plants a key in its first file, and its last turn asks for it.
 
-A session's turns run in one slot. After each prompt's last whole chunk, the slot's recurrent and conv states are saved, into spare rows of the same state buffers; the next turn restores them and prefills from that boundary, since the KV cache still holds those positions. The saved rows cost 151 MB per core and leave single-turn prefill as it was: the same build ran the single-turn agentic benchmark's prefill in 242.6 s against 241.9 s for A11, with the same outputs.
+A session's turns run in one slot. After each prompt's last whole chunk (from M3, after its last chunk), the slot's recurrent and conv states are saved, into spare rows of the same state buffers; the next turn restores them and prefills from there, since the KV cache still holds those positions. The saved rows cost 151 MB per core and leave single-turn prefill as it was: the same build ran the single-turn agentic benchmark's prefill in 242.6 s against 241.9 s for A11, with the same outputs.
 
 69% of the prompt tokens sent are reused, and the run takes 2.49 times less time. Because a restored state is exactly what the shared chunks gave, every turn generates the same tokens either way.
+
+In M3 the states are saved after each prompt's last chunk, full or not, and the next turn's prefill starts at that prompt's end, mid-chunk. Nothing in the prefill graph needed chunks to start at multiples of 512: attention masks the cache from `start` and writes the chunk's keys there, and padding past a chunk's real tokens leaves the gated delta states as they were. Each turn no longer prefills the last turn's partial chunk again, 256 tokens on average: 6.0% fewer tokens prefilled and 20 fewer prefill calls, 165.7 s of prefill against 172.9 s. A turn's chunks now start at other positions than when its prompt is prefilled whole, so the tokens are the same as without reuse only up to rounding.
 
 | # | Change | Rows x max length | Workload | Prompt tokens sent | Prefilled | Generated | Time | Total tok/s | Correct |
 |---|---|---|---|---|---|---|---|---|---|
 | M1 | Every turn prefilled whole | 4 x 32768 | 8 sessions, 53 turns | 654969 | 654969 | 1657 | 573.7 s | 1144.6 | key recalled |
 | M1 | Turns continue from the slot's saved states | 4 x 32768 | 8 sessions, 53 turns | 654969 | 204409 | 1657 | 230.3 s | 2851.1 | key recalled; every turn's tokens the same as without |
 | M2 | Speculative decoding, 4 tokens per verify step, below | 4 x 32768 | 8 sessions, 53 turns | 654969 | 204409 | 1664 | 206.7 s | 3177.0 | key recalled; 47 of 53 turns' tokens the same as M1's |
+| M3 | States saved at each prompt's end, not its last whole chunk, so a turn prefills from there | 4 x 32768 | 8 sessions, 53 turns | 654969 | 192176 | 1641 | 198.5 s | 3307.0 | key recalled; 46 of 53 turns' tokens the same as M2's |
 
 ## Speculative decoding
 

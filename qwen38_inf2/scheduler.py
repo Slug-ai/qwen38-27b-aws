@@ -10,7 +10,8 @@ Waiting rows lose latency, not throughput.
 
 Sessions, as a coding agent sends them, are turns whose prompts each extend the last. A session's next turn runs
 in the slot its last turn used, and when a slot's saved states match the start of a new prompt, its prefill starts
-from there: the KV cache still holds those positions, and the recurrent states were saved at that chunk boundary.
+from there: the KV cache still holds those positions, and the recurrent states were saved at the end of the prompt
+they belong to.
 """
 
 import time
@@ -44,7 +45,7 @@ class Scheduler:
         decode: the decode graph, ``(inputs_embeds [B, 1, H], cos, sin, position, active) -> [B, 1, H]``.
         prefill: the prefill graph, ``(inputs_embeds [1, C, H], cos, sin, slot, start, n_valid) -> [1, C, H]``.
         head: has ``embed_batch(ids, dtype)`` and ``next_tokens(hidden [rows, 1, H])``, as `generate.ChipHead`.
-        chunk: C, the prefill graph's tokens per call. Chunks start at multiples of it.
+        chunk: C, the prefill graph's tokens per call.
         copy_states: the graph that saves or restores one slot's recurrent states, called with
             `generate.state_copy_inputs`. Without one, or with `reuse_prefixes` False, every prompt is prefilled whole.
         verify, verify_tokens: with these, every decode step is a verify step of `verify_tokens` tokens per row
@@ -86,7 +87,7 @@ class Scheduler:
         self.drafted_tokens = 0
         self.copy_states = copy_states
         self.reuse_prefixes = reuse_prefixes and copy_states is not None
-        # Per slot, the prompt tokens whose recurrent states it has saved, up to a chunk boundary.
+        # Per slot, the prompt whose recurrent states at its end it has saved.
         self.saved: list[list[int]] = [[] for _ in range(batch_size)]
         self.reused_tokens = 0
         self.prefilled_tokens = 0
@@ -105,8 +106,6 @@ class Scheduler:
         saved = self.saved[slot]
         begin = len(saved) if self.reuse_prefixes and saved and len(saved) < row.prompt_len and row.ids[: len(saved)] == saved else 0
         self.reused_tokens += begin
-        # The last whole chunk's states are saved, for a later prompt that extends this one.
-        boundary = row.prompt_len // self.chunk * self.chunk
         if begin:
             self.copy_states(**state_copy_inputs(self.cfg, slot, False, self.dtype))
         for start in range(begin, row.prompt_len, self.chunk):
@@ -116,12 +115,11 @@ class Scheduler:
             hidden = self.prefill(inputs_embeds=embeds, **prefill_inputs(self.cfg, slot, start, n_valid, self.chunk, self.dtype))
             self.prefill_calls += 1
             self.prefilled_tokens += n_valid
-            if self.reuse_prefixes and start + self.chunk == boundary:
-                self.copy_states(**state_copy_inputs(self.cfg, slot, True, self.dtype))
-        # A prompt written from the start replaces whatever the slot held. One continuing the saved states keeps
-        # them unless it saved a later boundary.
-        if boundary > begin or begin == 0:
-            self.saved[slot] = row.ids[:boundary]
+        # The states at the prompt's end are saved, for a later prompt that extends this one. Padding past a
+        # chunk's real tokens leaves them as they were, so the last chunk may be part full.
+        if self.reuse_prefixes:
+            self.copy_states(**state_copy_inputs(self.cfg, slot, True, self.dtype))
+            self.saved[slot] = row.ids[: row.prompt_len]
         self.accepted[slot] = 0
         row.written = row.prompt_len
         token_id = self.head.next_tokens(hidden[:, n_valid - 1 : n_valid])[0]
