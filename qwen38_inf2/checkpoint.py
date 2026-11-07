@@ -26,6 +26,9 @@ EMBED_TOKENS = TEXT_PREFIX + "embed_tokens.weight"
 FINAL_NORM = TEXT_PREFIX + "norm.weight"
 # Static FP8 calibration scales for the KV cache. Only read when the cache is FP8.
 UNUSED_LAYER_SUFFIXES = ("self_attn.k_scale", "self_attn.v_scale")
+# The scales map the largest cached value to OCP e4m3fn's 448. NeuronCore-v2's e4m3 stops at 240, so they are
+# stretched to map it there instead, which keeps every value's relative precision and loses nothing to overflow.
+KV_SCALE_STRETCH = 448 / 240
 
 _DTYPES = {
     "BF16": (torch.bfloat16, 2),
@@ -199,9 +202,17 @@ def layer_weights(
         out[f"{sa}.q_norm_weight"] = source.get(f"{hs}.q_norm.weight").to(dtype)
         out[f"{sa}.k_norm_weight"] = source.get(f"{hs}.k_norm.weight").to(dtype)
         if cfg.kv_cache_format == "fp8":
-            out[f"{sa}.k_scale"] = source.get(f"{hs}.k_scale").reshape(1).to(dtype)
-            out[f"{sa}.v_scale"] = source.get(f"{hs}.v_scale").reshape(1).to(dtype)
+            out |= kv_scales(source, index, dtype)
     return out
+
+
+def kv_scales(source, index: int, dtype: torch.dtype = torch.bfloat16) -> dict[str, torch.Tensor]:
+    """Layer `index`'s FP8 KV-cache scales, stretched for the chip's e4m3, with `Qwen38Step` parameter names."""
+    hs = f"{TEXT_PREFIX}layers.{index}.self_attn"
+    return {
+        f"layers.{index}.self_attn.{name}": (source.get(f"{hs}.{name}").float() * KV_SCALE_STRETCH).reshape(1).to(dtype)
+        for name in ("k_scale", "v_scale")
+    }
 
 
 def rank_weights(source, cfg: TextConfig, rank: int, tp_degree: int, dtype: torch.dtype = torch.bfloat16):
@@ -263,6 +274,32 @@ def write_rank_weights(source, cfg: TextConfig, weights_dir: str | Path, block_l
             save_file({k: v.contiguous() for k, v in weights.items()}, shard_path(weights_dir, block, rank))
 
 
+def kv_scales_path(weights_dir: str | Path, block: int, rank: int) -> Path:
+    return Path(weights_dir) / f"block{block:02d}_tp{rank}_kv_scales.safetensors"
+
+
+def add_kv_scales(source, cfg: TextConfig, from_dir: str | Path, weights_dir: str | Path, block_layers: int, tp_degree: int = 2) -> None:
+    """Weights for an FP8 KV cache from those in `from_dir`, written for a BF16 one: links to its files, which are
+    otherwise the same for both formats, and beside each block's file a small one of the cache's scales, which
+    `load_rank_block` merges. This saves cutting the checkpoint again and 12 GB of disk per core.
+    """
+    from_dir, weights_dir = Path(from_dir).resolve(), Path(weights_dir)
+    weights_dir.mkdir(parents=True, exist_ok=True)
+    for path in from_dir.iterdir():
+        link = weights_dir / path.name
+        if path.is_file() and not path.name.endswith("_kv_scales.safetensors") and not link.exists():
+            link.symlink_to(path)
+    for block in range(cfg.num_hidden_layers // block_layers):
+        for rank in range(tp_degree):
+            scales = {}
+            for offset in range(block_layers):
+                index = block * block_layers + offset
+                if cfg.layer_types[index] == FULL:
+                    for name, tensor in kv_scales(source, index).items():
+                        scales[f"layers.{offset}." + name.split(".", 2)[2]] = tensor
+            save_file(scales, kv_scales_path(weights_dir, block, rank))
+
+
 HEAD_CHUNK_ROWS = 16384
 
 
@@ -302,8 +339,11 @@ def load_head_weights(weights_dir: str | Path, rank: int) -> dict[str, torch.Ten
 
 
 def load_rank_block(weights_dir: str | Path, block: int, rank: int, layers: int | None = None) -> dict[str, torch.Tensor]:
-    """One block's weights for one core, optionally keeping only its first `layers` layers."""
+    """One block's weights for one core, optionally keeping only its first `layers` layers. The FP8 KV cache's
+    scales are merged in from their own file when there is one (`add_kv_scales`)."""
     weights = load_file(shard_path(weights_dir, block, rank))
+    if kv_scales_path(weights_dir, block, rank).exists():
+        weights |= load_file(kv_scales_path(weights_dir, block, rank))
     if layers is None:
         return weights
     return {name: tensor for name, tensor in weights.items() if int(name.split(".")[1]) < layers}
@@ -312,6 +352,8 @@ def load_rank_block(weights_dir: str | Path, block: int, rank: int, layers: int 
 def rank_block_header(weights_dir: str | Path, block: int, rank: int, layers: int | None = None) -> dict:
     """Names, shapes and dtypes of one block's weights, read without loading them."""
     header = TensorSource(shard_path(weights_dir, block, rank)).header
+    if kv_scales_path(weights_dir, block, rank).exists():
+        header = header | TensorSource(kv_scales_path(weights_dir, block, rank)).header
     if layers is None:
         return header
     return {name: entry for name, entry in header.items() if int(name.split(".")[1]) < layers}

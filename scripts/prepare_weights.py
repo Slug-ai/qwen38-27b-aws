@@ -7,7 +7,7 @@ Vision and MTP tensors are never read. In total this is about 6.9 GB per core fo
 import argparse
 from dataclasses import replace
 
-from qwen38_inf2.checkpoint import TensorSource, read_build_info, write_head_weights, write_rank_weights
+from qwen38_inf2.checkpoint import TensorSource, add_kv_scales, read_build_info, write_head_weights, write_rank_weights
 from qwen38_inf2.config import TextConfig
 
 
@@ -17,6 +17,7 @@ def main():
     parser.add_argument("--compiled", required=True, help="Output directory of scripts/compile.py.")
     parser.add_argument("--output", required=True)
     parser.add_argument("--head-only", action="store_true", help="Write only the weights for lm_head on the chip, 1.3 GB per core, or 0.6 GB for FP8.")
+    parser.add_argument("--reuse", help="Weights written for a build that differs only in its BF16 KV cache: link to them and add the FP8 cache's scales.")
     args = parser.parse_args()
 
     if args.head_only:
@@ -28,7 +29,12 @@ def main():
     cfg = TextConfig.from_file(f"{args.model_dir}/config.json")
     info = read_build_info(args.compiled)
     cfg = replace(cfg, weight_format=info.get("weight_format", "fp4"), kv_cache_format=info.get("kv_cache_format", "bf16"))
-    write_rank_weights(TensorSource(f"{args.model_dir}/model.safetensors"), cfg, args.output, info["layers"], info["tp_degree"])
+    if args.reuse:
+        if cfg.kv_cache_format != "fp8":
+            parser.error("--reuse only adds the FP8 KV cache's scales, and this build's cache isn't FP8")
+        add_kv_scales(TensorSource(f"{args.model_dir}/model.safetensors"), cfg, args.reuse, args.output, info["layers"], info["tp_degree"])
+    else:
+        write_rank_weights(TensorSource(f"{args.model_dir}/model.safetensors"), cfg, args.output, info["layers"], info["tp_degree"])
     print(f"wrote weights to {args.output}")
 
 

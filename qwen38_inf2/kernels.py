@@ -138,6 +138,33 @@ MASKED = -30000.0
 KEY_BLOCK = 2048
 
 
+# The largest finite FP8 e4m3 value on NeuronCore-v2, whose e4m3 has infinities, unlike OCP e4m3fn's 448.
+FP8_E4M3_MAX = 240.0
+
+
+def fp8_encode_body(x: nl.ndarray, inverse_scale: nl.ndarray):
+    """FP8 e4m3 bytes of ``x * inverse_scale`` for the KV cache, clamped to the largest finite value, and the values
+    those bytes hold, as BF16, so a step can use its own key exactly as later steps will read it.
+
+    Args:
+        x: BF16 ``[rows, head]``.
+        inverse_scale: float32 ``[128, 1]``, 1 / the layer's scale on every partition.
+
+    Returns:
+        (uint8 ``[rows, head]``, BF16 ``[rows, head]``).
+    """
+    rows, head = x.shape
+    coded = nl.ndarray((rows, head), dtype=nl.uint8, buffer=nl.shared_hbm)
+    held = nl.ndarray((rows, head), dtype=x.dtype, buffer=nl.shared_hbm)
+    inverse = nl.load(inverse_scale)
+    for r0, rs in _tiles(rows, STATIONARY_TILE):
+        scaled = nisa.tensor_scalar(nl.load(x[r0 : r0 + rs, :]), nl.multiply, inverse[0:rs, :], dtype=nl.float32)
+        fp8 = nisa.tensor_scalar(scaled, nl.minimum, FP8_E4M3_MAX, op1=nl.maximum, operand1=-FP8_E4M3_MAX, dtype=nl.float8_e4m3)
+        nl.store(coded[r0 : r0 + rs, :], fp8.view(nl.uint8))
+        nl.store(held[r0 : r0 + rs, :], nisa.tensor_copy(fp8, dtype=x.dtype))
+    return coded, held
+
+
 def _transposed(tile, rows: int, cols: int, dtype, identity):
     """``tile.T``, ``[rows, cols]``, in SBUF, as `nc_transpose` does it: `tile` stationary against an identity.
 
@@ -151,8 +178,8 @@ def _transposed(tile, rows: int, cols: int, dtype, identity):
 
 
 def prefill_attention_body(
-    q: nl.ndarray, k_cache: nl.ndarray, v_cache: nl.ndarray, k_new: nl.ndarray, v_new: nl.ndarray, start: nl.ndarray, row: nl.ndarray,
-    blocks: nl.ndarray, positions: int,
+    q: nl.ndarray, k_cache: nl.ndarray, v_cache: nl.ndarray, k_new: nl.ndarray, v_new: nl.ndarray, start: nl.ndarray,
+    first_block: nl.ndarray, blocks: nl.ndarray, positions: int,
 ) -> nl.ndarray:
     """Flash attention for a prefill chunk of one row: its queries against the row's cache and against itself.
 
@@ -165,12 +192,14 @@ def prefill_attention_body(
     Args:
         q: BF16 ``[kv_heads, head, queries]``, already scaled. A KV head's query heads are stacked, so query
             ``g * chunk + i`` is head g's token i.
-        k_cache, v_cache: BF16 ``[rows * kv_heads * positions, head]``, every row's whole cache. The chunk's row is
-            read with indirect DMA, so it is never copied, and key blocks are transposed on the Tensor Engine, once
-            per block for all query tiles.
+        k_cache, v_cache: ``[rows * kv_heads * positions, head]``, every row's whole cache, BF16 or else uint8
+            holding FP8 e4m3 bytes from `fp8_encode`, in units of the layer's scales: then `q` must be multiplied by
+            the key scale and the result by the value scale, and `k_new` and `v_new` must be in the same units. The
+            chunk's row is read in place, a block at a time with an index held on the chip, and key blocks are
+            transposed on the Tensor Engine, once per block for all query tiles.
         k_new: BF16 ``[kv_heads, head, chunk]``. v_new: BF16 ``[kv_heads, chunk, head]``. The chunk's own keys and values.
         start: float32 ``[128, 1]``, the chunk's first position on every partition.
-        row: int32 ``[128, 1]``, ``slot * kv_heads * positions``, where the chunk's row begins, on every partition.
+        first_block: int32 ``[1, 1]``, ``slot * kv_heads * positions / KEY_BLOCK``, the chunk's row's first block.
         blocks: int32 ``[1, 1]``, ``ceil(start / KEY_BLOCK)``, the cache blocks to visit.
         positions: cache positions per row and KV head.
 
@@ -178,11 +207,11 @@ def prefill_attention_body(
         BF16 ``[kv_heads, queries, head]``.
     """
     out = nl.ndarray((q.shape[0], q.shape[2], q.shape[1]), dtype=q.dtype, buffer=nl.shared_hbm)
-    _prefill_attention(q, k_cache, v_cache, k_new, v_new, start, row, nisa.tensor_reduce(nl.add, nl.load(blocks), axis=[1]), positions, out)
+    _prefill_attention(q, k_cache, v_cache, k_new, v_new, start, first_block, nisa.tensor_reduce(nl.add, nl.load(blocks), axis=[1]), positions, out)
     return out
 
 
-def _prefill_attention(q, k_cache, v_cache, k_new, v_new, start, row, count, positions: int, out) -> None:
+def _prefill_attention(q, k_cache, v_cache, k_new, v_new, start, first_block, count, positions: int, out) -> None:
     """`prefill_attention_body` with the block count as an SBUF scalar, `count`, writing into `out`."""
     kv_heads, head, queries = q.shape
     chunk = k_new.shape[2]
@@ -191,12 +220,15 @@ def _prefill_attention(q, k_cache, v_cache, k_new, v_new, start, row, count, pos
     q_tiles = _tiles(queries, STATIONARY_TILE)
     assert all(qs == STATIONARY_TILE for _, qs in q_tiles), "queries must fill whole tiles"
     start_tile = nl.load(start)
-    row_tile = nl.load(row)
+    k_blocks = k_cache.reshape((k_cache.shape[0] // KEY_BLOCK, KEY_BLOCK, head))
+    v_blocks = v_cache.reshape((v_cache.shape[0] // KEY_BLOCK, KEY_BLOCK, head))
     i_p = nl.arange(STATIONARY_TILE)[:, None]
     i_f = nl.arange(KEY_BLOCK)[None, :]
     i_h = nl.arange(head)[None, :]
     i_s = nl.arange(STATIONARY_TILE)[None, :]
     identity = nisa.affine_select(i_p - i_s == 0, nl.ones((nl.par_dim(STATIONARY_TILE), STATIONARY_TILE), dtype=nl.bfloat16, buffer=nl.sbuf), 0.0)
+    fp8 = k_cache.dtype == nl.uint8
+    identity_fp8 = nisa.tensor_copy(identity, dtype=nl.float8_e4m3) if fp8 else identity
 
     for h in list(range(kv_heads)):
         q_sb = [nl.load(q[h, d0 : d0 + ds, :]) for d0, ds in d_tiles]
@@ -226,22 +258,26 @@ def _prefill_attention(q, k_cache, v_cache, k_new, v_new, start, row, count, pos
                 best[t][...] = new_best
 
         # A device loop with a run-time trip count, so code size doesn't grow with the cache and time grows only
-        # with the row's keys. Where the block's rows begin and its positions are carried from block to block.
-        offset = nisa.tensor_tensor(row_tile, nisa.iota(i_p + h * positions, dtype=nl.int32), op=nl.add)
+        # with the row's keys. The block's index and its positions are carried from block to block.
+        at = nisa.tensor_scalar(nl.load(first_block), nl.add, h * (positions // KEY_BLOCK))
         later = nisa.iota(i_f + 0 * i_p, dtype=nl.float32)
         for _ in range(scalar(count)):
-            keys = [nl.ndarray((nl.par_dim(ds), KEY_BLOCK), dtype=k_cache.dtype, buffer=nl.sbuf) for _, ds in d_tiles]
+            keys = [nl.ndarray((nl.par_dim(ds), KEY_BLOCK), dtype=q.dtype, buffer=nl.sbuf) for _, ds in d_tiles]
             values = []
             for k0 in list(range(0, KEY_BLOCK, STATIONARY_TILE)):
-                index = nisa.tensor_scalar(offset, nl.add, k0)
-                rows = nl.load(k_cache[index, i_h])
-                values.append(nl.load(v_cache[index, i_h]))
+                rows = nl.load(k_blocks[at, k0 + i_p, i_h])
+                cached_values = nl.load(v_blocks[at, k0 + i_p, i_h])
+                if fp8:
+                    # FP8 keys stay FP8 for the transpose, which writes BF16. Values become BF16 on the idle GpSimd.
+                    rows = rows.view(nl.float8_e4m3)
+                    cached_values = nisa.tensor_copy(cached_values.view(nl.float8_e4m3), dtype=nl.bfloat16, engine=nisa.gpsimd_engine)
+                values.append(cached_values)
                 for d, (d0, ds) in enumerate(d_tiles):
-                    keys[d][:, k0 : k0 + STATIONARY_TILE] = _transposed(rows[:, d0 : d0 + ds], ds, STATIONARY_TILE, k_cache.dtype, identity)
+                    keys[d][:, k0 : k0 + STATIONARY_TILE] = _transposed(rows[:, d0 : d0 + ds], ds, STATIONARY_TILE, q.dtype, identity_fp8)
             # Positions from `start` on hold no keys for this chunk yet.
             bias = nisa.tensor_scalar(later, nl.greater_equal, start_tile, op1=nl.multiply, operand1=MASKED)
             attend(keys, values, [bias] * len(q_tiles), KEY_BLOCK)
-            offset[...] = nisa.tensor_scalar(offset, nl.add, KEY_BLOCK)
+            at[...] = nisa.tensor_scalar(at, nl.add, 1)
             later[...] = nisa.tensor_scalar(later, nl.add, float(KEY_BLOCK))
 
         keys = [nl.load(k_new[h, d0 : d0 + ds, :]) for d0, ds in d_tiles]
@@ -256,6 +292,158 @@ def _prefill_attention(q, k_cache, v_cache, k_new, v_new, start, row, count, pos
             inverse = nisa.reciprocal(total[t])
             result = nisa.tensor_scalar(acc[t], nl.multiply, inverse, dtype=q.dtype)
             nl.store(out[h, q0 : q0 + qs, :], result)
+
+
+# Cache positions per iteration of the decode attention kernel's device loop. Every pair's keys and values for a
+# block are in SBUF at once, so this is smaller than prefill's.
+DECODE_BLOCK = 1024
+# Blocks per iteration of that loop, so the model asks for ceil(positions / DECODE_STEP) iterations.
+DECODE_SPLIT = 2
+DECODE_STEP = DECODE_SPLIT * DECODE_BLOCK
+DECODE_CONVERT_ENGINE = nisa.scalar_engine
+
+
+def decode_attention_body(
+    q: nl.ndarray, k_cache: nl.ndarray, v_cache: nl.ndarray, k_own: nl.ndarray, v_own: nl.ndarray, limit: nl.ndarray,
+    blocks: nl.ndarray, groups: int, positions: int,
+) -> nl.ndarray:
+    """Attention for one token per row: its queries against its cache as it was, then against its own key.
+
+    The query heads of every (row, KV head) pair are stacked on partitions, so the softmax runs once for all of
+    them. Each pair's keys meet a copy of the queries with every other pair's columns zeroed, so its scores land
+    only in its own rows, and its values are taken only by its own rows the same way. The loop over cache blocks
+    has a trip count read at run time, `blocks`, so it stops at the furthest row's position.
+
+    Args:
+        q: BF16 ``[queries, head]``, already scaled. Row ``p * groups + g`` is pair p's query head g, and pair
+            ``b * kv_heads + h`` is row b's KV head h.
+        k_cache, v_cache: ``[pairs * positions, head]``, every pair's cache, BF16 or uint8 FP8 bytes as for
+            `prefill_attention_body`.
+        k_own, v_own: BF16 ``[queries, head]``, the step's own key and value of each query row's pair.
+        limit: float32 ``[queries, 1]``, each query row's position: it sees cache positions before it.
+        blocks: int32 ``[1, 1]``, how many steps of `DECODE_STEP` positions hold any row's keys.
+        groups: query heads per pair.
+        positions: cache positions per pair.
+
+    Returns:
+        BF16 ``[queries, head]``.
+    """
+    out = nl.ndarray(q.shape, dtype=q.dtype, buffer=nl.shared_hbm)
+    count = nisa.tensor_reduce(nl.add, nl.load(blocks), axis=[1])
+    _decode_attention(q, k_cache, v_cache, k_own, v_own, limit, count, groups, positions, out)
+    return out
+
+
+def _decode_attention(q, k_cache, v_cache, k_own, v_own, limit, count, groups: int, positions: int, out) -> None:
+    """`decode_attention_body` with the block count as an SBUF scalar, `count`, writing into `out`."""
+    queries, head = q.shape
+    pairs = queries // groups
+    assert positions % DECODE_STEP == 0, f"the cache's {positions} positions must be a multiple of {DECODE_STEP}"
+    fp8 = k_cache.dtype == nl.uint8
+    d_tiles = _tiles(head, CONTRACT_TILE)
+    i_p = nl.arange(STATIONARY_TILE)[:, None]
+    i_s = nl.arange(STATIONARY_TILE)[None, :]
+    i_q = nl.arange(queries)[None, :]
+    i_h = nl.arange(head)[None, :]
+    i_r = nl.arange(queries)[:, None]
+    limits = nl.load(limit)
+    identity = nisa.affine_select(i_p - i_s == 0, nl.ones((nl.par_dim(STATIONARY_TILE), STATIONARY_TILE), dtype=nl.bfloat16, buffer=nl.sbuf), 0.0)
+    identity_fp8 = nisa.tensor_copy(identity, dtype=nl.float8_e4m3) if fp8 else identity
+
+    # Pair p's columns of a ``[128, queries]`` tile.
+    ones = nl.full((nl.par_dim(STATIONARY_TILE), queries), 1.0, dtype=nl.bfloat16, buffer=nl.sbuf)
+    columns = []
+    for p in list(range(pairs)):
+        mine = nisa.affine_select(i_q - p * groups + 0 * i_p >= 0, ones, 0.0)
+        columns.append(nisa.affine_select((p + 1) * groups - 1 - i_q + 0 * i_p >= 0, mine, 0.0))
+
+    # Queries with head dims on partitions, as the Tensor Engine contracts, and per pair a copy of only its columns.
+    q_rows = nl.load(q)
+    q_pair = [[] for _ in list(range(pairs))]
+    for d0, ds in d_tiles:
+        flipped = _transposed(q_rows[:, d0 : d0 + ds], ds, queries, q.dtype, identity[0:queries, 0:queries])
+        for p in list(range(pairs)):
+            q_pair[p].append(nisa.tensor_tensor(flipped, columns[p][0:ds, :], op=nl.multiply, dtype=q.dtype))
+
+    best = nl.full((nl.par_dim(queries), 1), MASKED, dtype=nl.float32, buffer=nl.sbuf)
+    total = nl.zeros((nl.par_dim(queries), 1), dtype=nl.float32, buffer=nl.sbuf)
+    acc = nl.zeros((nl.par_dim(queries), head), dtype=nl.float32, buffer=nl.sbuf)
+
+    # Caches by pair and step of DECODE_SPLIT blocks, so the loop variable indexes steps directly and every load is
+    # one contiguous DMA. A step's blocks have their own buffers and are taken stage by stage, so one block's loads
+    # and transposes overlap the other's softmax. The step's positions are carried from step to step.
+    step = DECODE_SPLIT * DECODE_BLOCK
+    k_steps = k_cache.reshape((pairs, positions // step, DECODE_SPLIT, DECODE_BLOCK, head))
+    v_steps = v_cache.reshape((pairs, positions // step, DECODE_SPLIT, DECODE_BLOCK, head))
+    later = nisa.iota(nl.arange(step)[None, :] + 0 * i_r, dtype=nl.float32)
+    halves = list(range(DECODE_SPLIT))
+    for b in range(scalar(count)):
+        raw = [[[] for _ in list(range(pairs))] for _ in halves]
+        for half in halves:
+            for p in list(range(pairs)):
+                for k0 in list(range(0, DECODE_BLOCK, STATIONARY_TILE)):
+                    rows = nl.load(k_steps[p, b, half, k0 + i_p, i_h])
+                    cached_values = nl.load(v_steps[p, b, half, k0 + i_p, i_h])
+                    raw[half][p].append((rows, cached_values))
+        keys = [[] for _ in halves]
+        values = [[] for _ in halves]
+        masked = []
+        for half in halves:
+            for p in list(range(pairs)):
+                pair_keys = [nl.ndarray((nl.par_dim(ds), DECODE_BLOCK), dtype=q.dtype, buffer=nl.sbuf) for _, ds in d_tiles]
+                pair_values = []
+                for k, (rows, cached_values) in enumerate(raw[half][p]):
+                    if fp8:
+                        # FP8 keys stay FP8 for the transpose, which writes BF16. Values become BF16 on an engine
+                        # this kernel leaves mostly idle.
+                        rows = rows.view(nl.float8_e4m3)
+                        cached_values = nisa.tensor_copy(cached_values.view(nl.float8_e4m3), dtype=nl.bfloat16, engine=DECODE_CONVERT_ENGINE)
+                    pair_values.append(cached_values)
+                    for d, (d0, ds) in enumerate(d_tiles):
+                        pair_keys[d][:, k * STATIONARY_TILE : (k + 1) * STATIONARY_TILE] = _transposed(rows[:, d0 : d0 + ds], ds, STATIONARY_TILE, q.dtype, identity_fp8)
+                keys[half].append(pair_keys)
+                values[half].append(pair_values)
+            tile = nl.ndarray((nl.par_dim(queries), DECODE_BLOCK), dtype=nl.float32, buffer=nl.sbuf)
+            for j0 in list(range(0, DECODE_BLOCK, OUTPUT_TILE)):
+                scores = nl.zeros((nl.par_dim(queries), OUTPUT_TILE), nl.float32, buffer=nl.psum)
+                for p in list(range(pairs)):
+                    for d, _ in enumerate(d_tiles):
+                        scores += nisa.nc_matmul(q_pair[p][d], keys[half][p][d][:, j0 : j0 + OUTPUT_TILE])
+                # A row sees the cache positions before its own.
+                at = half * DECODE_BLOCK + j0
+                bias = nisa.tensor_scalar(later[:, at : at + OUTPUT_TILE], nl.greater_equal, limits, op1=nl.multiply, operand1=MASKED)
+                tile[:, j0 : j0 + OUTPUT_TILE] = nisa.tensor_tensor(scores, bias, op=nl.add, dtype=nl.float32)
+            masked.append(tile)
+
+        for half in halves:
+            new_best = nisa.tensor_tensor(best, nisa.tensor_reduce(nl.maximum, masked[half], axis=[1], keepdims=True), op=nl.maximum)
+            negative = nisa.tensor_scalar(new_best, nl.multiply, -1.0)
+            row_sum = nl.ndarray((nl.par_dim(queries), 1), dtype=nl.float32, buffer=nl.sbuf)
+            weights = nisa.activation_reduce(nl.exp, masked[half], reduce_op=nl.add, reduce_res=row_sum, bias=negative, dtype=nl.bfloat16)
+            rescale = nisa.activation(nl.exp, best, bias=negative)
+            total[...] = nisa.scalar_tensor_tensor(data=total, op0=nl.multiply, operand0=rescale, op1=nl.add, operand1=row_sum)
+            mixed = nl.zeros((nl.par_dim(queries), head), nl.float32, buffer=nl.psum)
+            for k, k0 in enumerate(list(range(0, DECODE_BLOCK, STATIONARY_TILE))):
+                flipped = _transposed(weights[:, k0 : k0 + STATIONARY_TILE], STATIONARY_TILE, queries, nl.bfloat16, identity[0:queries, 0:queries])
+                for p in list(range(pairs)):
+                    mine = nisa.tensor_tensor(flipped, columns[p], op=nl.multiply, dtype=nl.bfloat16)
+                    mixed += nisa.nc_matmul(mine, values[half][p][k])
+            acc[...] = nisa.scalar_tensor_tensor(data=acc, op0=nl.multiply, operand0=rescale, op1=nl.add, operand1=mixed)
+            best[...] = new_best
+        later[...] = nisa.tensor_scalar(later, nl.add, float(step))
+
+    # The step's own key and value, one per query row.
+    own_key = nl.load(k_own)
+    own_value = nl.load(v_own)
+    own = nisa.tensor_reduce(nl.add, nisa.tensor_tensor(q_rows, own_key, op=nl.multiply, dtype=nl.float32), axis=[1], keepdims=True)
+    new_best = nisa.tensor_tensor(best, own, op=nl.maximum)
+    negative = nisa.tensor_scalar(new_best, nl.multiply, -1.0)
+    weight = nisa.activation(nl.exp, own, bias=negative)
+    rescale = nisa.activation(nl.exp, best, bias=negative)
+    total = nisa.scalar_tensor_tensor(data=total, op0=nl.multiply, operand0=rescale, op1=nl.add, operand1=weight)
+    taken = nisa.tensor_scalar(own_value, nl.multiply, weight, dtype=nl.float32)
+    acc = nisa.scalar_tensor_tensor(data=acc, op0=nl.multiply, operand0=rescale, op1=nl.add, operand1=taken)
+    nl.store(out, nisa.tensor_scalar(acc, nl.multiply, nisa.reciprocal(total), dtype=q.dtype))
 
 
 PIECE = 128
@@ -499,8 +687,10 @@ def delta_prefill_body(
 
 
 fp8_linear = nki.jit(fp8_linear_body)
+fp8_encode = nki.jit(fp8_encode_body)
 delta_prefill = nki.jit(delta_prefill_body)
 # Loops with a trip count read at run time need these, as the SDK's own dynamic-loop kernels use.
 DYNAMIC_LOOP_FLAGS = "experimental-native-scalar-support, experimental-local-tensor-parent"
 prefill_attention = nki.compiler.skip_middle_end_transformations(nki.jit(prefill_attention_body, experimental_flags=DYNAMIC_LOOP_FLAGS))
+decode_attention = nki.compiler.skip_middle_end_transformations(nki.jit(decode_attention_body, experimental_flags=DYNAMIC_LOOP_FLAGS))
 lm_head_group_maxima = nki.jit(lm_head_group_maxima_body)

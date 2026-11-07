@@ -342,3 +342,39 @@ def test_all_text_tensors_are_consumed():
     checkpoint.rank_weights(source, cfg, 0, 1)
     host_only = {checkpoint.EMBED_TOKENS, checkpoint.FINAL_NORM, checkpoint.LM_HEAD}
     assert set(tensors) - source.read == host_only
+
+
+def test_adding_kv_scales_to_bf16_cache_weights_matches_cutting_for_fp8(tmp_path):
+    """`prepare_weights.py --reuse`: links to BF16-cache files plus the FP8 cache's scales load as cutting for FP8 writes."""
+    cfg = tiny_config(num_blocks=3)
+    _, tensors = build_reference(cfg)
+    for index, kind in enumerate(cfg.layer_types):
+        if kind == "full_attention":
+            for name in ("k_scale", "v_scale"):
+                tensors[f"model.language_model.layers.{index}.self_attn.{name}"] = torch.tensor([0.01 * (index + 1)], dtype=torch.bfloat16)
+    source = checkpoint.DictSource(tensors)
+    fp8 = replace(cfg, kv_cache_format="fp8")
+    checkpoint.write_rank_weights(source, cfg, tmp_path / "bf16", 4, 2)
+    (tmp_path / "bf16" / "head_tp0.safetensors").write_bytes(b"lm_head stand-in")
+    checkpoint.add_kv_scales(source, fp8, tmp_path / "bf16", tmp_path / "reused", 4, 2)
+    checkpoint.write_rank_weights(source, fp8, tmp_path / "cut", 4, 2)
+    for block in range(3):
+        for rank in range(2):
+            got = checkpoint.load_rank_block(tmp_path / "reused", block, rank)
+            want = checkpoint.load_rank_block(tmp_path / "cut", block, rank)
+            assert got.keys() == want.keys() and any(name.endswith("k_scale") for name in got)
+            assert all(torch.equal(got[name], want[name]) for name in want)
+    assert (tmp_path / "reused" / "head_tp0.safetensors").read_bytes() == b"lm_head stand-in"
+    scale = checkpoint.load_rank_block(tmp_path / "cut", 0, 0)["layers.3.self_attn.k_scale"]
+    assert torch.allclose(scale.float(), torch.tensor([0.04 * 448 / 240]), rtol=1e-2)
+
+
+def test_fp8_cache_bytes_are_the_chips_e4m3_bytes():
+    """The CPU path encodes with torch's e4m3fn. Up to 240, the chip's largest e4m3 value, it must give the same
+    bytes as IEEE-style e4m3: sign, 4 exponent bits with bias 7 and 3 mantissa bits, rounding to nearest even."""
+    values = torch.linspace(-240, 240, 200001)
+    coded = values.to(torch.float8_e4m3fn).view(torch.uint8).long()
+    sign, exponent, mantissa = coded >> 7, (coded >> 3) & 15, coded & 7
+    assert int(exponent.max()) <= 14, "exponent 15 is infinity or NaN in the chip's e4m3"
+    decoded = torch.where(exponent > 0, (1 + mantissa / 8) * 2.0 ** (exponent - 7), mantissa / 8 * 2.0**-6) * (1 - 2 * sign)
+    assert torch.equal(decoded.float(), values.to(torch.float8_e4m3fn).float())

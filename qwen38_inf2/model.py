@@ -35,7 +35,10 @@ DELTA_CHUNK = 128
 # Cache positions per piece of prefill attention, which bounds the size of its score matrix.
 ATTENTION_BLOCK = 2048
 # The largest FP8 e4m3 value, as the checkpoint's KV-cache scales assume.
-FP8_E4M3_MAX = 448.0
+# The KV cache's FP8 is NeuronCore-v2's e4m3, whose largest finite value is 240, unlike OCP e4m3fn's 448. Up to
+# 240 the two share every byte, so the CPU path encodes with torch's e4m3fn and gets the chip's bytes. The
+# checkpoint's scales, calibrated for 448, are stretched by 448 / 240 when loaded (`checkpoint.KV_SCALE_STRETCH`).
+FP8_E4M3_MAX = 240.0
 
 
 def identity_all_reduce(x: torch.Tensor) -> torch.Tensor:
@@ -186,13 +189,6 @@ def blocked_attention(query: torch.Tensor, keys: torch.Tensor, values: torch.Ten
         out = out * rescale + (weights.to(values.dtype) @ values[:, first : first + block]).float()
         best = new_best
     return out / total
-
-
-def _scatter(cache: torch.Tensor, dim: int, index: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
-    """`Tensor.scatter`. PyTorch's CPU scatter has no FP8 kernel but XLA's does, so only the CPU path goes through bytes."""
-    if cache.device.type == "cpu" and cache.dtype == torch.float8_e4m3fn:
-        return cache.view(torch.uint8).scatter(dim, index, values.view(torch.uint8)).view(torch.float8_e4m3fn)
-    return cache.scatter(dim, index, values)
 
 
 def _frozen(*shape: int, dtype: torch.dtype) -> nn.Parameter:
@@ -393,8 +389,8 @@ class FullAttentionStep(nn.Module):
     prefill graph serves sequences of up to `max_seq_len - chunk` positions.
 
     `cfg.kv_cache_format` "fp8" stores the cache as FP8 e4m3 with the checkpoint's static per-layer scales, the
-    format it was calibrated for, at half the memory. Only the CPU path runs it so far: the compiler accepts FP8
-    only inside NKI kernels.
+    format it was calibrated for, at half the memory. The compiler accepts FP8 only inside NKI kernels, so the cache
+    holds the bytes as uint8: on the chip `kernels.fp8_encode` makes them and the attention kernels read them.
     """
 
     def __init__(
@@ -416,7 +412,7 @@ class FullAttentionStep(nn.Module):
         self.k_norm_weight = _frozen(head, dtype=dtype)
 
         self.fp8_cache = cfg.kv_cache_format == "fp8"
-        cache_dtype = torch.float8_e4m3fn if self.fp8_cache else dtype
+        cache_dtype = torch.uint8 if self.fp8_cache else dtype
         if self.fp8_cache:
             self.k_scale = _frozen(1, dtype=dtype)
             self.v_scale = _frozen(1, dtype=dtype)
@@ -438,24 +434,35 @@ class FullAttentionStep(nn.Module):
         return query, key, value, gate.reshape(rows, tokens, self.num_heads * head)
 
     def _store(self, t: torch.Tensor, scale) -> torch.Tensor:
+        """What the cache holds for `t`: itself, or FP8 bytes of ``t / scale``."""
         if not self.fp8_cache:
             return t
-        return (t.float() / scale.float()).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+        if t.device.type != "cpu":
+            return self._encode(t, scale)[0]
+        return (t.float() / scale.float()).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn).view(torch.uint8)
 
     def _load(self, t: torch.Tensor, scale, dtype: torch.dtype) -> torch.Tensor:
-        return (t.to(dtype) * scale).to(dtype) if self.fp8_cache else t
+        """Cached values back from `_store`. CPU only for FP8: on the chip the kernels read the bytes."""
+        return (t.view(torch.float8_e4m3fn).to(dtype) * scale).to(dtype) if self.fp8_cache else t
 
     def _round_trip(self, t: torch.Tensor, scale, dtype: torch.dtype) -> torch.Tensor:
         """A key or value as it reads back from the cache, so a step sees its own the way later steps will."""
         return self._load(self._store(t, scale), scale, dtype)
 
-    def _write_both(self, key, value, positions, scales):
-        """Write keys and values ``[rows, kv_heads, n, head]`` at each row's ``positions`` ``[rows, n]``."""
-        k_scale, v_scale = scales
+    def _encode(self, t: torch.Tensor, scale) -> tuple[torch.Tensor, torch.Tensor]:
+        """On the chip, FP8 bytes of ``t / scale`` ``[..., head]`` and the values they hold, in units of `scale`."""
+        from .kernels import fp8_encode
+
+        inverse = (1.0 / scale.float()).reshape(1, 1).expand(128, 1)
+        coded, held = fp8_encode(t.reshape(-1, t.shape[-1]), inverse)
+        return coded.reshape(t.shape), held.reshape(t.shape)
+
+    def _write_both(self, key, value, positions):
+        """Write cached keys and values ``[rows, kv_heads, n, head]``, from `_store`, at each row's ``positions`` ``[rows, n]``."""
         rows, kv_heads, n, head = key.shape
         at = positions.reshape(rows, 1, n, 1).expand(-1, kv_heads, -1, head)
-        self.k_cache = _scatter(self.k_cache, 2, at, self._store(key, k_scale))
-        self.v_cache = _scatter(self.v_cache, 2, at, self._store(value, v_scale))
+        self.k_cache = self.k_cache.scatter(2, at, key)
+        self.v_cache = self.v_cache.scatter(2, at, value)
 
     def forward(self, x, cos, sin, position, active) -> torch.Tensor:
         """One token per row at `position`. A row with `active` 0 leaves its cache unchanged."""
@@ -468,6 +475,12 @@ class FullAttentionStep(nn.Module):
 
         groups = cfg.num_key_value_groups
         grouped = query.reshape(batch, self.num_kv_heads, groups, head)
+        where = torch.where(active > 0.5, position.long(), self.max_seq_len - 1).unsqueeze(-1)
+        if self.fp8_cache and device.type != "cpu":
+            out, k_coded, v_coded = self._decode_fp8(grouped, key, value, position, scales)
+            self._write_both(k_coded, v_coded, where)
+            return self.all_reduce(self.o_proj(out * torch.sigmoid(gate)))
+
         keys = self._load(self.k_cache, scales[0], x.dtype)
         values = self._load(self.v_cache, scales[1], x.dtype)
         earlier = torch.arange(self.max_seq_len, device=device) < position.unsqueeze(-1)
@@ -479,9 +492,29 @@ class FullAttentionStep(nn.Module):
         out = torch.matmul(weights[..., :-1], values) + weights[..., -1:] * own_value
         out = out.reshape(batch, 1, self.num_heads * head)
 
-        where = torch.where(active > 0.5, position.long(), self.max_seq_len - 1).unsqueeze(-1)
-        self._write_both(key, value, where, scales)
+        self._write_both(self._store(key, scales[0]), self._store(value, scales[1]), where)
         return self.all_reduce(self.o_proj(out * torch.sigmoid(gate)))
+
+    def _decode_fp8(self, grouped, key, value, position, scales):
+        """Decode attention on the chip over the FP8 cache, in the kernel since XLA can't read FP8. Returns the output
+        ``[batch, 1, heads * head]`` and the step's key and value as cache bytes."""
+        from .kernels import DECODE_STEP, decode_attention
+
+        k_scale, v_scale = scales
+        batch, kv_heads, groups, head = grouped.shape
+        k_coded, k_held = self._encode(key, k_scale)
+        v_coded, v_held = self._encode(value, v_scale)
+        # Cached keys are in units of k_scale, so the queries take it instead.
+        q = (grouped.float() * (head**-0.5 * k_scale.float())).to(grouped.dtype).reshape(-1, head)
+        per_query = lambda t: t.reshape(batch * kv_heads, 1, head).expand(-1, groups, -1).reshape(-1, head)  # noqa: E731
+        limit = position.float().reshape(batch, 1).expand(-1, kv_heads * groups).reshape(-1, 1)
+        blocks = torch.div(position.max().int() + DECODE_STEP - 1, DECODE_STEP, rounding_mode="floor").reshape(1, 1)
+        out = decode_attention(
+            q, self.k_cache.reshape(-1, head), self.v_cache.reshape(-1, head), per_query(k_held), per_query(v_held), limit, blocks,
+            groups=groups, positions=self.max_seq_len,
+        )
+        out = (out.float() * v_scale.float()).to(grouped.dtype).reshape(batch, 1, kv_heads * groups * head)
+        return out, k_coded, v_coded
 
     def prefill(self, x, cos, sin, slot, start, n_valid) -> torch.Tensor:
         """A chunk of one row's tokens from position `start`. Padding past `n_valid` is written but never read
@@ -496,8 +529,16 @@ class FullAttentionStep(nn.Module):
 
         # A KV head's query heads stacked, so query g * tokens + i is head g's token i.
         grouped = (query[0] * head**-0.5).reshape(self.num_kv_heads, groups * tokens, head)
-        own_keys = self._round_trip(key[0], scales[0], x.dtype)
-        own_values = self._round_trip(value[0], scales[1], x.dtype)
+        if self.fp8_cache and device.type != "cpu":
+            # The kernel works in units of the scales: cached bytes and the chunk's own values as the bytes hold them.
+            k_coded, own_keys = self._encode(key, scales[0])
+            v_coded, own_values = self._encode(value, scales[1])
+            grouped = (grouped.float() * scales[0].float()).to(x.dtype)
+            own_keys, own_values = own_keys[0], own_values[0]
+        else:
+            k_coded, v_coded = self._store(key, scales[0]), self._store(value, scales[1])
+            own_keys = self._round_trip(key[0], scales[0], x.dtype)
+            own_values = self._round_trip(value[0], scales[1], x.dtype)
         if device.type == "cpu":
             cache_keys = self._load(self.k_cache.index_select(0, slot.long())[0], scales[0], x.dtype)
             cache_values = self._load(self.v_cache.index_select(0, slot.long())[0], scales[1], x.dtype)
@@ -517,13 +558,15 @@ class FullAttentionStep(nn.Module):
             from .kernels import KEY_BLOCK, prefill_attention
 
             starts = start.float().reshape(1, 1).expand(128, 1)
-            first_row = (slot.int() * self.num_kv_heads * self.max_seq_len).reshape(1, 1).expand(128, 1)
+            first_block = (slot.int() * (self.num_kv_heads * self.max_seq_len // KEY_BLOCK)).reshape(1, 1)
             # Only the cache blocks before `start` hold this row's keys, and the kernel visits only those.
             blocks = torch.div(start.int() + KEY_BLOCK - 1, KEY_BLOCK, rounding_mode="floor").reshape(1, 1)
             out = prefill_attention(
                 grouped.transpose(1, 2), self.k_cache.reshape(-1, head), self.v_cache.reshape(-1, head),
-                own_keys.transpose(1, 2), own_values, starts, first_row, blocks, positions=self.max_seq_len,
+                own_keys.transpose(1, 2), own_values, starts, first_block, blocks, positions=self.max_seq_len,
             )
+            if self.fp8_cache:
+                out = out.float() * scales[1].float()
         out = out.to(x.dtype).reshape(self.num_heads, tokens, head).transpose(0, 1).reshape(1, tokens, self.num_heads * head)
 
         # Every row gets a chunk of positions: `slot` its own, the others the junk positions at the end.
@@ -532,7 +575,7 @@ class FullAttentionStep(nn.Module):
         junk = self.max_seq_len - tokens + torch.arange(tokens, device=device)
         others = torch.arange(rows, device=device) != slot.long()
         where = torch.where(others.unsqueeze(-1), junk.unsqueeze(0), positions.unsqueeze(0))
-        self._write_both(key.expand(rows, -1, -1, -1), value.expand(rows, -1, -1, -1), where, scales)
+        self._write_both(k_coded.expand(rows, -1, -1, -1), v_coded.expand(rows, -1, -1, -1), where)
         return self.all_reduce(self.o_proj(out * torch.sigmoid(gate)))
 
 

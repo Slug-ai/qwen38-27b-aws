@@ -2,7 +2,7 @@
 
 Runs the text part of [RedHatAI/Qwen3.8-27B-MXFP4](https://huggingface.co/RedHatAI/Qwen3.8-27B-MXFP4) on one AWS Inferentia2 chip (two NeuronCores), with its FP4 weights converted to FP8 and greedy decoding.
 
-**Status: runs end to end on a real `inf2.xlarge`.** On coding-agent requests of 8K to 30K prompt tokens with a 32K context, 912 tokens/s in all, nearly all of them prompt tokens, and 182 requests per hour, measured. With prompt plus output capped at 512 tokens, which no agent request fits, 156.20 generated tokens/s at batch 63. See [the throughput log](docs/throughput.md) and [the field notes](docs/field_notes.md), which cover setup on the Amazon Linux Neuron AMI.
+**Status: runs end to end on a real `inf2.xlarge`.** On coding-agent requests of 8K to 30K prompt tokens with a 32K context, 987 tokens/s in all, nearly all of them prompt tokens, and 197 requests per hour, measured. With prompt plus output capped at 512 tokens, which no agent request fits, 156.20 generated tokens/s at batch 63. See [the throughput log](docs/throughput.md) and [the field notes](docs/field_notes.md), which cover setup on the Amazon Linux Neuron AMI.
 
 **Goal: maximum throughput, not latency.** Every design choice is judged by total tokens per second across all sequences. Time per token doesn't matter, so large batches and slow steps are fine.
 
@@ -43,16 +43,17 @@ These choices change some outputs. Against an earlier float32-state build at bat
 
 ## Run the agentic build
 
-32K context, 2 rows, with a prefill graph. The layers compile in about 12 minutes on the `inf2.xlarge` itself. Run long jobs there with a memory cap, for example `systemd-run --scope -p MemoryMax=12G`, because running out of memory makes that instance stop answering instead of killing the job.
+32K context, 4 rows, an FP8 KV cache and a prefill graph. The layers compile in about 9 minutes on the `inf2.xlarge` itself. Run long jobs there with a memory cap, for example `systemd-run --scope -p MemoryMax=12G`, because running out of memory makes that instance stop answering instead of killing the job.
 
 ```bash
-python scripts/compile.py --config model/config.json --layers 16 --max-seq-len 32768 --batch-size 2 \
-  --weight-format fp8 --recurrent-state bf16 --chunk 512 --output artifacts/block16_b2_s32k_c512
-python scripts/compile.py --config model/config.json --head --head-format fp8 --batch-size 2 --output artifacts/head_fp8_b2
-python scripts/agentic_benchmark.py --model-dir model --compiled artifacts/block16_b2_s32k_c512 --head artifacts/head_fp8_b2 --weights weights_fp8
+python scripts/compile.py --config model/config.json --layers 16 --max-seq-len 32768 --batch-size 4 \
+  --weight-format fp8 --recurrent-state bf16 --kv-cache fp8 --chunk 512 --output artifacts/block16_b4_s32k_c512_kv8
+python scripts/compile.py --config model/config.json --head --head-format fp8 --batch-size 4 --output artifacts/head_fp8_b4
+python scripts/prepare_weights.py --model-dir model --compiled artifacts/block16_b4_s32k_c512_kv8 --output weights_fp8_kv8 --reuse weights_fp8
+python scripts/agentic_benchmark.py --model-dir model --compiled artifacts/block16_b4_s32k_c512_kv8 --head artifacts/head_fp8_b4 --weights weights_fp8_kv8
 ```
 
-The weights are the same files as the 512-token build's, prepared as below. `scripts/quality_check.py` with the same arguments also checks the prefill path against decode.
+`weights_fp8` holds the same files as the 512-token build's, prepared as below, and `--reuse` links to them, adding small files of the KV cache's scales. With `--kv-cache bf16` only 2 rows fit at 32K, and those weights work as they are. `scripts/quality_check.py` with the same arguments also checks the prefill path against decode.
 
 ## Run the 512-token build
 
