@@ -38,7 +38,14 @@ def run(loaded, prompts, max_new_tokens: int, use_prefill: bool = True) -> tuple
     for index, token_id in scheduler.run(prompts, max_new_tokens):
         outputs[index].append(token_id)
     seconds = time.perf_counter() - started
-    return outputs, seconds, {"prompt_path": "prefill", "prefill_calls": scheduler.prefill_calls, "decode_calls": scheduler.decode_calls}
+    return outputs, seconds, {
+        "prompt_path": "prefill",
+        "prefill_calls": scheduler.prefill_calls,
+        "decode_calls": scheduler.decode_calls,
+        "prefill_seconds": scheduler.prefill_seconds,
+        "decode_seconds": scheduler.decode_seconds,
+        "mean_rows_per_decode_step": scheduler.decode_rows / max(scheduler.decode_calls, 1),
+    }
 
 
 def summarize(requests, outputs, seconds: float, golden_ok: bool, needle_found: bool, batch_size: int, max_seq_len: int) -> dict:
@@ -59,6 +66,8 @@ def summarize(requests, outputs, seconds: float, golden_ok: bool, needle_found: 
         "requests_per_hour": len(requests) * 3600 / seconds,
         "golden_row_matches": golden_ok,
         "needle_found": needle_found,
+        # Greedy answers end where the model stops, so a numerics change can change how much is generated.
+        "generated_per_request": [len(o) for o in outputs],
     }
 
 
@@ -77,6 +86,11 @@ def report(numbers: dict, load_seconds: float, answer: str) -> str:
             f"Output            {numbers['output_tokens_per_second']:.2f} tok/s",
             f"Total             {numbers['total_tokens_per_second']:.1f} tok/s",
             f"Requests          {numbers['requests_per_hour']:.0f} per hour",
+            *(
+                [f"Split             prefill {numbers['prefill_seconds']:.1f} s over {numbers['prefill_calls']} calls, decode {numbers['decode_seconds']:.1f} s over {numbers['decode_calls']} steps of {numbers['mean_rows_per_decode_step']:.2f} rows"]
+                if "prefill_seconds" in numbers
+                else []
+            ),
             f"Correct           {'yes' if ok else 'NO: ' + ('saved greedy prompt differs' if not numbers['golden_row_matches'] else 'needle not found')}",
         ]
     )

@@ -9,6 +9,7 @@ work is fixed by the prompts, so total time is lowest when each decode step has 
 Waiting rows lose latency, not throughput.
 """
 
+import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 
@@ -62,10 +63,15 @@ class Scheduler:
         self.dtype = dtype
         self.prefill_calls = 0
         self.decode_calls = 0
+        # Where the time goes: prefill calls including the first token's head, and decode steps including theirs.
+        self.prefill_seconds = 0.0
+        self.decode_seconds = 0.0
+        self.decode_rows = 0
 
     def _prefill(self, slot: int, row: _Row) -> int:
         """Write the whole prompt to `slot` in chunks, and return the first new token."""
         hidden = None
+        started = time.perf_counter()
         for start in range(0, row.prompt_len, self.chunk):
             ids = row.ids[start : start + self.chunk]
             n_valid = len(ids)
@@ -73,7 +79,9 @@ class Scheduler:
             hidden = self.prefill(inputs_embeds=embeds, **prefill_inputs(self.cfg, slot, start, n_valid, self.chunk, self.dtype))
             self.prefill_calls += 1
         row.written = row.prompt_len
-        return self.head.next_tokens(hidden[:, n_valid - 1 : n_valid])[0]
+        token_id = self.head.next_tokens(hidden[:, n_valid - 1 : n_valid])[0]
+        self.prefill_seconds += time.perf_counter() - started
+        return token_id
 
     def _finished(self, row: _Row, token_id: int, max_new_tokens: int) -> bool:
         # The next decode step would write position row.written. The cache's last `chunk` positions take junk writes.
@@ -107,10 +115,14 @@ class Scheduler:
             positions = [row.written if row else 0 for row in slots]
             active = [row is not None for row in slots]
             last = [row.ids[-1] if row else 0 for row in slots]
+            started = time.perf_counter()
             hidden = self.decode(inputs_embeds=self.head.embed_batch(last, self.dtype), **batch_step_inputs(self.cfg, positions, self.max_seq_len, self.dtype, active))
             self.decode_calls += 1
             ready = [slot for slot, row in enumerate(slots) if row]
-            for slot, token_id in zip(ready, self.head.next_tokens(hidden[ready])):
+            chosen = self.head.next_tokens(hidden[ready])
+            self.decode_seconds += time.perf_counter() - started
+            self.decode_rows += len(ready)
+            for slot, token_id in zip(ready, chosen):
                 row = slots[slot]
                 row.written += 1
                 row.new += 1
