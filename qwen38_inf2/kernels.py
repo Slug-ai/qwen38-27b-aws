@@ -136,6 +136,8 @@ MASKED = -30000.0
 # fewer, larger blocks hide more of that latency: at 32K positions 512 took 10.4 ms per layer, 2048 8.2 ms and
 # 4096 9.0 ms.
 KEY_BLOCK = 2048
+# Query tiles whose steps the prefill attention kernel emits in turn.
+PREFILL_Q_GROUP = 8
 
 
 # The largest finite FP8 e4m3 value on NeuronCore-v2, whose e4m3 has infinities, unlike OCP e4m3fn's 448.
@@ -175,6 +177,35 @@ def _transposed(tile, rows: int, cols: int, dtype, identity):
     flipped = nl.zeros((nl.par_dim(rows), cols), nl.float32, buffer=nl.psum)
     flipped += nisa.nc_matmul(tile, identity)
     return nisa.tensor_copy(flipped, dtype=dtype)
+
+
+def _attend_tile(q_sb, q0, keys, values, bias, block: int, state, identity, d_tiles, head: int):
+    """One 128-query tile's share of a block of keys for `_prefill_attention`: scores, the online softmax's update,
+    and the weighted values. A generator yielding between dependent stages, so `_interleave` can overlap tiles."""
+    best, total, acc = state
+    qs = STATIONARY_TILE
+    masked = nl.ndarray((nl.par_dim(qs), block), dtype=nl.float32, buffer=nl.sbuf)
+    for j0 in list(range(0, block, OUTPUT_TILE)):
+        scores = nl.zeros((nl.par_dim(qs), OUTPUT_TILE), nl.float32, buffer=nl.psum)
+        for d, (d0, ds) in enumerate(d_tiles):
+            scores += nisa.nc_matmul(q_sb[d][:, q0 : q0 + qs], keys[d][:, j0 : j0 + OUTPUT_TILE])
+        masked[:, j0 : j0 + OUTPUT_TILE] = nisa.tensor_tensor(scores, bias[:, j0 : j0 + OUTPUT_TILE], op=nl.add, dtype=nl.float32)
+    yield
+    new_best = nisa.tensor_tensor(best, nisa.tensor_reduce(nl.maximum, masked, axis=[1], keepdims=True), op=nl.maximum)
+    negative = nisa.tensor_scalar(new_best, nl.multiply, -1.0)
+    row_sum = nl.ndarray((nl.par_dim(qs), 1), dtype=nl.float32, buffer=nl.sbuf)
+    weights = nisa.activation_reduce(nl.exp, masked, reduce_op=nl.add, reduce_res=row_sum, bias=negative, dtype=nl.bfloat16)
+    rescale = nisa.activation(nl.exp, best, bias=negative)
+    total[...] = nisa.scalar_tensor_tensor(data=total, op0=nl.multiply, operand0=rescale, op1=nl.add, operand1=row_sum)
+    yield
+    flipped = [_transposed(weights[:, k0 : k0 + STATIONARY_TILE], STATIONARY_TILE, qs, nl.bfloat16, identity) for k0 in list(range(0, block, STATIONARY_TILE))]
+    yield
+    mixed = nl.zeros((nl.par_dim(qs), head), nl.float32, buffer=nl.psum)
+    for k, tile in enumerate(flipped):
+        mixed += nisa.nc_matmul(tile, values[k])
+    acc[...] = nisa.scalar_tensor_tensor(data=acc, op0=nl.multiply, operand0=rescale, op1=nl.add, operand1=mixed)
+    best[...] = new_best
+    yield
 
 
 def prefill_attention_body(
@@ -237,25 +268,13 @@ def _prefill_attention(q, k_cache, v_cache, k_new, v_new, start, first_block, co
         acc = [nl.zeros((nl.par_dim(STATIONARY_TILE), head), dtype=nl.float32, buffer=nl.sbuf) for _ in q_tiles]
 
         def attend(keys, values, biases, block):
-            """One block of keys for every query tile. `biases[t]` is the mask added to query tile t's scores."""
-            for t, (q0, qs) in enumerate(q_tiles):
-                masked = nl.ndarray((nl.par_dim(qs), block), dtype=nl.float32, buffer=nl.sbuf)
-                for j0 in list(range(0, block, OUTPUT_TILE)):
-                    scores = nl.zeros((nl.par_dim(qs), OUTPUT_TILE), nl.float32, buffer=nl.psum)
-                    for d, (d0, ds) in enumerate(d_tiles):
-                        scores += nisa.nc_matmul(q_sb[d][:, q0 : q0 + qs], keys[d][:, j0 : j0 + OUTPUT_TILE])
-                    masked[:, j0 : j0 + OUTPUT_TILE] = nisa.tensor_tensor(scores, biases[t][:, j0 : j0 + OUTPUT_TILE], op=nl.add, dtype=nl.float32)
-                new_best = nisa.tensor_tensor(best[t], nisa.tensor_reduce(nl.maximum, masked, axis=[1], keepdims=True), op=nl.maximum)
-                negative = nisa.tensor_scalar(new_best, nl.multiply, -1.0)
-                row_sum = nl.ndarray((nl.par_dim(qs), 1), dtype=nl.float32, buffer=nl.sbuf)
-                weights = nisa.activation_reduce(nl.exp, masked, reduce_op=nl.add, reduce_res=row_sum, bias=negative, dtype=nl.bfloat16)
-                rescale = nisa.activation(nl.exp, best[t], bias=negative)
-                total[t][...] = nisa.scalar_tensor_tensor(data=total[t], op0=nl.multiply, operand0=rescale, op1=nl.add, operand1=row_sum)
-                mixed = nl.zeros((nl.par_dim(qs), head), nl.float32, buffer=nl.psum)
-                for k, k0 in enumerate(list(range(0, block, STATIONARY_TILE))):
-                    mixed += nisa.nc_matmul(_transposed(weights[:, k0 : k0 + STATIONARY_TILE], STATIONARY_TILE, qs, nl.bfloat16, identity), values[k])
-                acc[t][...] = nisa.scalar_tensor_tensor(data=acc[t], op0=nl.multiply, operand0=rescale, op1=nl.add, operand1=mixed)
-                best[t][...] = new_best
+            """One block of keys for every query tile, `PREFILL_Q_GROUP` tiles' steps at a time in turn.
+            `biases[t]` is the mask added to query tile t's scores."""
+            for g0 in list(range(0, len(q_tiles), PREFILL_Q_GROUP)):
+                group = list(range(g0, min(g0 + PREFILL_Q_GROUP, len(q_tiles))))
+                _interleave(
+                    [_attend_tile(q_sb, q_tiles[t][0], keys, values, biases[t], block, (best[t], total[t], acc[t]), identity, d_tiles, head) for t in group]
+                )
 
         # A device loop with a run-time trip count, so code size doesn't grow with the cache and time grows only
         # with the row's keys. The block's index and its positions are carried from block to block.
