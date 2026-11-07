@@ -29,6 +29,9 @@ class Loaded:
     # The prefill graph, called as `generate.prefill_prompt` does, and its tokens per call. None without one.
     prefill: Callable[..., torch.Tensor] | None = None
     chunk: int | None = None
+    # The verify graph for speculative decoding and its tokens per row, with a head for that many rows each.
+    verify: Callable[..., torch.Tensor] | None = None
+    verify_tokens: int = 0
 
 
 def load(model_dir, compiled, weights, head_dir=None, simulate: bool = False, log: Callable[[str], None] = _log) -> Loaded:
@@ -43,7 +46,8 @@ def load(model_dir, compiled, weights, head_dir=None, simulate: bool = False, lo
     if head_dir:
         from .neuron import load_head_graph
 
-        head = ChipHead(source, cfg.rms_norm_eps, load_head_graph(head_dir, weights), batch_size)
+        # Its own build's batch, which a verify graph needs to be its rows times its tokens per row.
+        head = ChipHead(source, cfg.rms_norm_eps, load_head_graph(head_dir, weights), checkpoint.read_build_info(head_dir).get("batch_size", batch_size))
     else:
         head = HostHead(source, cfg.rms_norm_eps)
 
@@ -66,7 +70,13 @@ def load(model_dir, compiled, weights, head_dir=None, simulate: bool = False, lo
         log(f"read lm_head and embeddings into the disk cache in {time.perf_counter() - started:.1f}s")
     # A build with a prefill graph holds it in the same loaded blocks, and calls are routed by their inputs.
     chunk = info.get("chunk")
-    return Loaded(cfg, tokenizer, head, step, batch_size, info["max_seq_len"], load_seconds, step if chunk else None, chunk)
+    verify_tokens = info.get("verify_tokens", 0)
+    if verify_tokens and getattr(head, "batch_size", batch_size * verify_tokens) < batch_size * verify_tokens:
+        raise ValueError(f"a verify graph of {verify_tokens} tokens for {batch_size} rows needs a head for {batch_size * verify_tokens} rows")
+    return Loaded(
+        cfg, tokenizer, head, step, batch_size, info["max_seq_len"], load_seconds, step if chunk else None, chunk,
+        step if verify_tokens else None, verify_tokens,
+    )
 
 
 def encode(tokenizer, lines: Sequence[str]) -> list[list[int]]:

@@ -183,6 +183,46 @@ def long_context_requests(tokenizer, lengths: Sequence[int]) -> list[tuple[Reque
     return out
 
 
+# Where the assistant's reply begins in every turn's prompt, with thinking left empty.
+OPENING = "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+
+def multi_turn_sessions(tokenizer, sessions: int, max_tokens: int, max_turns: int, needle_session: int = 0) -> list[list[list[int]]]:
+    """Coding-agent sessions as an agent sends them: each turn's prompt is the whole last one, then the agent's
+    reply, a scripted read of the next file, and that file back as the tool's result.
+
+    Turn 1 is the system prompt and task. Each later turn adds one file, until the next would pass `max_tokens`
+    or `max_turns` is reached. Every piece is tokenized on its own, so each turn's ids begin with the last turn's
+    exactly. Session `needle_session` plants `NEEDLE` in its first file, and its last turn asks for it.
+    """
+    count = lambda text: tokenizer.encode(text, add_special_tokens=False).ids  # noqa: E731
+    files = stdlib_files()
+    stride = max(1, len(files) // sessions)
+    out = []
+    for index in range(sessions):
+        ordered = files[index * stride :] + files[: index * stride]
+        ids = count(_turn("system", SYSTEM) + _turn("user", TASK) + OPENING)
+        turns = [list(ids)]
+        for number, path in enumerate(ordered):
+            if len(turns) >= max_turns:
+                break
+            source = path.read_text(encoding="utf-8", errors="replace")
+            if index == needle_session and number == 0:
+                source = NEEDLE_LINE + source
+            call = f"<tool_call>\n<function=read_file>\n<parameter=path>\nlib/{path.name}\n</parameter>\n</function>\n</tool_call><|im_end|>\n"
+            piece = count(call + _tool_result(source) + OPENING)
+            if len(ids) + len(piece) > max_tokens:
+                break
+            ids = ids + piece
+            turns.append(list(ids))
+        if index == needle_session:
+            # The last turn asks for the planted key instead of reading on.
+            question = count("I am stopping here.<|im_end|>\n" + _turn("user", NEEDLE_QUESTION) + OPENING)
+            turns[-1] = turns[-1] + question
+        out.append(turns)
+    return out
+
+
 def prompt_digest(requests: Sequence[Request]) -> str:
     """Identifies the exact prompts, so two results can be checked to come from the same work."""
     digest = hashlib.sha256()

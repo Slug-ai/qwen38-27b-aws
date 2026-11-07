@@ -23,6 +23,7 @@ class FakeDevice:
 
     def __init__(self, batch_size: int, max_seq_len: int):
         self.cache = [[] for _ in range(batch_size)]
+        self.saved = [None] * batch_size
         self.max_seq_len = max_seq_len
 
     def _hidden(self, slot: int, position: int) -> torch.Tensor:
@@ -40,6 +41,18 @@ class FakeDevice:
         for i in range(n_valid):
             hidden[0, i] = self._hidden(slot, start + i)
         return hidden
+
+    def copy_states(self, inputs_embeds, save_slot=None, restore_slot=None):
+        """Saved states stand for exactly the tokens up to where they were saved, at a chunk boundary."""
+        if save_slot is not None:
+            slot = int(save_slot[0])
+            assert len(self.cache[slot]) % CHUNK == 0, "states are saved at a chunk boundary"
+            self.saved[slot] = list(self.cache[slot])
+        else:
+            slot = int(restore_slot[0])
+            assert self.saved[slot] is not None, "nothing was saved"
+            self.cache[slot] = list(self.saved[slot])
+        return inputs_embeds
 
     def decode(self, inputs_embeds, cos, sin, position, active):
         hidden = torch.zeros(len(self.cache), 1, 3)
@@ -119,3 +132,44 @@ def test_prompts_that_leave_no_room_are_refused():
     scheduler = Scheduler(device.decode, device.prefill, FakeHead(device), tiny_config(), 2, 16, CHUNK, [], torch.float32)
     with pytest.raises(ValueError):
         list(scheduler.run([[1] * (16 - CHUNK)], max_new_tokens=4))
+
+
+def session_prompts(seed: int, turns: int) -> list[list[int]]:
+    """A session's turn prompts, each the last one plus a scripted reply and a new tool result, as an agent sends them."""
+    rng = torch.Generator().manual_seed(seed)
+    prompts, ids = [], torch.randint(1, 50, (5 + seed * 3,), generator=rng).tolist()
+    for _ in range(turns):
+        prompts.append(list(ids))
+        ids = ids + torch.randint(1, 50, (int(torch.randint(2, 21, (1,), generator=rng)),), generator=rng).tolist()
+    return prompts
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_sessions_reuse_saved_prefixes_and_get_the_tokens_they_would_alone(batch_size):
+    max_seq_len, max_new = 160, 6
+    sessions = [session_prompts(seed, 5) for seed in range(3)]
+    got = {}
+    calls = {}
+    for reuse in (True, False):
+        device = FakeDevice(batch_size, max_seq_len)
+        scheduler = Scheduler(
+            device.decode, device.prefill, FakeHead(device), tiny_config(), batch_size, max_seq_len, CHUNK, [EOS], torch.float32, device.copy_states, reuse
+        )
+        out = {}
+        for session, turn, token in scheduler.run_sessions(sessions, max_new):
+            out.setdefault((session, turn), []).append(token)
+        got[reuse], calls[reuse] = out, (scheduler.prefill_calls, scheduler.reused_tokens)
+    want = {(s, t): alone(p, max_new, max_seq_len) for s, turns in enumerate(sessions) for t, p in enumerate(turns)}
+    assert got[True] == want and got[False] == want
+    assert calls[False][1] == 0 and calls[True][1] > 0 and calls[True][0] < calls[False][0]
+
+
+def test_a_slot_never_reuses_states_saved_for_a_different_prompt():
+    device = FakeDevice(1, 64)
+    scheduler = Scheduler(device.decode, device.prefill, FakeHead(device), tiny_config(), 1, 64, CHUNK, [EOS], torch.float32, device.copy_states)
+    first = list(range(1, 20))
+    other = [7] + first[1:] + [3, 4]  # differs at its first token, so nothing saved for `first` applies
+    got = [t for _, _, t in scheduler.run_sessions([[first], [other], [first + [9, 9]]], 3)]
+    assert scheduler.reused_tokens == 0
+    assert got == alone(first, 3, 64) + alone(other, 3, 64) + alone(first + [9, 9], 3, 64)
+

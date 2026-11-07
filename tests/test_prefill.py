@@ -102,11 +102,11 @@ def test_prefill_then_decode_matches_hf_generate():
     assert got == want
 
 
-def batched_model(cfg, tensors, batch):
+def batched_model(cfg, tensors, batch, verify_tokens=0, saved_states=False):
     from qwen38_inf2 import checkpoint
     from qwen38_inf2.model import Qwen38Step
 
-    model = Qwen38Step(cfg, MAX_SEQ_LEN, dtype=torch.float32, batch_size=batch).eval()
+    model = Qwen38Step(cfg, MAX_SEQ_LEN, dtype=torch.float32, batch_size=batch, verify_tokens=verify_tokens, saved_states=saved_states).eval()
     model.load_state_dict(checkpoint.rank_weights(checkpoint.DictSource(tensors), cfg, 0, 1, torch.float32), strict=False)
     return model
 
@@ -204,3 +204,86 @@ def test_scheduler_on_the_real_model_matches_hf_generate_for_every_request():
         for index, token_id in scheduler.run(prompts, 8):
             got[index].append(token_id)
     assert got == want
+
+
+def test_sessions_on_the_real_model_give_the_same_tokens_with_saved_prefixes_as_without():
+    """A turn continuing a slot's saved states must give exactly what prefilling its whole prompt gives."""
+    from qwen38_inf2.scheduler import Scheduler
+
+    cfg = tiny_config()
+    _, tensors = build_reference(cfg)
+    head = host_head(tensors)
+    # Within MAX_SEQ_LEN less a chunk. The second turns continue from position 16, the third from 32.
+    base = PROMPT + [5, 9] * 2
+    sessions = [
+        [base, base + [7, 8, 9, 10, 11, 12, 13], base + [7, 8, 9, 10, 11, 12, 13] + [21] * 9],
+        [[60, 61, 62] * 6, [60, 61, 62] * 6 + [4] * 15],
+    ]
+    got = {}
+    for reuse in (True, False):
+        model = batched_model(cfg, tensors, 2, saved_states=True)
+        scheduler = Scheduler(prefill_of(model), prefill_of(model), head, cfg, 2, MAX_SEQ_LEN, CHUNK, (), torch.float32, prefill_of(model), reuse)
+        out = {}
+        with torch.no_grad():
+            for session, turn, token in scheduler.run_sessions(sessions, 6):
+                out.setdefault((session, turn), []).append(token)
+        got[reuse] = (out, scheduler.reused_tokens)
+    assert got[True][0] == got[False][0]
+    assert got[False][1] == 0 and got[True][1] >= 2 * CHUNK
+
+
+def test_verify_steps_give_what_decoding_the_same_tokens_one_by_one_gives():
+    """Verify steps commit only the tokens accepted, so after any mix of accepted counts each position's hidden
+    state matches decoding the accepted tokens one at a time."""
+    from qwen38_inf2.generate import verify_inputs
+
+    cfg = tiny_config()
+    _, tensors = build_reference(cfg)
+    head = host_head(tensors)
+    tokens, k = [5, 77, 13, 2, 91, 40, 8, 66, 31, 12, 3], 4
+    with torch.no_grad():
+        plain = batched_model(cfg, tensors, 2)
+        prefill_prompt(prefill_of(plain), head, cfg, 0, PROMPT, CHUNK, torch.float32)
+        want = []
+        for i, token in enumerate(tokens):
+            embeds = head.embed_batch([token, 0], torch.float32)
+            out = plain(inputs_embeds=embeds, **batch_step_inputs(cfg, [len(PROMPT) + i, 0], MAX_SEQ_LEN, torch.float32, [True, False]))
+            want.append(out[0, 0])
+
+        spec = batched_model(cfg, tensors, 2, verify_tokens=k)
+        prefill_prompt(prefill_of(spec), head, cfg, 0, PROMPT, CHUNK, torch.float32)
+        done, accepted = 0, 0
+        # Each step commits a different number of the last one's tokens: drafts after the accepted ones are junk.
+        for take in [2, 4, 1, 3, 1]:
+            batch_tokens = tokens[done : done + take] + [7] * (k - take)
+            embeds = head.embed_batch(batch_tokens + [0] * k, torch.float32).reshape(2, k, -1)
+            out = spec(inputs_embeds=embeds, **verify_inputs(cfg, [len(PROMPT) + done, 0], k, MAX_SEQ_LEN, torch.float32, [True, False], [accepted, 0]))
+            for j in range(take):
+                assert torch.allclose(out[0, j], want[done + j], atol=1e-4, rtol=1e-4), (done, j, (out[0, j] - want[done + j]).abs().max())
+            done, accepted = done + take, take
+
+
+
+def test_speculative_decoding_gives_the_tokens_plain_greedy_decoding_gives():
+    from qwen38_inf2.scheduler import Scheduler
+
+    cfg = tiny_config()
+    _, tensors = build_reference(cfg)
+    head = host_head(tensors)
+    # Repeats in the prompts give the drafts something to match.
+    prompts = [PROMPT + PROMPT[:12], [9, 9, 4, 1] * 5, PROMPT[5:] + [3] * 9, [11, 2, 60, 7] * 4]
+    got = {}
+    for k in (1, 4):
+        model = batched_model(cfg, tensors, 2, verify_tokens=k if k > 1 else 0)
+        scheduler = Scheduler(
+            prefill_of(model), prefill_of(model), head, cfg, 2, MAX_SEQ_LEN, CHUNK, (), torch.float32,
+            verify=prefill_of(model) if k > 1 else None, verify_tokens=k,
+        )
+        out = [[] for _ in prompts]
+        with torch.no_grad():
+            for index, token in scheduler.run(prompts, 12):
+                out[index].append(token)
+        got[k] = (out, scheduler.decode_calls, scheduler.drafted_tokens)
+    assert got[4][0] == got[1][0]
+    # The tiny model's tokens are near random, so few drafts match, but some must, and they never cost steps.
+    assert got[4][2] > 0 and got[4][1] <= got[1][1]

@@ -25,13 +25,14 @@ from qwen38_inf2.runner import generate, load
 from qwen38_inf2.scheduler import Scheduler
 
 
-def run(loaded, prompts, max_new_tokens: int, use_prefill: bool = True) -> tuple[list[list[int]], float, dict]:
+def run(loaded, prompts, max_new_tokens: int, use_prefill: bool = True, eos=EOS_TOKEN_IDS, speculate: bool = True) -> tuple[list[list[int]], float, dict]:
     """With a prefill graph, prompts go through it in chunks. Without one, they're fed token by token through decode."""
     if not use_prefill or getattr(loaded, "prefill", None) is None:
         outputs, seconds = generate(loaded.step, loaded.head, loaded.cfg, prompts, loaded.batch_size, max_new_tokens, loaded.max_seq_len)
         return outputs, seconds, {"prompt_path": "decode"}
     scheduler = Scheduler(
-        loaded.step, loaded.prefill, loaded.head, loaded.cfg, loaded.batch_size, loaded.max_seq_len, loaded.chunk, EOS_TOKEN_IDS
+        loaded.step, loaded.prefill, loaded.head, loaded.cfg, loaded.batch_size, loaded.max_seq_len, loaded.chunk, eos,
+        verify=loaded.verify if speculate else None, verify_tokens=loaded.verify_tokens,
     )
     outputs = [[] for _ in prompts]
     started = time.perf_counter()
@@ -45,6 +46,8 @@ def run(loaded, prompts, max_new_tokens: int, use_prefill: bool = True) -> tuple
         "prefill_seconds": scheduler.prefill_seconds,
         "decode_seconds": scheduler.decode_seconds,
         "mean_rows_per_decode_step": scheduler.decode_rows / max(scheduler.decode_calls, 1),
+        "verify_tokens": scheduler.step_tokens,
+        "drafted_tokens_accepted": scheduler.drafted_tokens,
     }
 
 
@@ -68,6 +71,7 @@ def summarize(requests, outputs, seconds: float, golden_ok: bool, needle_found: 
         "needle_found": needle_found,
         # Greedy answers end where the model stops, so a numerics change can change how much is generated.
         "generated_per_request": [len(o) for o in outputs],
+        "outputs": [list(o) for o in outputs],
     }
 
 
@@ -111,6 +115,11 @@ def main():
     parser.add_argument("--output", type=Path, help="Write the results as JSON here.")
     parser.add_argument("--simulate", action="store_true", help="Run on CPU instead of a chip.")
     parser.add_argument("--no-prefill", action="store_true", help="Feed prompts token by token through decode even if the build has a prefill graph.")
+    parser.add_argument("--no-speculation", action="store_true", help="Decode one token per step even if the build has a verify graph.")
+    parser.add_argument(
+        "--ignore-eos", action="store_true",
+        help="Generate exactly --max-new-tokens for every request, so two builds do the same work even where their greedy answers stop differently.",
+    )
     args = parser.parse_args()
 
     loaded = load(args.model_dir, args.compiled, args.weights, args.head, args.simulate)
@@ -125,14 +134,18 @@ def main():
     prompts = [r.ids for r in requests] + [golden["prompt"]]
 
     with torch.no_grad():
-        outputs, seconds, path = run(loaded, prompts, args.max_new_tokens, not args.no_prefill)
+        outputs, seconds, path = run(
+            loaded, prompts, args.max_new_tokens, not args.no_prefill, () if args.ignore_eos else EOS_TOKEN_IDS, not args.no_speculation
+        )
     golden_ok = outputs[-1][: len(golden["output"])] == golden["output"]
     needle_index = next(i for i, r in enumerate(requests) if r.has_needle)
     answer = loaded.tokenizer.decode(outputs[needle_index], skip_special_tokens=True)
     # The golden request is counted too, since its tokens were really processed.
     counted = requests + [Request(golden["prompt"], [], False)]
     numbers = summarize(counted, outputs, seconds, golden_ok, NEEDLE in answer, loaded.batch_size, loaded.max_seq_len)
-    numbers |= path | {"load_seconds": loaded.load_seconds, "prompt_digest": prompt_digest(requests), "python": platform.python_version()}
+    numbers |= path | {
+        "load_seconds": loaded.load_seconds, "prompt_digest": prompt_digest(requests), "python": platform.python_version(), "ignore_eos": args.ignore_eos,
+    }
     print(report(numbers, loaded.load_seconds, answer))
     if args.output:
         args.output.write_text(json.dumps(numbers, indent=1))

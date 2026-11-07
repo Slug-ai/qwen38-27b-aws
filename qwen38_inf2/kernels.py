@@ -403,7 +403,30 @@ def decode_attention_body(
     return out
 
 
-def _decode_attention(q, k_cache, v_cache, k_own, v_own, limit, count, groups: int, positions: int, out) -> None:
+def verify_attention_body(
+    q: nl.ndarray, k_cache: nl.ndarray, v_cache: nl.ndarray, k_own: nl.ndarray, v_own: nl.ndarray, own_mask: nl.ndarray,
+    limit: nl.ndarray, blocks: nl.ndarray, groups: int, positions: int, pair_offset: int,
+) -> nl.ndarray:
+    """`decode_attention_body` for a verify step's K tokens per row, for the pairs from `pair_offset` on.
+
+    Each token's queries are query heads of its pair, all against the pair's cache before the row's position, so
+    `groups` is query heads times K. Then every query meets every one of the step's own keys, through `own_mask`.
+
+    Args:
+        q: BF16 ``[queries, head]``, row ``p * groups + g * K + t`` the query head g of token t of pair
+            ``pair_offset + p``.
+        k_own, v_own: BF16 ``[pairs * K, head]``, the pairs' own keys and values, row ``p * K + s``.
+        own_mask: float32 ``[queries, pairs * K]``: 0 where a query sees an own key, its pair's tokens up to its
+            own, and MASKED elsewhere.
+        The rest as for `decode_attention_body`.
+    """
+    out = nl.ndarray(q.shape, dtype=q.dtype, buffer=nl.shared_hbm)
+    count = nisa.tensor_reduce(nl.add, nl.load(blocks), axis=[1])
+    _decode_attention(q, k_cache, v_cache, k_own, v_own, limit, count, groups, positions, out, own_mask, pair_offset)
+    return out
+
+
+def _decode_attention(q, k_cache, v_cache, k_own, v_own, limit, count, groups: int, positions: int, out, own_mask=None, pair_offset: int = 0) -> None:
     """`decode_attention_body` with the block count as an SBUF scalar, `count`, writing into `out`."""
     queries, head = q.shape
     pairs = queries // groups
@@ -429,8 +452,10 @@ def _decode_attention(q, k_cache, v_cache, k_own, v_own, limit, count, groups: i
     # Queries with head dims on partitions, as the Tensor Engine contracts, and per pair a copy of only its columns.
     q_rows = nl.load(q)
     q_pair = [[] for _ in list(range(pairs))]
+    q_t = []
     for d0, ds in d_tiles:
         flipped = _transposed(q_rows[:, d0 : d0 + ds], ds, queries, q.dtype, identity[0:queries, 0:queries])
+        q_t.append(flipped)
         for p in list(range(pairs)):
             q_pair[p].append(nisa.tensor_tensor(flipped, columns[p][0:ds, :], op=nl.multiply, dtype=q.dtype))
 
@@ -442,8 +467,9 @@ def _decode_attention(q, k_cache, v_cache, k_own, v_own, limit, count, groups: i
     # one contiguous DMA. A step's blocks have their own buffers and are taken stage by stage, so one block's loads
     # and transposes overlap the other's softmax. The step's positions are carried from step to step.
     step = DECODE_SPLIT * DECODE_BLOCK
-    k_steps = k_cache.reshape((pairs, positions // step, DECODE_SPLIT, DECODE_BLOCK, head))
-    v_steps = v_cache.reshape((pairs, positions // step, DECODE_SPLIT, DECODE_BLOCK, head))
+    cached_pairs = k_cache.shape[0] // positions
+    k_steps = k_cache.reshape((cached_pairs, positions // step, DECODE_SPLIT, DECODE_BLOCK, head))
+    v_steps = v_cache.reshape((cached_pairs, positions // step, DECODE_SPLIT, DECODE_BLOCK, head))
     later = nisa.iota(nl.arange(step)[None, :] + 0 * i_r, dtype=nl.float32)
     halves = list(range(DECODE_SPLIT))
     for b in range(scalar(count)):
@@ -451,8 +477,8 @@ def _decode_attention(q, k_cache, v_cache, k_own, v_own, limit, count, groups: i
         for half in halves:
             for p in list(range(pairs)):
                 for k0 in list(range(0, DECODE_BLOCK, STATIONARY_TILE)):
-                    rows = nl.load(k_steps[p, b, half, k0 + i_p, i_h])
-                    cached_values = nl.load(v_steps[p, b, half, k0 + i_p, i_h])
+                    rows = nl.load(k_steps[pair_offset + p, b, half, k0 + i_p, i_h])
+                    cached_values = nl.load(v_steps[pair_offset + p, b, half, k0 + i_p, i_h])
                     raw[half][p].append((rows, cached_values))
         keys = [[] for _ in halves]
         values = [[] for _ in halves]
@@ -501,17 +527,37 @@ def _decode_attention(q, k_cache, v_cache, k_own, v_own, limit, count, groups: i
             best[...] = new_best
         later[...] = nisa.tensor_scalar(later, nl.add, float(step))
 
-    # The step's own key and value, one per query row.
-    own_key = nl.load(k_own)
-    own_value = nl.load(v_own)
-    own = nisa.tensor_reduce(nl.add, nisa.tensor_tensor(q_rows, own_key, op=nl.multiply, dtype=nl.float32), axis=[1], keepdims=True)
-    new_best = nisa.tensor_tensor(best, own, op=nl.maximum)
-    negative = nisa.tensor_scalar(new_best, nl.multiply, -1.0)
-    weight = nisa.activation(nl.exp, own, bias=negative)
-    rescale = nisa.activation(nl.exp, best, bias=negative)
-    total = nisa.scalar_tensor_tensor(data=total, op0=nl.multiply, operand0=rescale, op1=nl.add, operand1=weight)
-    taken = nisa.tensor_scalar(own_value, nl.multiply, weight, dtype=nl.float32)
-    acc = nisa.scalar_tensor_tensor(data=acc, op0=nl.multiply, operand0=rescale, op1=nl.add, operand1=taken)
+    if own_mask is None:
+        # The step's own key and value, one per query row.
+        own_key = nl.load(k_own)
+        own_value = nl.load(v_own)
+        own = nisa.tensor_reduce(nl.add, nisa.tensor_tensor(q_rows, own_key, op=nl.multiply, dtype=nl.float32), axis=[1], keepdims=True)
+        new_best = nisa.tensor_tensor(best, own, op=nl.maximum)
+        negative = nisa.tensor_scalar(new_best, nl.multiply, -1.0)
+        weight = nisa.activation(nl.exp, own, bias=negative)
+        rescale = nisa.activation(nl.exp, best, bias=negative)
+        total = nisa.scalar_tensor_tensor(data=total, op0=nl.multiply, operand0=rescale, op1=nl.add, operand1=weight)
+        taken = nisa.tensor_scalar(own_value, nl.multiply, weight, dtype=nl.float32)
+        acc = nisa.scalar_tensor_tensor(data=acc, op0=nl.multiply, operand0=rescale, op1=nl.add, operand1=taken)
+    else:
+        # Every query against every own key of the step, through the mask: a verify step's own keys.
+        own_count = k_own.shape[0]
+        own_keys = nl.load(k_own)
+        own_values = nl.load(v_own)
+        scores = nl.zeros((nl.par_dim(queries), own_count), nl.float32, buffer=nl.psum)
+        for d, (d0, ds) in enumerate(d_tiles):
+            keys_t = _transposed(own_keys[:, d0 : d0 + ds], ds, own_count, q.dtype, identity[0:own_count, 0:own_count])
+            scores += nisa.nc_matmul(q_t[d], keys_t)
+        masked = nisa.tensor_tensor(scores, nl.load(own_mask), op=nl.add, dtype=nl.float32)
+        new_best = nisa.tensor_tensor(best, nisa.tensor_reduce(nl.maximum, masked, axis=[1], keepdims=True), op=nl.maximum)
+        negative = nisa.tensor_scalar(new_best, nl.multiply, -1.0)
+        row_sum = nl.ndarray((nl.par_dim(queries), 1), dtype=nl.float32, buffer=nl.sbuf)
+        weights = nisa.activation_reduce(nl.exp, masked, reduce_op=nl.add, reduce_res=row_sum, bias=negative, dtype=nl.bfloat16)
+        rescale = nisa.activation(nl.exp, best, bias=negative)
+        total = nisa.scalar_tensor_tensor(data=total, op0=nl.multiply, operand0=rescale, op1=nl.add, operand1=row_sum)
+        mixed = nl.zeros((nl.par_dim(queries), head), nl.float32, buffer=nl.psum)
+        mixed += nisa.nc_matmul(_transposed(weights, own_count, queries, nl.bfloat16, identity[0:queries, 0:queries]), own_values)
+        acc = nisa.scalar_tensor_tensor(data=acc, op0=nl.multiply, operand0=rescale, op1=nl.add, operand1=mixed)
     nl.store(out, nisa.tensor_scalar(acc, nl.multiply, nisa.reciprocal(total), dtype=q.dtype))
 
 
@@ -771,4 +817,5 @@ delta_prefill = nki.jit(delta_prefill_body)
 DYNAMIC_LOOP_FLAGS = "experimental-native-scalar-support, experimental-local-tensor-parent"
 prefill_attention = nki.compiler.skip_middle_end_transformations(nki.jit(prefill_attention_body, experimental_flags=DYNAMIC_LOOP_FLAGS))
 decode_attention = nki.compiler.skip_middle_end_transformations(nki.jit(decode_attention_body, experimental_flags=DYNAMIC_LOOP_FLAGS))
+verify_attention = nki.compiler.skip_middle_end_transformations(nki.jit(verify_attention_body, experimental_flags=DYNAMIC_LOOP_FLAGS))
 lm_head_group_maxima = nki.jit(lm_head_group_maxima_body)

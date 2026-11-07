@@ -111,9 +111,24 @@ The agentic benchmark's planted key is one greedy answer, and a change that only
 
 Recall itself is the same: once the key starts, both finish it with probability 0.987. Nearly all the uncertainty is in the first token, whether to answer or to read another file first, at a probability of 0.25 to 0.6 per request, and it moves by up to 0.25 per request between the two builds in both directions, a mean difference of about 1.4 standard errors. Raw results are in [throughput/long_context/](throughput/long_context/).
 
+From here builds are also compared with every request generating exactly 64 tokens (`--ignore-eos --max-new-tokens 64`), so two builds do the same work wherever their greedy answers would stop: the build after A11, with saved state rows and no other change, gives 1094.0 tok/s that way, prefill 242.5 s and decode 37.2 s over 315 steps of 3.40 rows.
+
 Output tokens are few in this workload: requests stop at the end of the answer, about 64 tokens each, and only 2 rows fit at 32K positions, so most of the time is prefill.
 
 Raw results are in [throughput/agentic/](throughput/agentic/).
+
+## Multi-turn agentic workload
+
+A coding agent sends its whole conversation again every turn, so most of each prompt is the last one. `scripts/multi_turn_benchmark.py` runs 8 such sessions of up to 12 turns and 30K tokens: turn 1 is the system prompt and task, and each later turn adds the agent's read of the next standard library file and the file itself. The reads are scripted, so every build sees the same prompts, while the model's own replies, up to 128 tokens, are generated and counted. Session 0 plants a key in its first file, and its last turn asks for it.
+
+A session's turns run in one slot. After each prompt's last whole chunk, the slot's recurrent and conv states are saved, into spare rows of the same state buffers; the next turn restores them and prefills from that boundary, since the KV cache still holds those positions. The saved rows cost 151 MB per core and leave single-turn prefill as it was: the same build ran the single-turn agentic benchmark's prefill in 242.6 s against 241.9 s for A11, with the same outputs.
+
+69% of the prompt tokens sent are reused, and the run takes 2.49 times less time. Because a restored state is exactly what the shared chunks gave, every turn generates the same tokens either way.
+
+| # | Change | Rows x max length | Workload | Prompt tokens sent | Prefilled | Generated | Time | Total tok/s | Correct |
+|---|---|---|---|---|---|---|---|---|---|
+| M1 | Every turn prefilled whole | 4 x 32768 | 8 sessions, 53 turns | 654969 | 654969 | 1657 | 573.7 s | 1144.6 | key recalled |
+| M1 | Turns continue from the slot's saved states | 4 x 32768 | 8 sessions, 53 turns | 654969 | 204409 | 1657 | 230.3 s | 2851.1 | key recalled; every turn's tokens the same as without |
 
 ## Where the time goes
 

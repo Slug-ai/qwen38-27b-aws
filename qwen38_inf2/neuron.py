@@ -10,7 +10,7 @@ from neuronx_distributed.trace.nxd_model import NxDModel
 
 from . import checkpoint
 from .config import TextConfig
-from .generate import BlockChain, batch_step_inputs, prefill_inputs
+from .generate import BlockChain, batch_step_inputs, prefill_inputs, state_copy_inputs, verify_inputs
 from .model import HeadStep, Qwen38Step
 
 DTYPE = torch.bfloat16
@@ -23,6 +23,13 @@ def example_inputs(cfg: TextConfig, max_seq_len: int, batch_size: int = 1) -> di
     return {
         "inputs_embeds": torch.zeros(batch_size, 1, cfg.hidden_size, dtype=DTYPE),
         **batch_step_inputs(cfg, [0] * batch_size, max_seq_len, DTYPE),
+    }
+
+
+def verify_example_inputs(cfg: TextConfig, max_seq_len: int, batch_size: int, tokens: int) -> dict[str, torch.Tensor]:
+    return {
+        "inputs_embeds": torch.zeros(batch_size, tokens, cfg.hidden_size, dtype=DTYPE),
+        **verify_inputs(cfg, [0] * batch_size, tokens, max_seq_len, DTYPE, [True] * batch_size, [0] * batch_size),
     }
 
 
@@ -87,15 +94,22 @@ def build(
     optimize_layout: bool = False,
     batch_size: int = 1,
     chunk: int | None = None,
+    verify_tokens: int = 0,
 ) -> Path:
-    """Compile the one-token-per-row graph for the layers in `cfg`, plus a prefill graph of `chunk` tokens if given."""
-    traces = {"decode": example_inputs(cfg, max_seq_len, batch_size)}
+    """Compile the one-token-per-row graph for the layers in `cfg`, plus a prefill graph of `chunk` tokens if given,
+    and a verify graph of `verify_tokens` tokens per row for speculative decoding if given."""
+    # NxD allocates the state buffers the first graph uses, so the graph using the most of them goes first.
+    traces = {"verify": verify_example_inputs(cfg, max_seq_len, batch_size, verify_tokens)} if verify_tokens else {}
+    traces["decode"] = example_inputs(cfg, max_seq_len, batch_size)
     if chunk:
         from .kernels import KEY_BLOCK
 
         if max_seq_len % chunk or max_seq_len % KEY_BLOCK:
             raise ValueError(f"max_seq_len {max_seq_len} must be a multiple of the chunk {chunk} and of {KEY_BLOCK}")
         traces["prefill"] = prefill_example_inputs(cfg, chunk)
+        # Saving and restoring a row's recurrent states, so a prompt extending an earlier one skips what they share.
+        traces["save"] = state_copy_inputs(cfg, 0, True, DTYPE)
+        traces["restore"] = state_copy_inputs(cfg, 0, False, DTYPE)
     return compile_graph(
         lambda: Qwen38Step(
             cfg,
@@ -104,6 +118,8 @@ def build(
             dtype=DTYPE,
             all_reduce=reduce_from_tensor_model_parallel_region,
             batch_size=batch_size,
+            verify_tokens=verify_tokens,
+            saved_states=bool(chunk),
         ),
         traces,
         output_dir,
@@ -115,6 +131,7 @@ def build(
             "recurrent_state_format": cfg.recurrent_state_format,
             "kv_cache_format": cfg.kv_cache_format,
             **({"chunk": chunk} if chunk else {}),
+            **({"verify_tokens": verify_tokens} if verify_tokens else {}),
         },
         tp_degree,
         target,

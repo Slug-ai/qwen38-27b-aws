@@ -1,0 +1,9 @@
+{
+ "build": "artifacts/block16_b4_s32k_c512_mt",
+ "prefill_top_token_is_next_token": 312,
+ "prefill_same_top_token_as_decode": 320,
+ "positions": 323,
+ "top_token_is_next_token": 313,
+ "accuracy": 0.9690402476780186,
+ "positions_where_rows_disagree": 0
+}

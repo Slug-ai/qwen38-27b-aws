@@ -53,6 +53,8 @@ python scripts/prepare_weights.py --model-dir model --compiled artifacts/block16
 python scripts/agentic_benchmark.py --model-dir model --compiled artifacts/block16_b4_s32k_c512_kv8 --head artifacts/head_fp8_b4 --weights weights_fp8_kv8
 ```
 
+`scripts/multi_turn_benchmark.py` with the same arguments runs coding-agent sessions whose every turn sends the whole conversation again, as Claude Code does. A session's turns reuse its slot's cache and saved states, so only the new tokens are prefilled; `--no-reuse` prefills every prompt whole, which gives the same tokens.
+
 `weights_fp8` holds the same files as the 512-token build's, prepared as below, and `--reuse` links to them, adding small files of the KV cache's scales. With `--kv-cache bf16` only 2 rows fit at 32K, and those weights work as they are. `scripts/quality_check.py` with the same arguments also checks the prefill path against decode.
 
 ## Run the 512-token build

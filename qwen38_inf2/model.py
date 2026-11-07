@@ -262,9 +262,13 @@ class MLP(nn.Module):
 class GatedDeltaNetStep(nn.Module):
     """The gated delta rule with a causal conv: one token per row (decode), or a chunk of one row (prefill)."""
 
-    def __init__(self, cfg: TextConfig, tp_degree: int, dtype: torch.dtype, all_reduce: Callable, batch_size: int = 1):
+    def __init__(
+        self, cfg: TextConfig, tp_degree: int, dtype: torch.dtype, all_reduce: Callable, batch_size: int = 1, verify_tokens: int = 0,
+        saved_states: bool = False,
+    ):
         super().__init__()
         self.cfg = cfg
+        self.batch_size = batch_size
         self.all_reduce = all_reduce
         self.key_dim = cfg.linear_key_dim // tp_degree
         self.value_dim = cfg.linear_value_dim // tp_degree
@@ -283,12 +287,25 @@ class GatedDeltaNetStep(nn.Module):
         self.dt_bias = _frozen(self.num_v_heads, dtype=dtype)
         self.norm_weight = _frozen(cfg.linear_value_head_dim, dtype=dtype)
 
-        self.register_buffer("conv_state", torch.zeros(batch_size, conv_dim, cfg.linear_conv_kernel_dim - 1, dtype=dtype))
+        # With `saved_states`, rows from `batch_size` on hold each row's states as they were at a chunk boundary of
+        # its prompt (`copy_states`), so a later prompt extending that one can start from there: the KV cache still
+        # holds those positions. They are rows of the same buffers, so every graph touching them writes them too,
+        # and NxD keeps them as the shared state they are rather than taking them for weights.
+        rows = batch_size * (2 if saved_states else 1)
+        self.register_buffer("conv_state", torch.zeros(rows, conv_dim, cfg.linear_conv_kernel_dim - 1, dtype=dtype))
         self.state_dtype = {"float32": torch.float32, "bf16": torch.bfloat16}[cfg.recurrent_state_format]
         self.register_buffer(
             "recurrent_state",
-            torch.zeros(batch_size, self.num_v_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim, dtype=self.state_dtype),
+            torch.zeros(rows, self.num_v_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim, dtype=self.state_dtype),
         )
+        if verify_tokens:
+            # A verify step's tokens leave the states as they were, and keep what each would add, so the next step
+            # commits only the ones accepted: each token's update to the state is rank 1, key times delta, after decay.
+            k_head, v_head = cfg.linear_key_head_dim, cfg.linear_value_head_dim
+            self.register_buffer("pending_key_state", torch.zeros(batch_size, verify_tokens, self.num_v_heads, k_head))
+            self.register_buffer("pending_delta_state", torch.zeros(batch_size, verify_tokens, self.num_v_heads, v_head))
+            self.register_buffer("pending_decay_state", torch.zeros(batch_size, verify_tokens, self.num_v_heads))
+            self.register_buffer("pending_input_state", torch.zeros(batch_size, verify_tokens, conv_dim, dtype=dtype))
 
     def _split(self, mixed: torch.Tensor):
         """Query and key per value head, and value, from the conv output ``[tokens, conv_dim]``, all float32."""
@@ -326,8 +343,9 @@ class GatedDeltaNetStep(nn.Module):
         # A depthwise causal conv over one new sample is a weighted sum of a sliding window, so no
         # conv op is needed. Newest sample is last, matching F.conv1d's kernel order.
         qkv = self.in_proj_qkv(x).transpose(1, 2)
-        window = torch.cat((self.conv_state * keep.reshape(batch, 1, 1).to(dtype), qkv), dim=-1)
-        self.conv_state = torch.where(on, window[:, :, 1:], self.conv_state)
+        conv_state = self._live(self.conv_state)
+        window = torch.cat((conv_state * keep.reshape(batch, 1, 1).to(dtype), qkv), dim=-1)
+        self.conv_state = self._with_live(self.conv_state, torch.where(on, window[:, :, 1:], conv_state))
         query, key, value = self._split(silu((window * self.conv_weight).sum(dim=-1)))
 
         z = self.in_proj_z(x).reshape(batch, self.num_v_heads, -1)
@@ -336,12 +354,86 @@ class GatedDeltaNetStep(nn.Module):
         beta = (beta * active.unsqueeze(-1)).unsqueeze(-1)
         log_decay = log_decay * active.unsqueeze(-1)
 
-        state = self.recurrent_state.float() * keep.reshape(batch, 1, 1, 1) * log_decay.exp()[..., None, None]
+        state = self._live(self.recurrent_state).float() * keep.reshape(batch, 1, 1, 1) * log_decay.exp()[..., None, None]
         delta = (value - (state * key.unsqueeze(-1)).sum(dim=-2)) * beta
         state = state + key.unsqueeze(-1) * delta.unsqueeze(-2)
-        self.recurrent_state = state.to(self.state_dtype)
+        self.recurrent_state = self._with_live(self.recurrent_state, state.to(self.state_dtype))
         out = (state * query.unsqueeze(-1)).sum(dim=-2).to(dtype)
         return self.all_reduce(self._finish(out, z, dtype))
+
+    def verify(self, x: torch.Tensor, position: torch.Tensor, active: torch.Tensor, accepted: torch.Tensor) -> torch.Tensor:
+        """K tokens per row from `position`, ``x`` ``[batch, K, hidden]``, for speculative decoding.
+
+        First the last verify step's first `accepted` tokens per row are committed to the states, from the updates
+        it kept. Then the K new tokens run from those states without changing them, each token's update kept for
+        the next step to commit as many as are accepted. A row with `active` 0 keeps its states exactly.
+        """
+        dtype = x.dtype
+        batch, tokens = x.shape[:2]
+        kernel = self.cfg.linear_conv_kernel_dim
+        on = (active > 0.5).reshape(batch, 1, 1, 1)
+        state = self._live(self.recurrent_state).float()
+        steps = accepted.long().reshape(batch, 1, 1, 1)
+        for t in range(self.pending_key_state.shape[1]):
+            grown = state * self.pending_decay_state[:, t].exp()[..., None, None] + self.pending_key_state[:, t].unsqueeze(-1) * self.pending_delta_state[:, t].unsqueeze(-2)
+            state = torch.where(steps > t, grown, state)
+        # The conv's history is the last kernel - 1 inputs before the first token not committed.
+        window = torch.cat((self._live(self.conv_state), self.pending_input_state.transpose(1, 2)), dim=-1)
+        index = (accepted.long().reshape(batch, 1, 1) + torch.arange(kernel - 1, device=x.device)).expand(-1, window.shape[1], -1)
+        history = window.gather(2, index)
+        # A sequence's first token starts from empty states. Inactive rows keep theirs, whatever their position.
+        keep = torch.where((position == 0) & (active > 0.5), 0.0, 1.0)
+        state = state * keep.reshape(batch, 1, 1, 1)
+        history = history * keep.reshape(batch, 1, 1).to(dtype)
+        committed = torch.where(on, state.to(self.state_dtype), self._live(self.recurrent_state))
+        self.recurrent_state = self._with_live(self.recurrent_state, committed)
+        history = torch.where(on.reshape(batch, 1, 1), history, self._live(self.conv_state))
+        self.conv_state = self._with_live(self.conv_state, history)
+
+        qkv = self.in_proj_qkv(x)
+        window = torch.cat((history, qkv.transpose(1, 2)), dim=-1)
+        mixed = torch.stack([(window[:, :, t : t + kernel] * self.conv_weight).sum(dim=-1) for t in range(tokens)], dim=1)
+        query, key, value = (part.reshape(batch, tokens, *part.shape[1:]) for part in self._split(silu(mixed).reshape(batch * tokens, -1)))
+        z = self.in_proj_z(x).reshape(batch * tokens, self.num_v_heads, -1)
+        beta, log_decay = self._gates(x.reshape(batch * tokens, -1))
+        beta = beta.reshape(batch, tokens, -1) * active.reshape(batch, 1, 1)
+        log_decay = log_decay.reshape(batch, tokens, -1) * active.reshape(batch, 1, 1)
+
+        # From the states as committed, so what is kept is exactly what the next step builds on.
+        state = committed.float()
+        outs, deltas = [], []
+        for t in range(tokens):
+            state = state * log_decay[:, t].exp()[..., None, None]
+            delta = (value[:, t] - (state * key[:, t].unsqueeze(-1)).sum(dim=-2)) * beta[:, t].unsqueeze(-1)
+            state = state + key[:, t].unsqueeze(-1) * delta.unsqueeze(-2)
+            outs.append((state * query[:, t].unsqueeze(-1)).sum(dim=-2))
+            deltas.append(delta)
+        self.pending_key_state = key.float()
+        self.pending_delta_state = torch.stack(deltas, dim=1)
+        self.pending_decay_state = log_decay.float()
+        self.pending_input_state = qkv
+        out = torch.stack(outs, dim=1).reshape(batch * tokens, self.num_v_heads, -1).to(dtype)
+        return self.all_reduce(self._finish(out, z, dtype).reshape(batch, tokens, -1))
+
+    def copy_states(self, slot: torch.Tensor, to_saved: bool) -> None:
+        """Save a row's recurrent and conv states, or restore them from what was saved."""
+        if self.recurrent_state.shape[0] == self.batch_size:
+            raise ValueError("this layer keeps no saved states")
+        slot = slot.long()
+        saved = slot + self.batch_size
+        source, target = (slot, saved) if to_saved else (saved, slot)
+        self.recurrent_state = self.recurrent_state.index_copy(0, target, self.recurrent_state.index_select(0, source))
+        self.conv_state = self.conv_state.index_copy(0, target, self.conv_state.index_select(0, source))
+
+    def _live(self, buffer: torch.Tensor) -> torch.Tensor:
+        """The rows of a state buffer that running sequences use, without the saved ones."""
+        return buffer[: self.batch_size]
+
+    def _with_live(self, buffer: torch.Tensor, live: torch.Tensor) -> torch.Tensor:
+        """`buffer` with its running rows replaced by `live`, the saved rows left as they are."""
+        if buffer.shape[0] == live.shape[0]:
+            return live
+        return buffer.index_copy(0, torch.arange(live.shape[0], device=live.device), live)
 
     def prefill(self, x: torch.Tensor, slot: torch.Tensor, start: torch.Tensor, n_valid: torch.Tensor) -> torch.Tensor:
         """A chunk of one row's tokens. ``x`` is ``[1, chunk, hidden]``. Tokens from `n_valid` on are padding.
@@ -508,6 +600,76 @@ class FullAttentionStep(nn.Module):
         self._write_both(self._store(key, scales[0]), self._store(value, scales[1]), where)
         return self.all_reduce(self.o_proj(out * torch.sigmoid(gate)))
 
+    def verify(self, x, cos, sin, position, active) -> torch.Tensor:
+        """K tokens per row from `position`, ``x`` ``[batch, K, hidden]``, for speculative decoding: each against
+        the row's cache before `position` and the step's own tokens up to itself. Their keys and values are written
+        from `position` on; the next step overwrites those of tokens not accepted."""
+        cfg = self.cfg
+        head = cfg.head_dim
+        batch, tokens = x.shape[:2]
+        device = x.device
+        query, key, value, gate = self._project(x, cos, sin)
+        scales = (self.k_scale, self.v_scale) if self.fp8_cache else (None, None)
+        groups = cfg.num_key_value_groups
+        # Rows not running write junk at the cache's last positions, as in decode.
+        steps = torch.arange(tokens, device=device)
+        where = torch.where(active.unsqueeze(-1) > 0.5, position.long().unsqueeze(-1) + steps, self.max_seq_len - tokens + steps)
+        if self.fp8_cache and device.type != "cpu":
+            out, k_coded, v_coded = self._verify_fp8(query, key, value, position, scales)
+            self._write_both(k_coded, v_coded, where)
+            return self.all_reduce(self.o_proj(out * torch.sigmoid(gate)))
+        grouped = query.reshape(batch, self.num_kv_heads, groups, tokens, head)
+        keys = self._load(self.k_cache, scales[0], x.dtype).unsqueeze(2)
+        values = self._load(self.v_cache, scales[1], x.dtype).unsqueeze(2)
+        earlier = torch.arange(self.max_seq_len, device=device) < position.unsqueeze(-1)
+        cached = torch.matmul(grouped, keys.transpose(-1, -2)).float() + torch.where(earlier, 0.0, MASKED_SCORE).reshape(batch, 1, 1, 1, -1)
+        own_key = self._round_trip(key, scales[0], x.dtype).unsqueeze(2)
+        own_value = self._round_trip(value, scales[1], x.dtype).unsqueeze(2)
+        causal = steps.unsqueeze(0) <= steps.unsqueeze(-1)
+        own = torch.matmul(grouped, own_key.transpose(-1, -2)).float() + torch.where(causal, 0.0, MASKED_SCORE)
+        weights = torch.softmax(torch.cat((cached, own), dim=-1) * head**-0.5, dim=-1).to(x.dtype)
+        out = torch.matmul(weights[..., : self.max_seq_len], values) + torch.matmul(weights[..., self.max_seq_len :], own_value)
+        out = out.permute(0, 3, 1, 2, 4).reshape(batch, tokens, self.num_heads * head)
+        self._write_both(self._store(key, scales[0]), self._store(value, scales[1]), where)
+        return self.all_reduce(self.o_proj(out * torch.sigmoid(gate)))
+
+    def _verify_fp8(self, query, key, value, position, scales):
+        """Verify attention on the chip over the FP8 cache, through `kernels.verify_attention`. A row's K tokens are
+        query heads of its pairs, and calls take as many rows as fit 128 query rows. Returns the output
+        ``[batch, K, heads * head]`` and the tokens' keys and values as cache bytes."""
+        from .kernels import DECODE_STEP, verify_attention
+
+        k_scale, v_scale = scales
+        batch, heads, tokens, head = query.shape
+        kv_heads, device = self.num_kv_heads, query.device
+        groups = heads // kv_heads
+        per_pair = groups * tokens
+        k_coded, k_held = self._encode(key, k_scale)
+        v_coded, v_held = self._encode(value, v_scale)
+        # Pair (row, KV head), then query head, then token, as the kernel takes them.
+        q = (query.float() * (head**-0.5 * k_scale.float())).to(query.dtype).reshape(batch, kv_heads, groups, tokens, head)
+        limit = position.float().reshape(batch, 1).expand(-1, kv_heads * per_pair)
+        blocks = torch.div(position.max().int() + DECODE_STEP - 1, DECODE_STEP, rounding_mode="floor").reshape(1, 1)
+        rows_per_call = max(1, 128 // (kv_heads * per_pair))
+        outs = []
+        for first in range(0, batch, rows_per_call):
+            rows = min(rows_per_call, batch - first)
+            pairs = rows * kv_heads
+            # A query sees its own pair's tokens up to its own.
+            index_q = torch.arange(pairs * per_pair, device=device)
+            index_k = torch.arange(pairs * tokens, device=device)
+            visible = (index_q.unsqueeze(-1) // per_pair == index_k // tokens) & (index_k % tokens <= index_q.unsqueeze(-1) % tokens)
+            own_mask = torch.where(visible, 0.0, MASKED_SCORE).float()
+            outs.append(
+                verify_attention(
+                    q[first : first + rows].reshape(-1, head), self.k_cache.reshape(-1, head), self.v_cache.reshape(-1, head),
+                    k_held[first : first + rows].reshape(-1, head), v_held[first : first + rows].reshape(-1, head), own_mask,
+                    limit[first : first + rows].reshape(-1, 1), blocks, groups=per_pair, positions=self.max_seq_len, pair_offset=first * kv_heads,
+                )
+            )
+        out = (torch.cat(outs).float() * v_scale.float()).to(query.dtype).reshape(batch, kv_heads, groups, tokens, head)
+        return out.permute(0, 3, 1, 2, 4).reshape(batch, tokens, heads * head), k_coded, v_coded
+
     def _decode_fp8(self, grouped, key, value, position, scales):
         """Decode attention on the chip over the FP8 cache, in the kernel since XLA can't read FP8. Returns the output
         ``[batch, 1, heads * head]`` and the step's key and value as cache bytes."""
@@ -633,12 +795,12 @@ class HeadStep(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, cfg, layer_type, tp_degree, max_seq_len, dtype, all_reduce, batch_size=1):
+    def __init__(self, cfg, layer_type, tp_degree, max_seq_len, dtype, all_reduce, batch_size=1, verify_tokens=0, saved_states=False):
         super().__init__()
         self.cfg = cfg
         self.layer_type = layer_type
         if layer_type == LINEAR:
-            self.linear_attn = GatedDeltaNetStep(cfg, tp_degree, dtype, all_reduce, batch_size)
+            self.linear_attn = GatedDeltaNetStep(cfg, tp_degree, dtype, all_reduce, batch_size, verify_tokens, saved_states)
         elif layer_type == FULL:
             self.self_attn = FullAttentionStep(cfg, tp_degree, max_seq_len, dtype, all_reduce, batch_size)
         else:
@@ -647,10 +809,12 @@ class DecoderLayer(nn.Module):
         self.input_layernorm_weight = _frozen(cfg.hidden_size, dtype=dtype)
         self.post_attention_layernorm_weight = _frozen(cfg.hidden_size, dtype=dtype)
 
-    def forward(self, x, cos, sin, position=None, active=None, slot=None, start=None, n_valid=None):
+    def forward(self, x, cos, sin, position=None, active=None, slot=None, start=None, n_valid=None, accepted=None):
         eps = self.cfg.rms_norm_eps
         h = rms_norm(x, self.input_layernorm_weight, eps)
-        if slot is not None:
+        if accepted is not None:
+            mixer = self.linear_attn.verify(h, position, active, accepted) if self.layer_type == LINEAR else self.self_attn.verify(h, cos, sin, position, active)
+        elif slot is not None:
             mixer = self.linear_attn.prefill(h, slot, start, n_valid) if self.layer_type == LINEAR else self.self_attn.prefill(h, cos, sin, slot, start, n_valid)
         elif self.layer_type == LINEAR:
             mixer = self.linear_attn(h, position, active)
@@ -677,6 +841,18 @@ class Qwen38Step(nn.Module):
         slot: int32 ``[1]``, the row whose state and cache the chunk continues.
         start: int32 ``[1]``, the chunk's first position, a multiple of the chunk. 0 starts a new sequence.
         n_valid: int32 ``[1]``, how many of the chunk's tokens are real. The rest are padding.
+
+    Verify, K tokens per row for speculative decoding (inputs built by `generate.verify_inputs`):
+        inputs_embeds: ``[batch, K, hidden]``: each row's last chosen token, then K - 1 drafted ones.
+        cos, sin: ``[batch, K, rotary_dim]``, for each row's positions `position` onward.
+        position, active: as for decode, for the first of the K tokens.
+        accepted: int32 ``[batch]``, how many of the row's last verify step's tokens to commit first, 0 after a
+            prefill or decode step.
+
+    Saving or restoring one row's recurrent states (inputs built by `generate.state_copy_inputs`), so a prompt that
+    extends one already prefilled can start from a chunk boundary they share:
+        inputs_embeds: ``[1, 1, hidden]``, returned as it is, so blocks chain as for the other calls.
+        save_slot or restore_slot: int32 ``[1]``, the row.
     """
 
     def __init__(
@@ -687,17 +863,27 @@ class Qwen38Step(nn.Module):
         dtype: torch.dtype = torch.bfloat16,
         all_reduce: Callable = identity_all_reduce,
         batch_size: int = 1,
+        verify_tokens: int = 0,
+        saved_states: bool = False,
     ):
         super().__init__()
         cfg.validate_tp(tp_degree)
         self.cfg = cfg
         self.layers = nn.ModuleList(
-            DecoderLayer(cfg, layer_type, tp_degree, max_seq_len, dtype, all_reduce, batch_size)
+            DecoderLayer(cfg, layer_type, tp_degree, max_seq_len, dtype, all_reduce, batch_size, verify_tokens, saved_states)
             for layer_type in cfg.layer_types
         )
 
-    def forward(self, inputs_embeds, cos, sin, position=None, active=None, slot=None, start=None, n_valid=None):
+    def forward(
+        self, inputs_embeds, cos=None, sin=None, position=None, active=None, slot=None, start=None, n_valid=None, save_slot=None, restore_slot=None,
+        accepted=None,
+    ):
+        if save_slot is not None or restore_slot is not None:
+            for layer in self.layers:
+                if layer.layer_type == LINEAR:
+                    layer.linear_attn.copy_states(save_slot if save_slot is not None else restore_slot, to_saved=save_slot is not None)
+            return inputs_embeds
         x = inputs_embeds
         for layer in self.layers:
-            x = layer(x, cos, sin, position, active, slot, start, n_valid)
+            x = layer(x, cos, sin, position, active, slot, start, n_valid, accepted)
         return x

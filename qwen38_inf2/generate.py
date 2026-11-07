@@ -69,6 +69,32 @@ def prefill_inputs(cfg: TextConfig, slot: int, start: int, n_valid: int, chunk: 
     }
 
 
+def verify_inputs(
+    cfg: TextConfig, positions: Sequence[int], tokens: int, max_seq_len: int, dtype: torch.dtype, active: Sequence[bool], accepted: Sequence[int]
+) -> dict[str, torch.Tensor]:
+    """Verify inputs for `tokens` tokens per row from each row's position (`model.Qwen38Step`)."""
+    position = torch.as_tensor(positions, dtype=torch.int32)
+    on = torch.as_tensor(active, dtype=torch.bool)
+    if bool((position[on] + tokens > max_seq_len - 1).any()):
+        raise ValueError(f"a row's {tokens} tokens from position {int(position[on].max())} pass max_seq_len {max_seq_len}")
+    cos, sin = rotary(cfg, (position.unsqueeze(-1) + torch.arange(tokens)).reshape(-1), dtype)
+    return {
+        "cos": cos.reshape(len(positions), tokens, -1),
+        "sin": sin.reshape(len(positions), tokens, -1),
+        "position": position,
+        "active": on.float(),
+        "accepted": torch.as_tensor(accepted, dtype=torch.int32),
+    }
+
+
+def state_copy_inputs(cfg: TextConfig, slot: int, save: bool, dtype: torch.dtype) -> dict[str, torch.Tensor]:
+    """Inputs that save one row's recurrent states, or restore them (`model.Qwen38Step`)."""
+    return {
+        "inputs_embeds": torch.zeros(1, 1, cfg.hidden_size, dtype=dtype),
+        ("save_slot" if save else "restore_slot"): torch.tensor([slot], dtype=torch.int32),
+    }
+
+
 def prefill_prompt(prefill, head, cfg: TextConfig, slot: int, prompt_ids: Sequence[int], chunk: int, dtype: torch.dtype) -> torch.Tensor:
     """Write a whole prompt into `slot` a chunk at a time, and return the last token's hidden state ``[1, 1, hidden]``."""
     hidden = None
