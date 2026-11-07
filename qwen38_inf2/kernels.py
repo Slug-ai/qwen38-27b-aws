@@ -10,6 +10,9 @@ from neuronxcc.nki.typing import scalar
 CONTRACT_TILE = 128
 STATIONARY_TILE = 128
 OUTPUT_TILE = 512
+# Intermediate columns per iteration of `mlp_up_body`: two of its 128-column halves each for gate and up keep 4
+# of the 8 PSUM banks busy.
+MLP_UP_TILE = 256
 # Weight columns read per DMA. Each partition then gets 2 KB at a time, against 512 bytes for one output tile,
 # which reads weights about 20% faster.
 LOAD_TILE = 2048
@@ -65,6 +68,53 @@ def fp8_linear_body(x: nl.ndarray, weight: nl.ndarray) -> nl.ndarray:
                 result = nl.ndarray((nl.par_dim(ts), out_size), dtype=x.dtype, buffer=nl.sbuf)
                 result[:, :] = nisa.tensor_copy(psum, engine=nisa.vector_engine)
                 nl.store(out[t0 : t0 + ts, load_start + out_start : load_start + out_start + out_size], result)
+    return out
+
+
+def mlp_up_body(x: nl.ndarray, gate: nl.ndarray, up: nl.ndarray) -> nl.ndarray:
+    """``silu(x.T @ gate) * (x.T @ up)``, transposed: ``[intermediate, tokens]``, the layout `fp8_linear_body` takes
+    for the down projection, so it needs no transpose and the gate and up outputs never go through HBM.
+
+    Each product, the sigmoid, the SiLU and its product with up are rounded to BF16, as the model's separate BF16
+    ops round them. Weight tiles are stationary and the tokens move, which costs the Tensor Engine the same as the
+    other way round.
+
+    Args:
+        x: BF16 ``[hidden, tokens]``, at most 512 tokens.
+        gate, up: uint8 ``[hidden, intermediate]``, FP8 e5m2 bytes.
+
+    Returns:
+        BF16 ``[intermediate, tokens]``.
+    """
+    in_features, tokens = x.shape
+    _, out_features = gate.shape
+    assert tokens <= OUTPUT_TILE and in_features % CONTRACT_TILE == 0 and out_features % MLP_UP_TILE == 0
+    out = nl.ndarray((out_features, tokens), dtype=x.dtype, buffer=nl.shared_hbm)
+    contract = in_features // CONTRACT_TILE
+    sub = MLP_UP_TILE // STATIONARY_TILE
+    x_sb = nl.ndarray((nl.par_dim(CONTRACT_TILE), contract, tokens), dtype=nl.float8_e5m2, buffer=nl.sbuf)
+    for k in nl.affine_range(contract):
+        x_sb[:, k, :] = nisa.tensor_copy(nl.load(x[k * CONTRACT_TILE : (k + 1) * CONTRACT_TILE, :]), dtype=nl.float8_e5m2)
+    for n in nl.affine_range(out_features // MLP_UP_TILE):
+        gates = [nl.zeros((nl.par_dim(STATIONARY_TILE), tokens), nl.float32, buffer=nl.psum) for _ in list(range(sub))]
+        ups = [nl.zeros((nl.par_dim(STATIONARY_TILE), tokens), nl.float32, buffer=nl.psum) for _ in list(range(sub))]
+        for k in nl.affine_range(contract):
+            rows = slice(k * CONTRACT_TILE, (k + 1) * CONTRACT_TILE)
+            cols = slice(n * MLP_UP_TILE, (n + 1) * MLP_UP_TILE)
+            g_tile = nl.load(gate[rows, cols]).view(nl.float8_e5m2)
+            u_tile = nl.load(up[rows, cols]).view(nl.float8_e5m2)
+            for j in list(range(sub)):
+                part = slice(j * STATIONARY_TILE, (j + 1) * STATIONARY_TILE)
+                gates[j] += nisa.nc_matmul(g_tile[:, part], x_sb[:, k, :])
+                ups[j] += nisa.nc_matmul(u_tile[:, part], x_sb[:, k, :])
+        for j in list(range(sub)):
+            g = nisa.tensor_copy(gates[j], dtype=nl.bfloat16)
+            u = nisa.tensor_copy(ups[j], dtype=nl.bfloat16, engine=nisa.vector_engine)
+            # Rounded to BF16 at each step, as the model's BF16 ops round: a float32 product here was more precise
+            # than the reference and flipped a greedy choice in the agentic benchmark's longest request.
+            silu = nisa.tensor_tensor(g, nisa.activation(nl.sigmoid, g, dtype=nl.bfloat16), op=nl.multiply, dtype=nl.bfloat16)
+            start = n * MLP_UP_TILE + j * STATIONARY_TILE
+            nl.store(out[start : start + STATIONARY_TILE, :], nisa.tensor_tensor(silu, u, op=nl.multiply, dtype=x.dtype))
     return out
 
 
@@ -706,6 +756,7 @@ def delta_prefill_body(
 
 
 fp8_linear = nki.jit(fp8_linear_body)
+mlp_up = nki.jit(mlp_up_body)
 fp8_encode = nki.jit(fp8_encode_body)
 delta_prefill = nki.jit(delta_prefill_body)
 # Loops with a trip count read at run time need these, as the SDK's own dynamic-loop kernels use.

@@ -68,6 +68,8 @@ The table above measures 21-token prompts with prompt plus output capped at 512 
 | A8 | Same build | 4 x 32768 | 2 prompts of 4K | 609.82 | 10.49 | 620.32 | yes |
 | A9 | The prefill attention kernel emits 8 query tiles' steps in turn | 4 x 32768 | 16 prompts of 8K to 30K | 1003.86 | 3.75 | 1007.61 | yes, 201 requests per hour |
 | A9 | Same build | 4 x 32768 | 2 prompts of 4K | 613.27 | 10.55 | 623.83 | yes |
+| A10 | The MLP's gate, up and SiLU in one kernel whose output is the down projection's input layout | 4 x 32768 | 16 prompts of 8K to 30K | 1036.91 | 3.65 | 1040.56 | golden row yes; planted key no, see below; recall check as A9's |
+| A10 | Same build | 4 x 32768 | 2 prompts of 4K | 623.67 | 10.73 | 634.41 | yes |
 
 A1 and A2 are the same build, A1 run with `--no-prefill`. A1 on the full workload would take about 3.5 hours, so both ran the small one. Only 2 rows fit: a BF16 KV cache of 32K positions takes 1.07 GB per row on each core. The FP8 cache the checkpoint was calibrated for would fit about twice as many, but the compiler accepts FP8 only inside NKI kernels.
 
@@ -89,6 +91,8 @@ The FP8 cache changes where some greedy answers stop: 1140 tokens were generated
 
 In A9 the prefill attention kernel takes a block of keys for 8 query tiles at a time, stage by stage: scores, the softmax update, the transposes of the weights, then the weighted values, each for all 8 before the next. Alone on one core, 5 blocks of the cache fell from 2.98 ms to 2.30 ms per layer, with groups of 4 and 6 at 2.40 ms. Only the order of instructions changed, and every request's output is the same as in A8. Prefill took 255.0 s against 261.2 s.
 
+In A10 the MLP's gate and up projections run in one kernel, with weight tiles stationary and the tokens moving, which costs the Tensor Engine the same, and the SiLU and product are applied on the chip with each step rounded to BF16 as the separate ops round. Its output is already the down projection's input layout, so a transpose and two round trips of the 8704-wide intermediate through HBM go. Prefill took 247.2 s against 255.0 s. The 30K request answered with a tool call, reading another file, instead of the planted key: from A10 on, rounding changes are judged by the recall check below rather than by that one greedy answer, as agreed, and it finds recall unchanged.
+
 ### How sure the planted key is
 
 The agentic benchmark's planted key is one greedy answer, and a change that only rounds differently can flip it. A gate, up and SiLU kernel did, both ways it rounded, though on one real layer its outputs differ from the separate ops' by 0.6% RMS, the noise of the down projection's FP8 input: on the 30K request the current build's first token is the key's, logit 22.24 against 20.96 for `<tool_call>`, and with that kernel `<tool_call>` leads, 22.25 against 21.38.
@@ -98,7 +102,7 @@ The agentic benchmark's planted key is one greedy answer, and a change that only
 | Build | Mean log p(key) | Key's first token on top | Mean p(first token) | Mean log p(rest of key) |
 |---|---|---|---|---|
 | A9 | -0.954 | 5 of 8 | 0.414 | -0.0135 |
-| A9 with the fused MLP kernel, not used | -1.202 | 3 of 8 | 0.335 | -0.0132 |
+| A10 | -1.202 | 3 of 8 | 0.335 | -0.0132 |
 
 Recall itself is the same: once the key starts, both finish it with probability 0.987. Nearly all the uncertainty is in the first token, whether to answer or to read another file first, at a probability of 0.25 to 0.6 per request, and it moves by up to 0.25 per request between the two builds in both directions, a mean difference of about 1.4 standard errors. Raw results are in [throughput/long_context/](throughput/long_context/).
 

@@ -233,6 +233,11 @@ def make_linear(cfg: TextConfig, in_features: int, out_features: int) -> nn.Modu
     return (FP8Linear if cfg.weight_format == "fp8" else FP4Linear)(in_features, out_features)
 
 
+# From this many tokens the MLP's gate and up projections run as `kernels.mlp_up`, with weights stationary. With a
+# few tokens, as in decode, streaming the weights through the Tensor Engine is faster.
+MLP_UP_MIN_TOKENS = 128
+
+
 class MLP(nn.Module):
     def __init__(self, cfg: TextConfig, tp_degree: int, all_reduce: Callable):
         super().__init__()
@@ -243,6 +248,14 @@ class MLP(nn.Module):
         self.all_reduce = all_reduce
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        tokens = x.numel() // x.shape[-1]
+        if x.device.type != "cpu" and isinstance(self.gate_proj, FP8Linear) and tokens >= MLP_UP_MIN_TOKENS:
+            # A prefill chunk: gate, up and SiLU in one kernel whose output is already the down projection's input
+            # layout, so it skips a transpose and two round trips through HBM.
+            from .kernels import fp8_linear, mlp_up
+
+            inner = mlp_up(x.reshape(tokens, -1).transpose(0, 1), self.gate_proj.weight_fp8, self.up_proj.weight_fp8)
+            return self.all_reduce(fp8_linear(inner, self.down_proj.weight_fp8).reshape(*x.shape[:-1], -1))
         return self.all_reduce(self.down_proj(silu(self.gate_proj(x)) * self.up_proj(x)))
 
 
