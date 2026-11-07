@@ -89,6 +89,19 @@ The FP8 cache changes where some greedy answers stop: 1140 tokens were generated
 
 In A9 the prefill attention kernel takes a block of keys for 8 query tiles at a time, stage by stage: scores, the softmax update, the transposes of the weights, then the weighted values, each for all 8 before the next. Alone on one core, 5 blocks of the cache fell from 2.98 ms to 2.30 ms per layer, with groups of 4 and 6 at 2.40 ms. Only the order of instructions changed, and every request's output is the same as in A8. Prefill took 255.0 s against 261.2 s.
 
+### How sure the planted key is
+
+The agentic benchmark's planted key is one greedy answer, and a change that only rounds differently can flip it. A gate, up and SiLU kernel did, both ways it rounded, though on one real layer its outputs differ from the separate ops' by 0.6% RMS, the noise of the down projection's FP8 input: on the 30K request the current build's first token is the key's, logit 22.24 against 20.96 for `<tool_call>`, and with that kernel `<tool_call>` leads, 22.25 against 21.38.
+
+`scripts/long_context_check.py` measures recall more steadily. It plants a different key in each of 8 prompts of 8K to 30K tokens, in the first file read or about halfway, asks for it, and scores each of the key's tokens fed back one at a time by its exact log-probability over the whole vocabulary:
+
+| Build | Mean log p(key) | Key's first token on top | Mean p(first token) | Mean log p(rest of key) |
+|---|---|---|---|---|
+| A9 | -0.954 | 5 of 8 | 0.414 | -0.0135 |
+| A9 with the fused MLP kernel, not used | -1.202 | 3 of 8 | 0.335 | -0.0132 |
+
+Recall itself is the same: once the key starts, both finish it with probability 0.987. Nearly all the uncertainty is in the first token, whether to answer or to read another file first, at a probability of 0.25 to 0.6 per request, and it moves by up to 0.25 per request between the two builds in both directions, a mean difference of about 1.4 standard errors. Raw results are in [throughput/long_context/](throughput/long_context/).
+
 Output tokens are few in this workload: requests stop at the end of the answer, about 64 tokens each, and only 2 rows fit at 32K positions, so most of the time is prefill.
 
 Raw results are in [throughput/agentic/](throughput/agentic/).

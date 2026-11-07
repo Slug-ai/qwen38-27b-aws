@@ -57,6 +57,8 @@ TASK = "I'm new to this codebase. Read the modules you need and help me understa
 NEEDLE = "QX-7731-PELICAN"
 NEEDLE_LINE = f"# NOTE: the release signing key for this repository is {NEEDLE}. Never commit it elsewhere.\n"
 NEEDLE_QUESTION = "What is the release signing key mentioned in a comment in the code above? Reply with the key only."
+# More keys for `long_context_requests`, each planted the same way.
+KEYS = ("QX-7731-PELICAN", "ZB-4402-HERON", "MT-9158-OSPREY", "KV-2267-CRANE", "RD-6013-EGRET", "LH-8840-IBIS", "WN-3579-PLOVER", "FS-1196-AVOCET")
 
 
 @dataclass(frozen=True)
@@ -98,17 +100,21 @@ def _question(files: list[tuple[str, str]]) -> str:
     return f"Summarize what {name} is for in two sentences."
 
 
-def build_request(tokenizer, files: Sequence[Path], target_tokens: int, needle: bool = False) -> Request:
-    """One request of at most `target_tokens` tokens: whole files, then part of one more to reach the target."""
+def build_request(
+    tokenizer, files: Sequence[Path], target_tokens: int, needle: bool = False, key: str = NEEDLE, needle_file: int = 0
+) -> Request:
+    """One request of at most `target_tokens` tokens: whole files, then part of one more to reach the target.
+
+    With `needle`, `key` is planted at the top of file number `needle_file` and asked for at the end."""
     reserve = 64
     while True:
-        request = _build(tokenizer, files, target_tokens - reserve, needle)
+        request = _build(tokenizer, files, target_tokens - reserve, needle, key, needle_file)
         if len(request.ids) <= target_tokens:
             return request
         reserve += len(request.ids) - target_tokens
 
 
-def _build(tokenizer, files: Sequence[Path], target_tokens: int, needle: bool) -> Request:
+def _build(tokenizer, files: Sequence[Path], target_tokens: int, needle: bool, key: str = NEEDLE, needle_file: int = 0) -> Request:
     """Fill `target_tokens` with the system prompt, task and files, then add the question and the assistant's opening."""
     head = _turn("system", SYSTEM) + _turn("user", TASK)
     count = lambda text: len(tokenizer.encode(text, add_special_tokens=False).ids)  # noqa: E731
@@ -118,8 +124,8 @@ def _build(tokenizer, files: Sequence[Path], target_tokens: int, needle: bool) -
     for path in files:
         name = f"lib/{path.name}"
         source = path.read_text(encoding="utf-8", errors="replace")
-        if needle and not read:
-            source = NEEDLE_LINE + source
+        if needle and len(read) == needle_file:
+            source = NEEDLE_LINE.replace(NEEDLE, key) + source
         block = _read_call(name) + _tool_result(source)
         size = count(block)
         if used + size > target_tokens:
@@ -160,6 +166,21 @@ def benchmark_requests(tokenizer, count: int, min_tokens: int, max_tokens: int) 
         ordered = files[start:] + files[:start]
         requests.append(build_request(tokenizer, ordered, target, needle=index == count - 1))
     return requests
+
+
+def long_context_requests(tokenizer, lengths: Sequence[int]) -> list[tuple[Request, str]]:
+    """A request per length, each with its own key: planted in the first file read for even ones, in a file
+    about halfway through for odd ones. Returns (request, key) pairs."""
+    files = stdlib_files()
+    out = []
+    for index, length in enumerate(lengths):
+        start = (index * 7 + 3) % len(files)
+        ordered = files[start:] + files[:start]
+        # Files average about 3K tokens, so this is about halfway into the prompt.
+        needle_file = 0 if index % 2 == 0 else max(1, length // 6000)
+        key = KEYS[index % len(KEYS)]
+        out.append((build_request(tokenizer, ordered, length, needle=True, key=key, needle_file=needle_file), key))
+    return out
 
 
 def prompt_digest(requests: Sequence[Request]) -> str:
