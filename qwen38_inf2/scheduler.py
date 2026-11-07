@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 import torch
 
 from .config import TextConfig
-from .drafting import lookup_draft
+from .drafting import Drafter
 from .generate import batch_step_inputs, prefill_inputs, state_copy_inputs, verify_inputs
 
 
@@ -33,6 +33,8 @@ class _Row:
     # Tokens already written to the slot's cache.
     written: int = 0
     tokens: list[int] = field(default_factory=list)
+    # Drafts for speculative decoding, from the row's history so far.
+    drafter: Drafter | None = None
 
 
 class Scheduler:
@@ -207,7 +209,11 @@ class Scheduler:
         drafts, tokens = {}, []
         for slot, row in enumerate(slots):
             if row:
-                draft = lookup_draft(row.ids, k - 1)
+                if row.drafter is None:
+                    row.drafter = Drafter(row.ids)
+                else:
+                    row.drafter.extend(row.ids[len(row.drafter.tokens) :])
+                draft = row.drafter.draft(k - 1)
                 drafts[slot] = draft + [row.ids[-1]] * (k - 1 - len(draft))
                 tokens += [row.ids[-1]] + drafts[slot]
             else:

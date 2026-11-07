@@ -173,3 +173,14 @@ def test_a_slot_never_reuses_states_saved_for_a_different_prompt():
     assert scheduler.reused_tokens == 0
     assert got == alone(first, 3, 64) + alone(other, 3, 64) + alone(first + [9, 9], 3, 64)
 
+
+
+def test_the_drafter_drafts_what_a_scan_of_the_history_drafts():
+    from qwen38_inf2.drafting import Drafter, lookup_draft
+
+    rng = torch.Generator().manual_seed(0)
+    history = torch.randint(0, 6, (400,), generator=rng).tolist()
+    drafter = Drafter(history[:50])
+    for end in range(50, 400):
+        assert drafter.draft(3) == lookup_draft(history[:end], 3), end
+        drafter.extend([history[end]])

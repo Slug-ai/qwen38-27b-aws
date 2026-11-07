@@ -24,6 +24,33 @@ def lookup_draft(history: Sequence[int], count: int, max_match: int = 4, min_mat
     return []
 
 
+class Drafter:
+    """`lookup_draft` kept up as a sequence grows, so each draft is a few dictionary lookups instead of a scan of a
+    30K-token history every step. Gives the same drafts."""
+
+    def __init__(self, history: Sequence[int], max_match: int = 4, min_match: int = 1):
+        self.tokens: list[int] = []
+        self.max_match, self.min_match = max_match, min_match
+        # For each length n, every n tokens that something followed, mapped to where they last started.
+        self.starts = [dict() for _ in range(max_match + 1)]
+        self.extend(history)
+
+    def extend(self, tokens: Sequence[int]) -> None:
+        for token in tokens:
+            end = len(self.tokens)
+            for n in range(1, min(self.max_match, end) + 1):
+                self.starts[n][tuple(self.tokens[end - n : end])] = end - n
+            self.tokens.append(token)
+
+    def draft(self, count: int) -> list[int]:
+        end = len(self.tokens)
+        for n in range(min(self.max_match, end - 1), self.min_match - 1, -1):
+            start = self.starts[n].get(tuple(self.tokens[end - n :]))
+            if start is not None:
+                return self.tokens[start + n : start + n + count]
+        return []
+
+
 def accepted_per_step(history: Sequence[int], output: Sequence[int], draft_len: int) -> list[int]:
     """How many tokens each verify step would emit when greedy decoding produces `output` after `history`: the
     drafted tokens that match, plus the one the model chooses itself."""

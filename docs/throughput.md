@@ -129,6 +129,25 @@ A session's turns run in one slot. After each prompt's last whole chunk, the slo
 |---|---|---|---|---|---|---|---|---|---|
 | M1 | Every turn prefilled whole | 4 x 32768 | 8 sessions, 53 turns | 654969 | 654969 | 1657 | 573.7 s | 1144.6 | key recalled |
 | M1 | Turns continue from the slot's saved states | 4 x 32768 | 8 sessions, 53 turns | 654969 | 204409 | 1657 | 230.3 s | 2851.1 | key recalled; every turn's tokens the same as without |
+| M2 | Speculative decoding, 4 tokens per verify step, below | 4 x 32768 | 8 sessions, 53 turns | 654969 | 204409 | 1664 | 206.7 s | 3177.0 | key recalled; 47 of 53 turns' tokens the same as M1's |
+
+## Speculative decoding
+
+A decode step streams every weight once whatever the rows, so its 121 ms in the blocks buys at most one token per row. A build compiled with `--verify-tokens 4` adds a verify graph that takes 4 tokens per row: the row's last token and 3 drafted from its own history by prompt lookup (`qwen38_inf2/drafting.py`), the tokens that followed the last time its latest 1 to 4 tokens appeared. Coding agents repeat what they have read, in paths, names and edited lines. The drafted tokens the model would have picked itself are kept, with its own pick after them, so each step adds 1 to 4 tokens per row, and the tokens are greedy decoding's up to rounding, since verify does the same arithmetic in another order. Its lm_head graph takes 16 rows (`--head --batch-size 16`).
+
+Attention takes the 4 tokens as extra query heads in an NKI kernel. A gated delta layer can't simply run 4 tokens and keep the state after all of them, since only some may be accepted, so each step keeps its tokens' rank-1 updates, and the next step commits as many as were accepted before running its own. The commit is closed-form, the state decayed by the accepted tokens' total plus each one's key times delta decayed by the tokens after it, and the 4 tokens run as one small chunk of the chunked rule, so the state appears only in matmuls. A kernel, `delta_verify_state`, commits and multiplies the state by the new keys and queries for each row and head in SBUF. Chained on one core, a gated delta layer's verify step takes 0.98 ms against 0.44 ms for decode, where the first verify formulation, 4 recurrent steps as XLA ops, took 1.63 ms. Over 4 blocks a verify step takes 161.7 ms against 121.4 ms for decode and 186.5 ms for the first formulation.
+
+`scripts/speculation_check.py` checks a build's verify graph against decode, teacher-forced on standard library source: verify picks what decode picks at 183 of 192 positions, against 184 for the first formulation, and the text's actual next token at 165 against decode's 163. A version whose commit read the step's own decays instead of the last step's, because NxD wrote the state before the commit read it (see [the field notes](field_notes.md)), agreed at 156 of 192 on similar text and predicted worse than decode, 140 against 148.
+
+| # | Workload | Total tok/s | Plain decoding | Decode time | Tokens the same as plain |
+|---|---|---|---|---|---|
+| A12 | 16 prompts of 8K to 30K, every request 64 tokens (`--ignore-eos`) | 1108.9 | 1092.5 | 33.1 s over 185 steps, against 37.8 s over 315 | 7 of 17 requests |
+| A12 | 16 prompts of 8K to 30K, stopping where the answer does | 976.2 | 953.3 | 72.2 s over 415 steps, against 78.9 s over 632 | 8 of 17 requests |
+| M2 | 8 multi-turn sessions, 53 turns | 3177.0 | 2851.1 | 33.7 s over 198 steps, against 57.1 s over 472 | 47 of 53 turns |
+
+Plain decoding is the same graphs run with `--no-speculation`, or M1 for the sessions. With every request generating 64 tokens, the same work either way, speculation is 1.5% faster in all and decode 12.5% faster. Single-turn answers accept few drafts, 1.43 tokens per row per step, against 2.34 in the sessions, whose replies repeat more of what came before, where decode is 41% faster and the run 11.4%. The answers that stop on their own come out at different lengths, 1871 tokens against 1951, so that row is not like for like. The first formulation gave 1078.5, 891.4 and 3097.2 tok/s on the same three workloads.
+
+Raw results are in [throughput/agentic/](throughput/agentic/) and [throughput/multi_turn/](throughput/multi_turn/).
 
 ## Where the time goes
 

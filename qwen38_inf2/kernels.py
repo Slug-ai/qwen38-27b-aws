@@ -809,10 +809,75 @@ def delta_prefill_body(
     return gated, final
 
 
+# Pairs of a row and value head whose steps the delta verify kernel interleaves.
+DELTA_VERIFY_GROUP = 4
+# Its matmuls' inputs: float32 cost nothing measurable over tfloat32 here, matmuls this small being cheap.
+DELTA_VERIFY_MATMUL_DTYPE = nl.float32
+
+
+def _verify_pair(p, c):
+    """`delta_verify_state_body` for pair `p`. A generator yielding between dependent steps, so `_interleave` can
+    overlap several pairs' chains."""
+    state, scale, weighted, deltas, reads, committed, products = c
+    mm = DELTA_VERIFY_MATMUL_DTYPE
+    k_head, v_head = state.shape[1:]
+    width = reads.shape[2]
+    s = nl.load(state[p], dtype=nl.float32)
+    factor = nl.load(scale[p])
+    w = nisa.tensor_copy(nl.load(weighted[p]), dtype=mm)
+    d = nisa.tensor_copy(nl.load(deltas[p]), dtype=mm)
+    r = nisa.tensor_copy(nl.load(reads[p]), dtype=mm)
+    yield
+    update = _matmul(w, d, k_head, v_head)
+    yield
+    kept = nisa.scalar_tensor_tensor(data=s, op0=nl.multiply, operand0=factor, op1=nl.add, operand1=update, dtype=state.dtype)
+    nl.store(committed[p], kept)
+    yield
+    read = _matmul(r, nisa.tensor_copy(kept, dtype=mm), width, v_head)
+    yield
+    nl.store(products[p], _to_sbuf(read, width, v_head))
+
+
+def delta_verify_state_body(state: nl.ndarray, scale: nl.ndarray, weighted: nl.ndarray, deltas: nl.ndarray, reads: nl.ndarray):
+    """A gated delta layer's verify step against its state, for every pair of a row and value head: the last step's
+    accepted tokens committed, then the new tokens' keys and queries read against the result.
+
+    Also returns a zero, for the caller to add to what the step keeps for the next one, so that is written only
+    after this runs: NxD writes a state in place, and a new value that doesn't depend on the old one could be
+    written first. The commit read this step's log decays instead of the last step's. Passing the values themselves
+    through instead put the layer's other ops in layouts that made the verify graph 3.4 times slower.
+
+    The commit is ``state * scale + weighted.T @ deltas``, so the masks for inactive rows and a sequence's first
+    token come in `scale` and `weighted`. The state stays in SBUF between the two, and the matmuls are float32. As
+    XLA ops, the same steps made the 16-layer verify graph 2.8 times slower.
+
+    Args:
+        state: ``[pairs, k_head, v_head]``, as stored.
+        scale: float32 ``[pairs, k_head, 1]``, the decay over the committed tokens, on every partition.
+        weighted: float32 ``[pairs, K, k_head]``, each pending key times the decay after it, 0 where not committed.
+        deltas: float32 ``[pairs, K, v_head]``, the pending deltas.
+        reads: float32 ``[pairs, k_head, R]``, the new tokens' keys then queries, transposed.
+
+    Returns:
+        (the committed state ``[pairs, k_head, v_head]`` in the state's dtype, float32 ``[pairs, R, v_head]``: each
+        key and query times that state, and a float32 ``[1, 1]`` zero).
+    """
+    pairs, k_head, v_head = state.shape
+    committed = nl.ndarray((pairs, k_head, v_head), dtype=state.dtype, buffer=nl.shared_hbm)
+    products = nl.ndarray((pairs, reads.shape[2], v_head), dtype=nl.float32, buffer=nl.shared_hbm)
+    zero = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.shared_hbm)
+    nl.store(zero, nl.zeros((1, 1), dtype=nl.float32, buffer=nl.sbuf))
+    c = (state, scale, weighted, deltas, reads, committed, products)
+    for p0 in list(range(0, pairs, DELTA_VERIFY_GROUP)):
+        _interleave([_verify_pair(p, c) for p in list(range(p0, min(p0 + DELTA_VERIFY_GROUP, pairs)))])
+    return committed, products, zero
+
+
 fp8_linear = nki.jit(fp8_linear_body)
 mlp_up = nki.jit(mlp_up_body)
 fp8_encode = nki.jit(fp8_encode_body)
 delta_prefill = nki.jit(delta_prefill_body)
+delta_verify_state = nki.jit(delta_verify_state_body)
 # Loops with a trip count read at run time need these, as the SDK's own dynamic-loop kernels use.
 DYNAMIC_LOOP_FLAGS = "experimental-native-scalar-support, experimental-local-tensor-parent"
 prefill_attention = nki.compiler.skip_middle_end_transformations(nki.jit(prefill_attention_body, experimental_flags=DYNAMIC_LOOP_FLAGS))

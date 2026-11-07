@@ -259,6 +259,18 @@ class MLP(nn.Module):
         return self.all_reduce(self.down_proj(silu(self.gate_proj(x)) * self.up_proj(x)))
 
 
+def _commit_and_read(state, scale, weighted, deltas, reads):
+    """`kernels.delta_verify_state` on a chip, and the same in float32 ops on a CPU."""
+    if state.device.type == "cpu":
+        committed = (state.float() * scale + weighted.transpose(1, 2) @ deltas).to(state.dtype)
+        return committed, reads.transpose(1, 2) @ committed.float(), torch.zeros(1, 1)
+    from .kernels import delta_verify_state
+
+    # While NxD traces, tensors made from a state buffer are placeholders, and the kernel's tracer can't take a call
+    # whose every input is one: their data_ptr() reads an original only the buffer itself has.
+    return delta_verify_state(*(t.as_subclass(torch.Tensor) for t in (state, scale, weighted, deltas, reads)))
+
+
 class GatedDeltaNetStep(nn.Module):
     """The gated delta rule with a causal conv: one token per row (decode), or a chunk of one row (prefill)."""
 
@@ -371,22 +383,23 @@ class GatedDeltaNetStep(nn.Module):
         dtype = x.dtype
         batch, tokens = x.shape[:2]
         kernel = self.cfg.linear_conv_kernel_dim
-        on = (active > 0.5).reshape(batch, 1, 1, 1)
-        state = self._live(self.recurrent_state).float()
-        steps = accepted.long().reshape(batch, 1, 1, 1)
-        for t in range(self.pending_key_state.shape[1]):
-            grown = state * self.pending_decay_state[:, t].exp()[..., None, None] + self.pending_key_state[:, t].unsqueeze(-1) * self.pending_delta_state[:, t].unsqueeze(-2)
-            state = torch.where(steps > t, grown, state)
+        on = (active > 0.5).reshape(batch, 1)
+        # A sequence's first token starts from empty states. Inactive rows keep theirs, whatever their position.
+        keep = torch.where((position.reshape(batch, 1) == 0) & on, 0.0, 1.0)
+        # The state after the first `accepted` tokens of the last step, in closed form: their decays applied to the
+        # state they started from, plus each one's key times delta, decayed by the tokens after it. Masks compare
+        # against `accepted` and loops run over the K tokens: the compiler fails on masks from iota.
+        taken = [(accepted.reshape(batch, 1) > s).float() for s in range(self.pending_key_state.shape[1])]
+        decays = [self.pending_decay_state[:, s] * taken[s] for s in range(len(taken))]
+        remaining, weighted = sum(decays), []
+        scale = torch.where(on, remaining.exp() * keep, 1.0)
+        for s in range(len(taken)):
+            remaining = remaining - decays[s]
+            weighted.append(self.pending_key_state[:, s] * (remaining.exp() * taken[s] * keep * on).unsqueeze(-1))
         # The conv's history is the last kernel - 1 inputs before the first token not committed.
         window = torch.cat((self._live(self.conv_state), self.pending_input_state.transpose(1, 2)), dim=-1)
         index = (accepted.long().reshape(batch, 1, 1) + torch.arange(kernel - 1, device=x.device)).expand(-1, window.shape[1], -1)
-        history = window.gather(2, index)
-        # A sequence's first token starts from empty states. Inactive rows keep theirs, whatever their position.
-        keep = torch.where((position == 0) & (active > 0.5), 0.0, 1.0)
-        state = state * keep.reshape(batch, 1, 1, 1)
-        history = history * keep.reshape(batch, 1, 1).to(dtype)
-        committed = torch.where(on, state.to(self.state_dtype), self._live(self.recurrent_state))
-        self.recurrent_state = self._with_live(self.recurrent_state, committed)
+        history = window.gather(2, index) * keep.reshape(batch, 1, 1).to(dtype)
         history = torch.where(on.reshape(batch, 1, 1), history, self._live(self.conv_state))
         self.conv_state = self._with_live(self.conv_state, history)
 
@@ -399,20 +412,45 @@ class GatedDeltaNetStep(nn.Module):
         beta = beta.reshape(batch, tokens, -1) * active.reshape(batch, 1, 1)
         log_decay = log_decay.reshape(batch, tokens, -1) * active.reshape(batch, 1, 1)
 
-        # From the states as committed, so what is kept is exactly what the next step builds on.
-        state = committed.float()
-        outs, deltas = [], []
+        # The commit, and the new keys and queries times the committed state, one row and head at a time. What this
+        # step keeps for the next has the kernel's zero added, so it overwrites the last step's only once read.
+        heads, k_head, v_head = self.recurrent_state.shape[1:]
+        pairs = batch * heads
+        committed, products, zero = _commit_and_read(
+            self._live(self.recurrent_state).reshape(pairs, k_head, v_head),
+            scale.reshape(pairs, 1, 1).expand(-1, k_head, -1),
+            torch.stack(weighted, dim=2).reshape(pairs, -1, k_head),
+            self.pending_delta_state.transpose(1, 2).reshape(pairs, -1, v_head),
+            torch.cat((key, query), dim=1).permute(0, 2, 3, 1).reshape(pairs, k_head, 2 * tokens),
+        )
+        zero = zero.reshape(())
+        self.recurrent_state = self._with_live(self.recurrent_state, committed.reshape(batch, heads, k_head, v_head))
+        products = products.reshape(batch, heads, 2 * tokens, v_head).transpose(1, 2)
+        key_state, query_state = products[:, :tokens], products[:, tokens:]
+
+        # The K tokens as one small chunk of the chunked delta rule from the committed state, so the state appears
+        # only in those products and the tokens' dependence on each other is a K x K triangular solve.
+        cumulative = [log_decay[:, 0]]
+        for t in range(1, tokens):
+            cumulative.append(cumulative[-1] + log_decay[:, t])
+        deltas, outs = [], []
         for t in range(tokens):
-            state = state * log_decay[:, t].exp()[..., None, None]
-            delta = (value[:, t] - (state * key[:, t].unsqueeze(-1)).sum(dim=-2)) * beta[:, t].unsqueeze(-1)
-            state = state + key[:, t].unsqueeze(-1) * delta.unsqueeze(-2)
-            outs.append((state * query[:, t].unsqueeze(-1)).sum(dim=-2))
-            deltas.append(delta)
-        self.pending_key_state = key.float()
-        self.pending_delta_state = torch.stack(deltas, dim=1)
-        self.pending_decay_state = log_decay.float()
-        self.pending_input_state = qkv
-        out = torch.stack(outs, dim=1).reshape(batch * tokens, self.num_v_heads, -1).to(dtype)
+            delta = value[:, t] - cumulative[t].exp().unsqueeze(-1) * key_state[:, t]
+            for s in range(t):
+                coupling = (cumulative[t] - cumulative[s]).exp() * (key[:, t] * key[:, s]).sum(dim=-1)
+                delta = delta - coupling.unsqueeze(-1) * deltas[s]
+            deltas.append(delta * beta[:, t].unsqueeze(-1))
+            out = cumulative[t].exp().unsqueeze(-1) * query_state[:, t]
+            for s in range(t + 1):
+                attend = (cumulative[t] - cumulative[s]).exp() * (query[:, t] * key[:, s]).sum(dim=-1)
+                out = out + attend.unsqueeze(-1) * deltas[s]
+            outs.append(out)
+        delta, out = torch.stack(deltas, dim=1), torch.stack(outs, dim=1)
+        self.pending_key_state = key.float() + zero
+        self.pending_delta_state = delta
+        self.pending_decay_state = log_decay.float() + zero
+        self.pending_input_state = qkv + zero.to(qkv.dtype)
+        out = out.reshape(batch * tokens, self.num_v_heads, -1).to(dtype)
         return self.all_reduce(self._finish(out, z, dtype).reshape(batch, tokens, -1))
 
     def copy_states(self, slot: torch.Tensor, to_saved: bool) -> None:
