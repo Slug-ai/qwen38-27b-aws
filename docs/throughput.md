@@ -78,6 +78,8 @@ The table above measures 21-token prompts with prompt plus output capped at 512 
 | A14 | Same build | 4 x 32768 | 16 prompts of 8K to 30K | 1135.94 | 5.52 | 1141.46 | golden row yes; planted key yes, 228 requests per hour |
 | A15 | Each block's output goes to the next on the chip, not through the host, below | 4 x 32768 | 16 prompts of 8K to 30K, every request 64 tokens | 1188.87 | 4.24 | 1193.12 | golden row yes; planted key yes; every output the same as A14's |
 | A15 | Same build | 4 x 32768 | 16 prompts of 8K to 30K | 1144.83 | 5.57 | 1150.39 | golden row yes; planted key yes, 230 requests per hour; every output the same as A14's |
+| A16 | The prefill attention kernel computes scores with keys on partitions, so the softmax weights need no transposes, below | 4 x 32768 | 16 prompts of 8K to 30K, every request 64 tokens | 1215.43 | 4.34 | 1219.76 | golden row yes; planted key no, below; recall check better |
+| A16 | Same build | 4 x 32768 | 16 prompts of 8K to 30K | 1159.14 | 5.50 | 1164.63 | golden row yes; planted key no, 233 requests per hour; recall check better |
 
 A1 and A2 are the same build, A1 run with `--no-prefill`. A1 on the full workload would take about 3.5 hours, so both ran the small one. Only 2 rows fit: a BF16 KV cache of 32K positions takes 1.07 GB per row on each core. The FP8 cache the checkpoint was calibrated for would fit about twice as many, but the compiler accepts FP8 only inside NKI kernels.
 
@@ -105,6 +107,8 @@ A13 changes how the gated delta prefill kernel inverts each 128-token piece's tr
 
 In A15 the 4 blocks hand the hidden state to each other on the chip. NxD's default forward copies rank 0's output to the host after every block and both ranks' inputs back, 5 MB each way for a prefill chunk. Its ranked forward instead returns each rank's output where it is, a tensor on the Neuron device (`privateuseone`), which the next block takes as that rank's input, and only the last block's output comes back (`ranked_to_cpu`). Chained over 4 blocks from the same states, a prefill chunk took 376.2 ms against 383.8 ms with the same bytes out, and a verify step 135.5 ms either way. In the benchmarks prefill took 237.7 s against 240.3 s, 4.3 ms less per chunk.
 
+In A16 the prefill attention kernel computes each block's scores transposed, a tile of 128 keys by a query head's 512 tokens per matmul, so the exp writes the softmax weights already laid out for the values' matmul. The online softmax needed each query's maximum, which only the untransposed scores give cheaply, and then 16 Tensor Engine transposes per query tile per 2048-key block and copies of them out of PSUM. Instead the kernel subtracts one constant per KV head, which cancels in each query's normalization like a per-query maximum does, and takes each query's weights' sum from a column of ones beside the values. The constant is the smaller of two limits. One is a bound on the layer's scores less 70: a normed query or key is at most sqrt(256) times its norm's largest weight long, so a score is at most 16 times both weights, 42 to 124 across the 16 attention layers, plus 8% for FP8 keys' rounding. That keeps every weight under e^70. The other is the lowest score of any of the chunk's queries with its own key plus 80, so every query keeps at least e^-80 on its own key and no sum underflows. Alone on one core with an FP8 cache, a layer took 1.397 ms against 1.951 at an 8K start, 2.672 against 3.727 at 16K and 4.913 against 6.826 at 30K, and its outputs matched a float64 reference as closely as the old kernel's. In the benchmarks prefill took 231.8 s against 237.7 s, and 158.0 s against 162.5 s in the sessions. The 30K request's greedy answer, unlike A15's, declined to repeat the key it was asked for: it named the comment in `lib/threading.py` that holds it and called it a prompt injection. The recall check, which scores the key itself, is better than A13's (below).
+
 A11's total is lower than A10's only because its greedy answers ran longer: 1951 tokens generated against 1229, four requests reaching the 256-token cap, so decode took 78.1 s over 632 steps. On the same prompts prefill took 241.9 s against 247.2 s, 2.1% less, and decode 40.0 ms per generated token against 42.2. The kernel's inputs keep 10 mantissa bits instead of 23, still more than the BF16 the recurrent state is stored in between chunks.
 
 ### How sure the planted key is
@@ -119,6 +123,9 @@ The agentic benchmark's planted key is one greedy answer, and a change that only
 | A10 | -1.202 | 3 of 8 | 0.335 | -0.0132 |
 | A11 | -1.017 | 5 of 8 | 0.399 | -0.0079 |
 | A13 | -1.201 | 4 of 8 | 0.343 | -0.0181 |
+| A16 | -0.698 | 7 of 8 | 0.535 | -0.0113 |
+
+A16 against A13 is +0.503 ± 0.167 in log p(key), higher on 7 of the 8 requests.
 
 A13 against A11, request by request, is -0.184 ± 0.24 (one standard error) in log p(key), the requests moving both ways (one from p = 0.165 to 0.625 for the key's first token), as A10 was at -0.185 ± 0.16.
 
@@ -149,6 +156,7 @@ In M3 the states are saved after each prompt's last chunk, full or not, and the 
 | M4 | A13's gated delta prefill solve | 4 x 32768 | 8 sessions, 53 turns | 654969 | 192176 | 1633 | 194.1 s | 3382.6 | session 0's last turn searched for the key with a tool call instead of answering it; 35 of 53 turns' tokens the same as M3's |
 | M5 | A14's drafts from the MTP layer | 4 x 32768 | 8 sessions, 53 turns | 654969 | 192176 | 1634 | 192.0 s | 3420.4 | session 0's last turn searched for the key with a tool call, as in M4; 51 of 53 turns' tokens the same as M4's |
 | M6 | A15's blocks handing their outputs on on the chip | 4 x 32768 | 8 sessions, 53 turns | 654969 | 192176 | 1634 | 190.1 s | 3454.5 | as M5, every turn's tokens the same as M5's |
+| M7 | A16's prefill attention kernel | 4 x 32768 | 8 sessions, 53 turns | 654969 | 192176 | 1609 | 185.2 s | 3546.1 | as M5 |
 
 ## Speculative decoding
 

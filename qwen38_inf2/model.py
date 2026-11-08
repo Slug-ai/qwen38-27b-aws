@@ -768,21 +768,29 @@ class FullAttentionStep(nn.Module):
             all_values = torch.cat((cache_values, own_values), dim=1)
             out = blocked_attention(grouped, all_keys, all_values, visible, ATTENTION_BLOCK)
         else:
-            from .kernels import KEY_BLOCK, prefill_attention
+            from .kernels import KEY_BLOCK, SCORE_HEADROOM, prefill_attention
 
             starts = start.float().reshape(1, 1).expand(128, 1)
             first_block = (slot.int() * (self.num_kv_heads * self.max_seq_len // KEY_BLOCK)).reshape(1, 1)
             # Only the cache blocks before `start` hold this row's keys, and the kernel visits only those.
             blocks = torch.div(start.int() + KEY_BLOCK - 1, KEY_BLOCK, rounding_mode="floor").reshape(1, 1)
+            ceiling = (self._score_bound() - SCORE_HEADROOM).reshape(1, 1).expand(128, 1)
             out = prefill_attention(
                 grouped.transpose(1, 2), self.k_cache.reshape(-1, head), self.v_cache.reshape(-1, head),
-                own_keys.transpose(1, 2), own_values, starts, first_block, blocks, positions=self.max_seq_len,
+                own_keys.transpose(1, 2), own_values, starts, first_block, blocks, ceiling, positions=self.max_seq_len,
             )
             if self.fp8_cache:
                 out = out.float() * scales[1].float()
         out = out.to(x.dtype).reshape(self.num_heads, tokens, head).transpose(0, 1).reshape(1, tokens, self.num_heads * head)
         self._write_chunk(k_coded, v_coded, slot, start)
         return self.all_reduce(self.o_proj(out * torch.sigmoid(gate)))
+
+    def _score_bound(self) -> torch.Tensor:
+        """The most any of this layer's scores can be. A normed query or key is at most sqrt(head) times its norm's
+        largest weight long, rotary terms keep lengths, and a score is their product over sqrt(head). The 8% covers
+        FP8 keys, which round by up to 1/16, and BF16 queries."""
+        head = self.cfg.head_dim
+        return (1.0 + self.q_norm_weight.float()).abs().max() * (1.0 + self.k_norm_weight.float()).abs().max() * head**0.5 * 1.08
 
     def cache_chunk(self, x, cos, sin, slot, start) -> None:
         """Only what `prefill` writes for a chunk, its keys and values, for a layer whose prefill output nothing

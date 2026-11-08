@@ -313,6 +313,33 @@ def test_attention_cache_chunk_writes_what_prefill_writes():
         assert attn.k_cache[1, :, : 2 * CHUNK].abs().sum() > 0
 
 
+def test_attention_score_bound_holds():
+    """The prefill attention kernel subtracts `FullAttentionStep._score_bound` less a headroom from its scores, so
+    no score may exceed it, here with norm weights large in the same few dims and inputs along those dims."""
+    from qwen38_inf2 import fp4
+    from qwen38_inf2.generate import rotary
+    from qwen38_inf2.model import FullAttentionStep, identity_all_reduce
+
+    cfg = replace(tiny_config(), weight_format="fp8")
+    torch.manual_seed(3)
+    attn = FullAttentionStep(cfg, 1, MAX_SEQ_LEN, torch.float32, identity_all_reduce, 1).eval()
+    for name, param in attn.named_parameters():
+        param.data = fp4.float_to_fp8(torch.randn(param.shape) * 0.2) if name.endswith("weight_fp8") else torch.randn(param.shape) * 0.5
+    attn.q_norm_weight.data[:2] = 4.0
+    attn.k_norm_weight.data[:2] = -6.0
+    x = torch.randn(1, 64, cfg.hidden_size)
+    cos, sin = rotary(cfg, torch.arange(64), torch.float32)
+    with torch.no_grad():
+        query, key, _, _ = attn._project(x, cos.unsqueeze(0), sin.unsqueeze(0))
+    scores = torch.einsum("hqd,kd->hqk", query[0], key[0, 0]) / cfg.head_dim**0.5
+    bound = attn._score_bound()
+    assert scores.abs().max() <= bound
+    # The bound is reached by a normed query and key with all their mass on the dim where both weights are largest.
+    q_norm, k_norm = (1 + attn.q_norm_weight).abs(), (1 + attn.k_norm_weight).abs()
+    reach = cfg.head_dim**0.5 * q_norm.max() * k_norm.max()
+    assert reach <= bound <= 1.081 * reach
+
+
 def test_mtp_prefill_and_steps_draft_alike():
     """The MTP layer's prefill and its steps must agree: a row's indices run through prefill chunks, then the next
     ones as steps of K, give what running them all as steps gives, and its output is the next step's input."""
