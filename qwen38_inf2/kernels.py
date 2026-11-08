@@ -118,6 +118,11 @@ def mlp_up_body(x: nl.ndarray, gate: nl.ndarray, up: nl.ndarray) -> nl.ndarray:
     return out
 
 
+# The FP8 type lm_head's rows take against its FP8 e5m2 weights, and the weight columns per load.
+HEAD_X_DTYPE = nl.float8_e5m2
+HEAD_LOAD_WIDTH = 2048
+
+
 def lm_head_group_maxima_body(x: nl.ndarray, weight: nl.ndarray, group_rows: int) -> nl.ndarray:
     """The largest logit in each group of `group_rows` tokens, for every row of a batch.
 
@@ -135,24 +140,35 @@ def lm_head_group_maxima_body(x: nl.ndarray, weight: nl.ndarray, group_rows: int
     out = nl.ndarray((batch, (tokens + group_rows - 1) // group_rows), dtype=nl.float32, buffer=nl.shared_hbm)
     contract_tiles = _tiles(hidden, CONTRACT_TILE)
 
+    # With FP8 weights the rows go to FP8 too: a BF16 stationary made the Vector Engine widen every weight tile
+    # to BF16 first, 6.8 ms of casts per call against 3.7 ms of matmuls.
+    fp8 = weight.dtype != nl.bfloat16
     x_tiles = []
     for start, size in contract_tiles:
-        x_tiles.append(nl.load(x[start : start + size, :]))
+        tile = nl.load(x[start : start + size, :])
+        x_tiles.append(nisa.tensor_copy(tile, dtype=HEAD_X_DTYPE) if fp8 else tile)
 
-    # A multiple of group_rows, so no group straddles two tiles.
-    for out_start, out_size in _tiles(tokens, OUTPUT_TILE - OUTPUT_TILE % group_rows):
-        psum = nl.zeros((nl.par_dim(batch), out_size), nl.float32, buffer=nl.psum)
+    # A multiple of group_rows, so no group straddles two tiles. Each load takes HEAD_LOAD_WIDTH columns, several
+    # matmuls' worth, since short rows of a load left the DMA queues at a quarter of their bandwidth.
+    tile_width = OUTPUT_TILE - OUTPUT_TILE % group_rows
+    for load_start, load_size in _tiles(tokens, HEAD_LOAD_WIDTH - HEAD_LOAD_WIDTH % tile_width):
+        outputs = _tiles(load_size, tile_width)
+        psums = [nl.zeros((nl.par_dim(batch), size), nl.float32, buffer=nl.psum) for _, size in outputs]
         for x_tile, (start, size) in zip(x_tiles, contract_tiles):
-            moving = nl.load(weight[start : start + size, out_start : out_start + out_size])
-            psum += nisa.nc_matmul(x_tile, moving if weight.dtype == nl.bfloat16 else moving.view(nl.float8_e5m2))
-        logits = nl.ndarray((nl.par_dim(batch), out_size), dtype=nl.float32, buffer=nl.sbuf)
-        logits[:, :] = nisa.tensor_copy(psum, engine=nisa.vector_engine)
-        groups = _tiles(out_size, group_rows)
-        maxima = nl.ndarray((nl.par_dim(batch), len(groups)), dtype=nl.float32, buffer=nl.sbuf)
-        for index, (start, size) in enumerate(groups):
-            maxima[:, index : index + 1] = nisa.tensor_reduce(nl.maximum, logits[:, start : start + size], axis=[1], keepdims=True)
-        first = out_start // group_rows
-        nl.store(out[:, first : first + len(groups)], maxima)
+            moving = nl.load(weight[start : start + size, load_start : load_start + load_size])
+            if fp8:
+                moving = moving.view(nl.float8_e5m2)
+            for psum, (out_start, out_size) in zip(psums, outputs):
+                psum += nisa.nc_matmul(x_tile, moving[:, out_start : out_start + out_size])
+        for psum, (out_start, out_size) in zip(psums, outputs):
+            logits = nl.ndarray((nl.par_dim(batch), out_size), dtype=nl.float32, buffer=nl.sbuf)
+            logits[:, :] = nisa.tensor_copy(psum, engine=nisa.vector_engine)
+            groups = _tiles(out_size, group_rows)
+            maxima = nl.ndarray((nl.par_dim(batch), len(groups)), dtype=nl.float32, buffer=nl.sbuf)
+            for index, (start, size) in enumerate(groups):
+                maxima[:, index : index + 1] = nisa.tensor_reduce(nl.maximum, logits[:, start : start + size], axis=[1], keepdims=True)
+            first = (load_start + out_start) // group_rows
+            nl.store(out[:, first : first + len(groups)], maxima)
     return out
 
 
