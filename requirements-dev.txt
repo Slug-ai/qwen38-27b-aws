@@ -10,3 +10,5 @@ accelerate
 loguru
 pydantic
 psutil
+# The OpenAI-compatible API that scripts/serve.py runs. Install it on the instance too.
+slug-api @ git+https://github.com/Slug-ai/slug-api
