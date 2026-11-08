@@ -85,6 +85,8 @@ The table above measures 21-token prompts with prompt plus output capped at 512 
 | A18 | The attention kernels load each block of the cache in one DMA per KV head, below | 4 x 32768 | 16 prompts of 8K to 30K, every request 64 tokens | 1236.85 | 4.41 | 1241.26 | golden row yes; planted key yes; recall check as A16's |
 | A18 | Same build | 4 x 32768 | 16 prompts of 8K to 30K | 1211.84 | 4.00 | 1215.84 | golden row yes; planted key yes, 243 requests per hour; answers shorter, 1006 tokens against 1446 |
 | A19 | The host rechecks lm_head's candidates from slices of its memory map, and drafts only the chip's best group | 4 x 32768 | 16 prompts of 8K to 30K, every request 64 tokens | 1239.16 | 4.42 | 1243.58 | as A18; 16 of 17 requests' tokens the same; decode 16.0 s against 16.4 |
+| A20 | The MTP layer's graph compiled again from this code, so its steps get A18's verify attention: every build in the table's last row is now this tree's | 4 x 32768 | 16 prompts of 8K to 30K, every request 64 tokens | 1243.01 | 4.43 | 1247.44 | as A18; decode 15.6 s against 16.0 |
+| A20 | Same build | 4 x 32768 | 16 prompts of 8K to 30K | 1208.25 | 4.40 | 1212.65 | golden row yes; planted key yes, 242 requests per hour |
 
 A1 and A2 are the same build, A1 run with `--no-prefill`. A1 on the full workload would take about 3.5 hours, so both ran the small one. Only 2 rows fit: a BF16 KV cache of 32K positions takes 1.07 GB per row on each core. The FP8 cache the checkpoint was calibrated for would fit about twice as many, but the compiler accepts FP8 only inside NKI kernels.
 
@@ -172,6 +174,7 @@ In M3 the states are saved after each prompt's last chunk, full or not, and the 
 | M8 | A17's lm_head kernel | 4 x 32768 | 8 sessions, 53 turns | 654969 | 192176 | 1609 | 183.1 s | 3585.4 | as M5; every turn's tokens the same as M7's |
 | M9 | A18's attention kernels' block loads | 4 x 32768 | 8 sessions, 53 turns | 654969 | 192176 | 1611 | 179.7 s | 3654.8 | as M5; 47 of 53 turns' tokens the same as M8's |
 | M10 | A19's recheck | 4 x 32768 | 8 sessions, 53 turns | 654969 | 192176 | 1611 | 179.5 s | 3657.1 | as M5; every turn's tokens the same as M9's; decode 23.0 s against 23.7 |
+| M11 | A20's MTP graph | 4 x 32768 | 8 sessions, 53 turns | 654969 | 192176 | 1611 | 179.1 s | 3666.6 | as M5; decode 22.7 s against 23.0 |
 
 ## Speculative decoding
 
