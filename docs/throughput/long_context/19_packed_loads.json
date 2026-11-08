@@ -1,0 +1,64 @@
+{
+ "build": "/root/qwen-dev/artifacts/block16_b4_s32k_c512_packd",
+ "requests": 8,
+ "mean_key_logprob": -0.7023090643629075,
+ "first_token_top": 7,
+ "rows": [
+  {
+   "key_logprob": -0.5319209258741466,
+   "first_token_rank": 1,
+   "first_token_p": 0.5968839526176453,
+   "prompt_tokens": 8150,
+   "key": "QX-7731-PELICAN"
+  },
+  {
+   "key_logprob": -0.8784834591497201,
+   "first_token_rank": 1,
+   "first_token_p": 0.4170367419719696,
+   "prompt_tokens": 12246,
+   "key": "ZB-4402-HERON"
+  },
+  {
+   "key_logprob": -0.3418814317701617,
+   "first_token_rank": 1,
+   "first_token_p": 0.7162731289863586,
+   "prompt_tokens": 16352,
+   "key": "MT-9158-OSPREY"
+  },
+  {
+   "key_logprob": -0.4255649127444485,
+   "first_token_rank": 1,
+   "first_token_p": 0.6584319472312927,
+   "prompt_tokens": 20446,
+   "key": "KV-2267-CRANE"
+  },
+  {
+   "key_logprob": -1.1611906899233873,
+   "first_token_rank": 2,
+   "first_token_p": 0.3166470527648926,
+   "prompt_tokens": 24543,
+   "key": "RD-6013-EGRET"
+  },
+  {
+   "key_logprob": -0.36331822638749145,
+   "first_token_rank": 1,
+   "first_token_p": 0.6999240517616272,
+   "prompt_tokens": 27608,
+   "key": "LH-8840-IBIS"
+  },
+  {
+   "key_logprob": -0.8203256936758407,
+   "first_token_rank": 1,
+   "first_token_p": 0.44572535157203674,
+   "prompt_tokens": 29917,
+   "key": "WN-3579-PLOVER"
+  },
+  {
+   "key_logprob": -1.0957871753780637,
+   "first_token_rank": 1,
+   "first_token_p": 0.3413083851337433,
+   "prompt_tokens": 29917,
+   "key": "FS-1196-AVOCET"
+  }
+ ]
+}

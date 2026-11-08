@@ -348,10 +348,14 @@ def _prefill_attention(q, k_cache, v_cache, k_new, v_new, start, first_block, co
     q_tiles = _tiles(queries, STATIONARY_TILE)
     start_tile = nl.load(start)
     ceiling_tile = nl.load(ceiling)
-    k_blocks = k_cache.reshape((k_cache.shape[0] // KEY_BLOCK, KEY_BLOCK, head))
-    v_blocks = v_cache.reshape((v_cache.shape[0] // KEY_BLOCK, KEY_BLOCK, head))
+    # Each block of the cache comes in one load: partition p takes the block's positions per_partition * p on,
+    # contiguous, so a load's rows are per_partition keys long, where 128-position tiles made them one key long and
+    # left the DMA queues waiting. Key tile j then holds positions per_partition * p + j.
+    per_partition = KEY_BLOCK // STATIONARY_TILE
+    k_blocks = k_cache.reshape((k_cache.shape[0] // KEY_BLOCK, STATIONARY_TILE, per_partition * head))
+    v_blocks = v_cache.reshape((v_cache.shape[0] // KEY_BLOCK, STATIONARY_TILE, per_partition * head))
+    i_w = nl.arange(per_partition * head)[None, :]
     i_p = nl.arange(STATIONARY_TILE)[:, None]
-    i_h = nl.arange(head)[None, :]
     i_s = nl.arange(STATIONARY_TILE)[None, :]
     i_c = nl.arange(chunk)[None, :]
     identity = nisa.affine_select(i_p - i_s == 0, nl.ones((nl.par_dim(STATIONARY_TILE), STATIONARY_TILE), dtype=nl.bfloat16, buffer=nl.sbuf), 0.0)
@@ -363,7 +367,7 @@ def _prefill_attention(q, k_cache, v_cache, k_new, v_new, start, first_block, co
     zero = nl.zeros((nl.par_dim(STATIONARY_TILE), chunk), dtype=nl.float32, buffer=nl.sbuf)
     # Own key tile kt holds tokens 128 kt + p, which query column i (token i of its head's chunk) sees from i on.
     own_masks = [nisa.affine_select(i_c - i_p - kt * STATIONARY_TILE >= 0, zero, MASKED) for kt in list(range(chunk // STATIONARY_TILE))]
-    tile_positions = nisa.iota(i_p + 0 * nl.arange(1)[None, :], dtype=nl.float32)
+    tile_positions = nisa.iota(per_partition * i_p + 0 * nl.arange(1)[None, :], dtype=nl.float32)
 
     def with_ones(values_tile, convert: bool):
         tile = nl.ndarray((nl.par_dim(STATIONARY_TILE), head + 1), dtype=nl.bfloat16, buffer=nl.sbuf)
@@ -393,15 +397,18 @@ def _prefill_attention(q, k_cache, v_cache, k_new, v_new, start, first_block, co
         for _ in range(scalar(count)):
             keys = [nl.ndarray((nl.par_dim(ds), KEY_BLOCK), dtype=q.dtype, buffer=nl.sbuf) for _, ds in d_tiles]
             values, biases = [], []
-            for k0 in list(range(0, KEY_BLOCK, STATIONARY_TILE)):
-                rows = nl.load(k_blocks[at, k0 + i_p, i_h])
-                values.append(with_ones(nl.load(v_blocks[at, k0 + i_p, i_h]), fp8))
+            block_keys = nl.load(k_blocks[at, i_p, i_w])
+            block_values = nl.load(v_blocks[at, i_p, i_w])
+            for j in list(range(per_partition)):
+                k0 = j * STATIONARY_TILE
+                rows = block_keys[:, j * head : (j + 1) * head]
+                values.append(with_ones(block_values[:, j * head : (j + 1) * head], fp8))
                 if fp8:
                     rows = rows.view(nl.float8_e4m3)
                 for d, (d0, ds) in enumerate(d_tiles):
                     keys[d][:, k0 : k0 + STATIONARY_TILE] = _transposed(rows[:, d0 : d0 + ds], ds, STATIONARY_TILE, q.dtype, identity_fp8)
                 # Positions from `start` on hold no keys for this chunk yet.
-                hidden = nisa.tensor_scalar(base, nl.add, float(k0), op1=nl.greater_equal, operand1=start_tile)
+                hidden = nisa.tensor_scalar(base, nl.add, float(j), op1=nl.greater_equal, operand1=start_tile)
                 biases.append(nisa.tensor_scalar(hidden, nl.multiply, MASKED, op1=nl.add, operand1=minus))
             attend(keys, values, biases, None)
             at[...] = nisa.tensor_scalar(at, nl.add, 1)
@@ -423,6 +430,8 @@ DECODE_BLOCK = 1024
 DECODE_SPLIT = 2
 DECODE_STEP = DECODE_SPLIT * DECODE_BLOCK
 DECODE_CONVERT_ENGINE = nisa.scalar_engine
+# Whether the decode attention kernel loads each block of the cache in one DMA per pair (`_decode_attention`).
+DECODE_PACKED = True
 
 
 def decode_attention_body(
@@ -523,16 +532,37 @@ def _decode_attention(q, k_cache, v_cache, k_own, v_own, limit, count, groups: i
     cached_pairs = k_cache.shape[0] // positions
     k_steps = k_cache.reshape((cached_pairs, positions // step, DECODE_SPLIT, DECODE_BLOCK, head))
     v_steps = v_cache.reshape((cached_pairs, positions // step, DECODE_SPLIT, DECODE_BLOCK, head))
-    later = nisa.iota(nl.arange(step)[None, :] + 0 * i_r, dtype=nl.float32)
     halves = list(range(DECODE_SPLIT))
+    per_partition = DECODE_BLOCK // STATIONARY_TILE
+    if DECODE_PACKED:
+        # Each block in one load per pair: partition p takes the block's positions per_partition * p on, contiguous,
+        # so every row of the load is per_partition keys long. Tile j of a block then holds positions
+        # per_partition * p + j, and its columns of the scores and the mask follow that order.
+        k_packed = k_cache.reshape((cached_pairs, positions // step, DECODE_SPLIT, STATIONARY_TILE, per_partition * head))
+        v_packed = v_cache.reshape((cached_pairs, positions // step, DECODE_SPLIT, STATIONARY_TILE, per_partition * head))
+        i_w = nl.arange(per_partition * head)[None, :]
+        later = nl.ndarray((nl.par_dim(queries), step), dtype=nl.float32, buffer=nl.sbuf)
+        for half in halves:
+            for j in list(range(per_partition)):
+                at = half * DECODE_BLOCK + j * STATIONARY_TILE
+                later[:, at : at + STATIONARY_TILE] = nisa.iota(half * DECODE_BLOCK + j + per_partition * i_s + 0 * i_r, dtype=nl.float32)
+    else:
+        later = nisa.iota(nl.arange(step)[None, :] + 0 * i_r, dtype=nl.float32)
     for b in range(scalar(count)):
         raw = [[[] for _ in list(range(pairs))] for _ in halves]
         for half in halves:
             for p in list(range(pairs)):
-                for k0 in list(range(0, DECODE_BLOCK, STATIONARY_TILE)):
-                    rows = nl.load(k_steps[pair_offset + p, b, half, k0 + i_p, i_h])
-                    cached_values = nl.load(v_steps[pair_offset + p, b, half, k0 + i_p, i_h])
-                    raw[half][p].append((rows, cached_values))
+                # NKI's tracer doesn't honor `continue`, so the two ways of loading are branches.
+                if DECODE_PACKED:
+                    block_keys = nl.load(k_packed[pair_offset + p, b, half, i_p, i_w])
+                    block_values = nl.load(v_packed[pair_offset + p, b, half, i_p, i_w])
+                    for j in list(range(per_partition)):
+                        raw[half][p].append((block_keys[:, j * head : (j + 1) * head], block_values[:, j * head : (j + 1) * head]))
+                else:
+                    for k0 in list(range(0, DECODE_BLOCK, STATIONARY_TILE)):
+                        rows = nl.load(k_steps[pair_offset + p, b, half, k0 + i_p, i_h])
+                        cached_values = nl.load(v_steps[pair_offset + p, b, half, k0 + i_p, i_h])
+                        raw[half][p].append((rows, cached_values))
         keys = [[] for _ in halves]
         values = [[] for _ in halves]
         masked = []

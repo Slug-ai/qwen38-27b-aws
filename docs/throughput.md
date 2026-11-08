@@ -82,6 +82,8 @@ The table above measures 21-token prompts with prompt plus output capped at 512 
 | A16 | Same build | 4 x 32768 | 16 prompts of 8K to 30K | 1159.14 | 5.50 | 1164.63 | golden row yes; planted key no, 233 requests per hour; recall check better |
 | A17 | The lm_head kernel loads 2048 weight columns at a time and takes its rows as FP8 e5m2, below | 4 x 32768 | 16 prompts of 8K to 30K, every request 64 tokens | 1222.93 | 4.36 | 1227.29 | as A16; every output the same as A16's |
 | A17 | Same build | 4 x 32768 | 16 prompts of 8K to 30K | 1168.22 | 5.54 | 1173.76 | as A16, 234 requests per hour; every output the same as A16's |
+| A18 | The attention kernels load each block of the cache in one DMA per KV head, below | 4 x 32768 | 16 prompts of 8K to 30K, every request 64 tokens | 1236.85 | 4.41 | 1241.26 | golden row yes; planted key yes; recall check as A16's |
+| A18 | Same build | 4 x 32768 | 16 prompts of 8K to 30K | 1211.84 | 4.00 | 1215.84 | golden row yes; planted key yes, 243 requests per hour; answers shorter, 1006 tokens against 1446 |
 
 A1 and A2 are the same build, A1 run with `--no-prefill`. A1 on the full workload would take about 3.5 hours, so both ran the small one. Only 2 rows fit: a BF16 KV cache of 32K positions takes 1.07 GB per row on each core. The FP8 cache the checkpoint was calibrated for would fit about twice as many, but the compiler accepts FP8 only inside NKI kernels.
 
@@ -113,6 +115,8 @@ In A16 the prefill attention kernel computes each block's scores transposed, a t
 
 In A17 the lm_head graph, which a verify step calls 4 times (its own picks and each of the MTP layer's 3 drafts), takes 3.0 ms per core against 6.2 ms. Its profile had the Vector Engine casting every FP8 weight tile to BF16 for a BF16 stationary, 6.8 ms of busy time, and the DMA queues moving 635 MB at about 100 GB/s, since each load was 512 columns wide. Wider loads alone took it to 5.2 ms, where the casts bound it, and rows rounded to FP8 e5m2 as well, so the Tensor Engine multiplies FP8 by FP8, to 3.0 ms (4096 columns gave the same). The chip only picks candidate groups, and the host rechecks the best 4 exactly. With final hidden states from 3072 positions of agentic prompts, the true greedy token was in the chip's best 4 groups at every position with BF16, e5m2 or e4m3 rows, and in the best 2 at all but one with e5m2. A verify step takes 196 ms against 213, and every output is the same as A16's.
 
+In A18 the attention kernels read the KV cache a block per DMA for each KV head (1024 positions in decode and verify, 2048 in prefill), with partition p taking the block's positions 8p to 8p + 7, or 16p to 16p + 15, contiguous. Loading 128 positions at a time had given every partition one 256-byte key per DMA, and a verify step's attention read its FP8 cache at about 33 GB/s, its Sync Engine the busiest. Key tile j now holds positions 8p + j, and the scores' and mask's columns follow that order, which the softmax doesn't see. Alone on one core, 2 rows of a verify step at 16K took 0.448 ms against 0.821, and prefill attention 2.071 ms against 2.672 at 16K and 3.783 against 4.913 at 30K, both as close to NumPy as before. A verify step takes 182 ms against 196, and prefill 230.2 s against 231.7 s. Sums in another order round differently, so 8 of the 17 fixed-length requests give A17's tokens.
+
 A11's total is lower than A10's only because its greedy answers ran longer: 1951 tokens generated against 1229, four requests reaching the 256-token cap, so decode took 78.1 s over 632 steps. On the same prompts prefill took 241.9 s against 247.2 s, 2.1% less, and decode 40.0 ms per generated token against 42.2. The kernel's inputs keep 10 mantissa bits instead of 23, still more than the BF16 the recurrent state is stored in between chunks.
 
 ### How sure the planted key is
@@ -128,8 +132,9 @@ The agentic benchmark's planted key is one greedy answer, and a change that only
 | A11 | -1.017 | 5 of 8 | 0.399 | -0.0079 |
 | A13 | -1.201 | 4 of 8 | 0.343 | -0.0181 |
 | A16 | -0.698 | 7 of 8 | 0.535 | -0.0113 |
+| A18 | -0.702 | 7 of 8 | 0.524 | -0.0108 |
 
-A16 against A13 is +0.503 ± 0.167 in log p(key), higher on 7 of the 8 requests.
+A16 against A13 is +0.503 ± 0.167 in log p(key), higher on 7 of the 8 requests. A18 against A16 is -0.004 ± 0.153.
 
 A13 against A11, request by request, is -0.184 ± 0.24 (one standard error) in log p(key), the requests moving both ways (one from p = 0.165 to 0.625 for the key's first token), as A10 was at -0.185 ± 0.16.
 
@@ -162,6 +167,7 @@ In M3 the states are saved after each prompt's last chunk, full or not, and the 
 | M6 | A15's blocks handing their outputs on on the chip | 4 x 32768 | 8 sessions, 53 turns | 654969 | 192176 | 1634 | 190.1 s | 3454.5 | as M5, every turn's tokens the same as M5's |
 | M7 | A16's prefill attention kernel | 4 x 32768 | 8 sessions, 53 turns | 654969 | 192176 | 1609 | 185.2 s | 3546.1 | as M5 |
 | M8 | A17's lm_head kernel | 4 x 32768 | 8 sessions, 53 turns | 654969 | 192176 | 1609 | 183.1 s | 3585.4 | as M5; every turn's tokens the same as M7's |
+| M9 | A18's attention kernels' block loads | 4 x 32768 | 8 sessions, 53 turns | 654969 | 192176 | 1611 | 179.7 s | 3654.8 | as M5; 47 of 53 turns' tokens the same as M8's |
 
 ## Speculative decoding
 
