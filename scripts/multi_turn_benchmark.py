@@ -32,6 +32,7 @@ def main():
     parser.add_argument("--compiled", required=True)
     parser.add_argument("--weights", required=True)
     parser.add_argument("--head", help="Compiled lm_head for the chip. Its weights go in --weights too.")
+    parser.add_argument("--mtp", help="Compiled MTP drafter (scripts/compile.py --mtp): speculate with its drafts. Its weights go in --weights too.")
     parser.add_argument("--sessions", type=int, default=8)
     parser.add_argument("--max-turns", type=int, default=12)
     parser.add_argument("--max-prompt-tokens", type=int, default=30000)
@@ -41,7 +42,7 @@ def main():
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
-    loaded = load(args.model_dir, args.compiled, args.weights, args.head)
+    loaded = load(args.model_dir, args.compiled, args.weights, args.head, mtp_dir=args.mtp)
     usable = loaded.max_seq_len - loaded.chunk
     if args.max_prompt_tokens + args.max_new_tokens > usable:
         parser.error(f"prompts of {args.max_prompt_tokens} tokens plus {args.max_new_tokens} new need more than the build's {usable} positions")
@@ -49,7 +50,7 @@ def main():
     scheduler = Scheduler(
         loaded.step, loaded.prefill, loaded.head, loaded.cfg, loaded.batch_size, loaded.max_seq_len, loaded.chunk, EOS_TOKEN_IDS,
         copy_states=loaded.step, reuse_prefixes=not args.no_reuse,
-        verify=None if args.no_speculation else loaded.verify, verify_tokens=loaded.verify_tokens,
+        verify=None if args.no_speculation else loaded.verify, verify_tokens=loaded.verify_tokens, mtp=loaded.mtp,
     )
     outputs: dict[tuple[int, int], list[int]] = {}
     started = time.perf_counter()

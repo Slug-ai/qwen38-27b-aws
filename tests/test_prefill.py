@@ -287,3 +287,135 @@ def test_speculative_decoding_gives_the_tokens_plain_greedy_decoding_gives():
     assert got[4][0] == got[1][0]
     # The tiny model's tokens are near random, so few drafts match, but some must, and they never cost steps.
     assert got[4][2] > 0 and got[4][1] <= got[1][1]
+
+
+def test_attention_cache_chunk_writes_what_prefill_writes():
+    """`FullAttentionStep.cache_chunk`, which the MTP layer's prefill uses, must leave the cache exactly as
+    `prefill` does, in both cache formats."""
+    from qwen38_inf2 import fp4
+    from qwen38_inf2.model import FullAttentionStep, identity_all_reduce
+
+    for kv in ("bf16", "fp8"):
+        cfg = replace(tiny_config(), weight_format="fp8", kv_cache_format=kv)
+        torch.manual_seed(2)
+        attn = FullAttentionStep(cfg, 1, MAX_SEQ_LEN, torch.float32, identity_all_reduce, 2).eval()
+        for name, param in attn.named_parameters():
+            param.data = fp4.float_to_fp8(torch.randn(param.shape) * 0.2) if name.endswith("weight_fp8") else torch.rand(param.shape) * 0.1 + 0.02
+        other = FullAttentionStep(cfg, 1, MAX_SEQ_LEN, torch.float32, identity_all_reduce, 2).eval()
+        other.load_state_dict(attn.state_dict())
+        with torch.no_grad():
+            for start in (0, CHUNK):
+                x = torch.randn(1, CHUNK, cfg.hidden_size)
+                inputs = prefill_inputs(cfg, 1, start, CHUNK - 3, CHUNK, torch.float32)
+                attn.prefill(x, inputs["cos"], inputs["sin"], inputs["slot"], inputs["start"], inputs["n_valid"])
+                other.cache_chunk(x, inputs["cos"], inputs["sin"], inputs["slot"], inputs["start"])
+        assert torch.equal(attn.k_cache, other.k_cache) and torch.equal(attn.v_cache, other.v_cache)
+        assert attn.k_cache[1, :, : 2 * CHUNK].abs().sum() > 0
+
+
+def test_mtp_prefill_and_steps_draft_alike():
+    """The MTP layer's prefill and its steps must agree: a row's indices run through prefill chunks, then the next
+    ones as steps of K, give what running them all as steps gives, and its output is the next step's input."""
+    from qwen38_inf2 import fp4
+    from qwen38_inf2.generate import mtp_prefill_inputs, mtp_step_inputs
+    from qwen38_inf2.model import MTPStep, identity_all_reduce
+
+    cfg = replace(tiny_config(), weight_format="fp8")
+    torch.manual_seed(0)
+    mtp = MTPStep(cfg, 1, MAX_SEQ_LEN, torch.float32, identity_all_reduce, 2).eval()
+    for name, param in mtp.named_parameters():
+        if name.endswith("weight_fp8"):
+            param.data = fp4.float_to_fp8(torch.randn(param.shape) * 0.1)
+        else:
+            param.data = torch.randn(param.shape) * 0.1
+    k, n = 4, 28
+    hidden = torch.randn(1, n, cfg.hidden_size)
+    embeds = torch.randn(1, n, cfg.hidden_size)
+    with torch.no_grad():
+        stepped = []
+        for start in range(0, n, k):
+            pad = lambda t: torch.cat((t[:, start : start + k], torch.zeros(1, k, cfg.hidden_size)), 0)  # noqa: E731
+            out = mtp(hidden=pad(hidden), inputs_embeds=pad(embeds), **mtp_step_inputs(cfg, [start, 0], k, MAX_SEQ_LEN, torch.float32, [True, False]))
+            stepped.append(out[0])
+        stepped = torch.cat(stepped)
+
+        fresh = MTPStep(cfg, 1, MAX_SEQ_LEN, torch.float32, identity_all_reduce, 2).eval()
+        fresh.load_state_dict(mtp.state_dict())
+        for start in range(0, 16, CHUNK):
+            fresh(hidden=hidden[:, start : start + CHUNK], inputs_embeds=embeds[:, start : start + CHUNK], **mtp_prefill_inputs(cfg, 0, start, CHUNK, CHUNK, torch.float32))
+        mixed = []
+        for start in range(16, n, k):
+            pad = lambda t: torch.cat((t[:, start : start + k], torch.zeros(1, k, cfg.hidden_size)), 0)  # noqa: E731
+            mixed.append(fresh(hidden=pad(hidden), inputs_embeds=pad(embeds), **mtp_step_inputs(cfg, [start, 0], k, MAX_SEQ_LEN, torch.float32, [True, False]))[0])
+    assert torch.allclose(torch.cat(mixed), stepped[16:], atol=1e-5, rtol=1e-5)
+
+
+def test_speculative_decoding_with_mtp_drafts_gives_greedy_tokens_and_drafts_from_the_true_history():
+    """With MTP drafts, speculation must still give plain greedy decoding's tokens, and each round's first draft
+    must be what the MTP layer gives over the sequence's true history: its cache filled through prefill and steps
+    at the right indices, from the main model's hidden states."""
+    from qwen38_inf2 import fp4
+    from qwen38_inf2.generate import mtp_step_inputs
+    from qwen38_inf2.model import MTPStep, identity_all_reduce
+    from qwen38_inf2.scheduler import Scheduler
+
+    cfg = tiny_config()
+    _, tensors = build_reference(cfg)
+    head = host_head(tensors)
+    mtp_cfg = replace(cfg, weight_format="fp8")
+    torch.manual_seed(1)
+    mtp = MTPStep(mtp_cfg, 1, MAX_SEQ_LEN, torch.float32, identity_all_reduce, 2).eval()
+    for name, param in mtp.named_parameters():
+        param.data = fp4.float_to_fp8(torch.randn(param.shape) * 0.2) if name.endswith("weight_fp8") else torch.randn(param.shape) * 0.1
+    state = {k: v.clone() for k, v in mtp.state_dict().items()}
+    prompts = [PROMPT + PROMPT[:12], [9, 9, 4, 1] * 5, PROMPT[5:] + [3] * 9]
+    out = {}
+    with torch.no_grad():
+        for spec in (False, True):
+            model = batched_model(cfg, tensors, 2, verify_tokens=4 if spec else 0)
+            scheduler = Scheduler(
+                prefill_of(model), prefill_of(model), head, cfg, 2, MAX_SEQ_LEN, CHUNK, (), torch.float32,
+                verify=prefill_of(model) if spec else None, verify_tokens=4 if spec else 1, mtp=(lambda **inputs: mtp(**inputs)) if spec else None,
+            )
+            seen = []
+            if spec:
+                real = scheduler._mtp_drafts
+
+                def recording(slots, real=real):
+                    drafts = real(slots)
+                    for slot, row in enumerate(slots):
+                        if row and row.mtp_seed:
+                            seen.append((row.index[0], row.mtp_seed[2] + row.mtp_seed[3], drafts[slot][0]))
+                    return drafts
+
+                scheduler._mtp_drafts = recording
+            got = [[] for _ in prompts]
+            for index, token in scheduler.run(prompts, 12):
+                got[index].append(token)
+            out[spec] = (got, seen)
+    assert out[True][0] == out[False][0]
+
+    # The reference: the MTP layer run in steps of 4 over each finished sequence, from the main model's hidden states.
+    plain = batched_model(cfg, tensors, 1)
+    reference = {}
+    with torch.no_grad():
+        for p, prompt in enumerate(prompts):
+            ids = prompt + out[False][0][p]
+            hidden = []
+            for start in range(0, len(ids), CHUNK):
+                chunk = ids[start : start + CHUNK]
+                embeds = head.embed_batch(chunk + [0] * (CHUNK - len(chunk)), torch.float32).reshape(1, CHUNK, -1)
+                hidden.append(plain(inputs_embeds=embeds, **prefill_inputs(cfg, 0, start, len(chunk), CHUNK, torch.float32))[0, : len(chunk)])
+            hidden = torch.cat(hidden)
+            fresh = MTPStep(mtp_cfg, 1, MAX_SEQ_LEN, torch.float32, identity_all_reduce, 2).eval()
+            fresh.load_state_dict(state)
+            picks = []
+            for start in range(0, len(ids) - 1, 4):
+                n = min(4, len(ids) - 1 - start)
+                pad = lambda t: torch.stack((torch.cat((t, torch.zeros(4 - n, t.shape[-1]))), torch.zeros(4, t.shape[-1])))  # noqa: E731
+                embeds = head.embed_batch(ids[start + 1 : start + 1 + n], torch.float32)[:, 0]
+                y = fresh(hidden=pad(hidden[start : start + n]), inputs_embeds=pad(embeds), **mtp_step_inputs(cfg, [start, 0], 4, MAX_SEQ_LEN, torch.float32, [True, False]))
+                picks += head.next_tokens(y[0, :n].unsqueeze(1))
+            reference[p] = picks
+    checked = [(p, t, d, reference[p][t]) for p, t, d in out[True][1] if t < len(reference[p])]
+    assert len(checked) > 10 and all(d == r for _, _, d, r in checked), [c for c in checked if c[2] != c[3]][:5]

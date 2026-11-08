@@ -32,9 +32,11 @@ class Loaded:
     # The verify graph for speculative decoding and its tokens per row, with a head for that many rows each.
     verify: Callable[..., torch.Tensor] | None = None
     verify_tokens: int = 0
+    # The MTP drafter (`model.MTPStep`), if loaded, and the blocks' last hidden state goes to it.
+    mtp: Callable[..., torch.Tensor] | None = None
 
 
-def load(model_dir, compiled, weights, head_dir=None, simulate: bool = False, log: Callable[[str], None] = _log) -> Loaded:
+def load(model_dir, compiled, weights, head_dir=None, simulate: bool = False, log: Callable[[str], None] = _log, mtp_dir=None) -> Loaded:
     """Load the graphs and weights, then read lm_head and the embeddings into the disk cache."""
     # The runtime reads this when it starts. The default page size reserves far more scratchpad than these graphs need.
     os.environ.setdefault("NEURON_SCRATCHPAD_PAGE_SIZE", "64")
@@ -73,9 +75,18 @@ def load(model_dir, compiled, weights, head_dir=None, simulate: bool = False, lo
     verify_tokens = info.get("verify_tokens", 0)
     if verify_tokens and getattr(head, "batch_size", batch_size * verify_tokens) < batch_size * verify_tokens:
         raise ValueError(f"a verify graph of {verify_tokens} tokens for {batch_size} rows needs a head for {batch_size * verify_tokens} rows")
+    mtp = None
+    if mtp_dir:
+        from .neuron import load_mtp_graph
+
+        mtp_info = checkpoint.read_build_info(mtp_dir)
+        if (mtp_info["batch_size"], mtp_info["mtp_tokens"], mtp_info["chunk"]) != (batch_size, verify_tokens, chunk):
+            raise ValueError(f"the MTP build's rows, tokens and chunk {mtp_info} don't match the blocks'")
+        mtp = load_mtp_graph(mtp_dir, weights)
+        log(f"loaded the MTP drafter from {mtp_dir}")
     return Loaded(
         cfg, tokenizer, head, step, batch_size, info["max_seq_len"], load_seconds, step if chunk else None, chunk,
-        step if verify_tokens else None, verify_tokens,
+        step if verify_tokens else None, verify_tokens, mtp,
     )
 
 

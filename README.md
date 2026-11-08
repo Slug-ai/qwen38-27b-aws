@@ -2,7 +2,7 @@
 
 Runs the text part of [RedHatAI/Qwen3.8-27B-MXFP4](https://huggingface.co/RedHatAI/Qwen3.8-27B-MXFP4) on one AWS Inferentia2 chip (two NeuronCores), with its FP4 weights converted to FP8 and greedy decoding.
 
-**Status: runs end to end on a real `inf2.xlarge`.** On coding-agent requests of 8K to 30K prompt tokens with a 32K context, 1043 tokens/s in all, nearly all of them prompt tokens, and 208 requests per hour, measured. On multi-turn agent sessions, which send the whole conversation again every turn, 3383 tokens/s with speculative decoding. With prompt plus output capped at 512 tokens, which no agent request fits, 156.20 generated tokens/s at batch 63. See [the throughput log](docs/throughput.md) and [the field notes](docs/field_notes.md), which cover setup on the Amazon Linux Neuron AMI.
+**Status: runs end to end on a real `inf2.xlarge`.** On coding-agent requests of 8K to 30K prompt tokens with a 32K context, 1141 tokens/s in all, nearly all of them prompt tokens, and 228 requests per hour, measured. On multi-turn agent sessions, which send the whole conversation again every turn, 3420 tokens/s. Both use speculative decoding with drafts from the checkpoint's MTP layer. With prompt plus output capped at 512 tokens, which no agent request fits, 156.20 generated tokens/s at batch 63. See [the throughput log](docs/throughput.md) and [the field notes](docs/field_notes.md), which cover setup on the Amazon Linux Neuron AMI.
 
 **Goal: maximum throughput, not latency.** Every design choice is judged by total tokens per second across all sequences. Time per token doesn't matter, so large batches and slow steps are fine.
 
@@ -24,11 +24,11 @@ This describes the build measured in [the throughput log](docs/throughput.md), w
 
   The code and rings row comes from the runtime's table at batch 64, which doesn't fit. The other rows come from file sizes and tensor shapes.
 
-- **Text only.** The vision tower, MTP head and KV-cache FP8 scales are never read.
+- **Text only.** The vision tower is never read.
 - **Two cores.** Each core owns a slice of the attention heads. Only the output projections need a collective, so there are two all-reduces per layer. Each core also holds half of `lm_head`'s tokens, and one more all-reduce joins the two halves of its output.
 - **Decode: one token per row.** Each row of the fixed batch is an independent sequence at its own position, and decode runs the recurrent form of the gated delta rule. A row that finishes takes the next waiting prompt.
 - **Prefill: 512 prompt tokens of one row per call** (`--chunk 512`), in a second graph that shares the first's weights and caches. Prompts are no longer fed one token per step. Everything in a gated delta layer between its projections (causal conv, norms, the chunked gated delta rule, the gated norm) and flash attention against the row's cache are NKI kernels ([kernels.py](qwen38_inf2/kernels.py)), and its matmuls reach the Tensor Engine's peak. `qwen38_inf2/scheduler.py` prefills every free row before each decode step. The long-context build allows 32768 positions per row, 2 rows.
-- **Speculative decoding** (`--verify-tokens 4`), in a third graph: each step runs a row's last token and 3 drafted from its own history by prompt lookup, and keeps the drafted tokens the model would have picked, so a step adds 1 to 4 tokens per row for 162 ms in the blocks, against decode's 121 ms. A gated delta layer commits only the accepted tokens' updates to its state at the next step. Multi-turn sessions accept 2.3 tokens per row per step and run 11% faster; single-turn answers accept 1.4.
+- **Speculative decoding** (`--verify-tokens 4`), in a third graph: each step runs a row's last token and 3 drafted ones, and keeps the drafted tokens the model would have picked, so a step adds 1 to 4 tokens per row for 162 ms in the blocks, against decode's 121 ms. A gated delta layer commits only the accepted tokens' updates to its state at the next step. The drafts come from the checkpoint's multi-token prediction layer (`--mtp`), a graph of its own whose cache every prompt chunk also fills, for 5 ms a chunk, and whose drafts cost 40 ms a step. A step then keeps 3.5 tokens per row on single-turn requests and 3.7 in multi-turn sessions. Without it, drafts come from the row's own history by prompt lookup, which keeps 1.7 and 2.6.
 - **16 layers at a time, loaded 4 times.** The model is 16 repeats of the same 4 layers (3 gated delta, 1 full attention). We compile 16 layers once and load that graph 4 times, each with its own weights and caches. Each loaded graph costs chip memory for code and collective rings, so 4 graphs leave more room for rows than 16 did. Larger graphs aren't practical on `inf2.xlarge`. Both cores' weights sit in host RAM together while a graph loads, which is about 24 GB for a whole-model graph against 15 GB of RAM, and preparing 32-layer weights was killed for running out of memory.
 - **`lm_head` on the chip, checked on the host.** A kernel returns the largest logit in each group of 32 tokens, using an FP8 copy of `lm_head`. The host then reads the top 4 groups from the checkpoint and picks the exact token, so it needs no 5 GB copy of `lm_head`, and the FP8 copy only has to keep the right group in the top 4.
 - **Host side.** Embeddings and the greedy loop run on the host, reading embeddings from the mapped checkpoint. `scripts/batch_generate.py` reads `lm_head` and the embeddings once after loading, in about 32 s, because otherwise each step waits on the disk. It also sets 64 MB scratchpad pages, which reserve less chip memory than the runtime's default.
@@ -56,7 +56,16 @@ python scripts/agentic_benchmark.py --model-dir model --compiled artifacts/block
 
 `scripts/multi_turn_benchmark.py` with the same arguments runs coding-agent sessions whose every turn sends the whole conversation again, as Claude Code does. A session's turns reuse its slot's cache and the states saved at the end of the last prompt, so only the new tokens are prefilled; `--no-reuse` prefills every prompt whole, which gives the same tokens up to rounding.
 
-For speculative decoding, add `--verify-tokens 4` to the layers' compile and give the benchmarks a head for 16 rows (`--head --head-format fp8 --batch-size 16`); `--no-speculation` runs the same build without it. `scripts/speculation_check.py` with the same arguments checks the verify graph against decode on real text.
+For speculative decoding, add `--verify-tokens 4` to the layers' compile and give the benchmarks a head for 16 rows (`--head --head-format fp8 --batch-size 16`); `--no-speculation` runs the same build without it. `scripts/speculation_check.py` with the same arguments checks the verify graph against decode on real text. That drafts by prompt lookup. To draft with the MTP layer, as the measured build does, compile the layers with `--verify-tokens 4 --no-decode` instead, then the MTP layer and its weights, from `model_mtp.safetensors`, and pass it to the benchmarks:
+
+```bash
+python scripts/compile.py --config model/config.json --max-seq-len 32768 --batch-size 4 --weight-format fp8 \
+  --recurrent-state bf16 --kv-cache fp8 --chunk 512 --verify-tokens 4 --mtp --output artifacts/mtp_b4_s32k_c512
+python scripts/prepare_weights.py --model-dir model --compiled artifacts/mtp_b4_s32k_c512 --output weights_fp8_kv8 --mtp-kv-scales 0.12 0.24
+python scripts/agentic_benchmark.py ... --mtp artifacts/mtp_b4_s32k_c512
+```
+
+The MTP layer's KV cache scales, which the checkpoint doesn't have, were measured on standard library source ([the field notes](docs/field_notes.md)).
 
 `weights_fp8` holds the same files as the 512-token build's, prepared as below, and `--reuse` links to them, adding small files of the KV cache's scales. With `--kv-cache bf16` only 2 rows fit at 32K, and those weights work as they are. `scripts/quality_check.py` with the same arguments also checks the prefill path against decode.
 
@@ -153,11 +162,11 @@ python scripts/inspect_graph.py artifacts/block4/compiler-work/decode/<timestamp
 
 ## Prepare weights (no chip or SDK needed)
 
-Needs about 33 GB of disk: 19 GB for the checkpoint and 14 GB for the per-core files.
+Needs about 34 GB of disk: 20 GB for the checkpoint, its MTP layer included, and 14 GB for the per-core files.
 
 ```bash
 mkdir -p model
-for f in model.safetensors config.json tokenizer.json; do
+for f in model.safetensors model_mtp.safetensors config.json tokenizer.json; do
   curl -fL -o model/$f https://huggingface.co/RedHatAI/Qwen3.8-27B-MXFP4/resolve/main/$f
 done
 python scripts/prepare_weights.py --model-dir model --compiled artifacts/block4 --output weights

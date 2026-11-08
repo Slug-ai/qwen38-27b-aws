@@ -32,7 +32,7 @@ def run(loaded, prompts, max_new_tokens: int, use_prefill: bool = True, eos=EOS_
         return outputs, seconds, {"prompt_path": "decode"}
     scheduler = Scheduler(
         loaded.step, loaded.prefill, loaded.head, loaded.cfg, loaded.batch_size, loaded.max_seq_len, loaded.chunk, eos,
-        verify=loaded.verify if speculate else None, verify_tokens=loaded.verify_tokens,
+        verify=loaded.verify if speculate else None, verify_tokens=loaded.verify_tokens, mtp=getattr(loaded, "mtp", None),
     )
     outputs = [[] for _ in prompts]
     started = time.perf_counter()
@@ -107,6 +107,7 @@ def main():
     parser.add_argument("--compiled", required=True)
     parser.add_argument("--weights", required=True)
     parser.add_argument("--head", help="Compiled lm_head for the chip. Its weights go in --weights too.")
+    parser.add_argument("--mtp", help="Compiled MTP drafter (scripts/compile.py --mtp): speculate with its drafts. Its weights go in --weights too.")
     parser.add_argument("--requests", type=int, default=16)
     parser.add_argument("--min-prompt-tokens", type=int, default=8192)
     parser.add_argument("--max-prompt-tokens", type=int, default=30000)
@@ -122,7 +123,7 @@ def main():
     )
     args = parser.parse_args()
 
-    loaded = load(args.model_dir, args.compiled, args.weights, args.head, args.simulate)
+    loaded = load(args.model_dir, args.compiled, args.weights, args.head, args.simulate, mtp_dir=args.mtp)
     longest = args.max_prompt_tokens + args.max_new_tokens
     # The cache's last positions take junk writes: one for decode, a chunk with a prefill graph.
     usable = loaded.max_seq_len - (loaded.chunk or 1)

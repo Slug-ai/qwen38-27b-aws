@@ -87,6 +87,26 @@ def verify_inputs(
     }
 
 
+def mtp_step_inputs(
+    cfg: TextConfig, indices: Sequence[int], tokens: int, max_seq_len: int, dtype: torch.dtype, active: Sequence[bool]
+) -> dict[str, torch.Tensor]:
+    """Inputs for `model.MTPStep` steps: `tokens` per row from each row's MTP index, at positions one on."""
+    inputs = verify_inputs(cfg, indices, tokens, max_seq_len, dtype, active, [0] * len(indices))
+    del inputs["accepted"]
+    at = (torch.as_tensor(indices, dtype=torch.int32).unsqueeze(-1) + 1 + torch.arange(tokens)).reshape(-1)
+    cos, sin = rotary(cfg, at, dtype)
+    inputs["cos"], inputs["sin"] = cos.reshape(len(indices), tokens, -1), sin.reshape(len(indices), tokens, -1)
+    return inputs
+
+
+def mtp_prefill_inputs(cfg: TextConfig, slot: int, start: int, n_valid: int, chunk: int, dtype: torch.dtype) -> dict[str, torch.Tensor]:
+    """Inputs for a `model.MTPStep` prefill chunk of one row from MTP index `start`, at positions one on."""
+    inputs = prefill_inputs(cfg, slot, start, n_valid, chunk, dtype)
+    cos, sin = rotary(cfg, start + 1 + torch.arange(chunk), dtype)
+    inputs["cos"], inputs["sin"] = cos.unsqueeze(0), sin.unsqueeze(0)
+    return inputs
+
+
 def state_copy_inputs(cfg: TextConfig, slot: int, save: bool, dtype: torch.dtype) -> dict[str, torch.Tensor]:
     """Inputs that save one row's recurrent states, or restore them (`model.Qwen38Step`)."""
     return {

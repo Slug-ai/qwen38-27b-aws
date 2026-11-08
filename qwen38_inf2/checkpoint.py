@@ -338,6 +338,52 @@ def load_head_weights(weights_dir: str | Path, rank: int) -> dict[str, torch.Ten
     return load_file(head_path(weights_dir, rank))
 
 
+# The multi-token prediction layer's own file, next to the checkpoint's.
+MTP_FILE = "model_mtp.safetensors"
+
+
+def mtp_weights(mtp, source, cfg: TextConfig, rank: int, tp_degree: int, kv_scales=(1.0, 1.0), dtype=torch.bfloat16):
+    """The MTP layer's weights for one core, with `model.MTPStep` names. Its matrices are BF16 in its file, and
+    become FP8 e5m2 as lm_head's do. The file has no KV-cache scales, so `kv_scales` gives them, measured."""
+    by_rows = lambda t: _rows(t, rank, tp_degree)  # noqa: E731
+    by_cols = lambda t: _cols(t, rank, tp_degree)  # noqa: E731
+    matrix = lambda name, ours, cut: {f"{ours}.weight_fp8": fp4.float_to_fp8(cut(mtp.get(f"mtp.{name}.weight"))).transpose(0, 1).contiguous()}  # noqa: E731
+    vector = lambda name: mtp.get(f"mtp.{name}.weight").to(dtype)  # noqa: E731
+    out = matrix("fc", "fc", by_cols)
+    if tp_degree > 1:
+        gate = torch.zeros(tp_degree, dtype=torch.float32)
+        gate[rank] = 1.0
+        out["rank_gate"] = gate
+    out |= {
+        "embedding_norm_weight": vector("pre_fc_norm_embedding"),
+        "hidden_norm_weight": vector("pre_fc_norm_hidden"),
+        "norm_weight": vector("norm"),
+        "final_norm_weight": source.get(FINAL_NORM).to(dtype),
+        "layer.input_layernorm_weight": vector("layers.0.input_layernorm"),
+        "layer.post_attention_layernorm_weight": vector("layers.0.post_attention_layernorm"),
+        "layer.self_attn.q_norm_weight": vector("layers.0.self_attn.q_norm"),
+        "layer.self_attn.k_norm_weight": vector("layers.0.self_attn.k_norm"),
+    }
+    for name, cut in (("q_proj", by_rows), ("k_proj", by_rows), ("v_proj", by_rows), ("o_proj", by_cols)):
+        out |= matrix(f"layers.0.self_attn.{name}", f"layer.self_attn.{name}", cut)
+    for name, cut in (("gate_proj", by_rows), ("up_proj", by_rows), ("down_proj", by_cols)):
+        out |= matrix(f"layers.0.mlp.{name}", f"layer.mlp.{name}", cut)
+    if cfg.kv_cache_format == "fp8":
+        out["layer.self_attn.k_scale"] = torch.tensor([kv_scales[0]], dtype=dtype)
+        out["layer.self_attn.v_scale"] = torch.tensor([kv_scales[1]], dtype=dtype)
+    return out
+
+
+def mtp_path(weights_dir: str | Path, rank: int) -> Path:
+    return Path(weights_dir) / f"mtp_tp{rank}.safetensors"
+
+
+def write_mtp_weights(mtp, source, cfg: TextConfig, weights_dir: str | Path, tp_degree: int = 2, kv_scales=(1.0, 1.0)) -> None:
+    Path(weights_dir).mkdir(parents=True, exist_ok=True)
+    for rank in range(tp_degree):
+        save_file(mtp_weights(mtp, source, cfg, rank, tp_degree, kv_scales), mtp_path(weights_dir, rank))
+
+
 def load_rank_block(weights_dir: str | Path, block: int, rank: int, layers: int | None = None) -> dict[str, torch.Tensor]:
     """One block's weights for one core, optionally keeping only its first `layers` layers. The FP8 KV cache's
     scales are merged in from their own file when there is one (`add_kv_scales`)."""

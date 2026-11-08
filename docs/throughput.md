@@ -74,6 +74,8 @@ The table above measures 21-token prompts with prompt plus output capped at 512 
 | A11 | Same build | 4 x 32768 | 2 prompts of 4K | 630.50 | 10.85 | 641.36 | yes |
 | A13 | The gated delta prefill kernel's triangular solve with fewer matmuls, and with A12's speculative decoding | 4 x 32768 | 16 prompts of 8K to 30K, every request 64 tokens | 1136.44 | 4.05 | 1140.49 | golden row yes; planted key yes; recall check below |
 | A13 | Same build | 4 x 32768 | 16 prompts of 8K to 30K | 1037.44 | 5.42 | 1042.85 | golden row yes; planted key yes, 208 requests per hour |
+| A14 | Drafts from the checkpoint's MTP layer instead of prompt lookup, and no decode graph, [below](#drafts-from-the-mtp-layer) | 4 x 32768 | 16 prompts of 8K to 30K, every request 64 tokens | 1175.91 | 4.20 | 1180.11 | golden row yes; planted key yes |
+| A14 | Same build | 4 x 32768 | 16 prompts of 8K to 30K | 1135.94 | 5.52 | 1141.46 | golden row yes; planted key yes, 228 requests per hour |
 
 A1 and A2 are the same build, A1 run with `--no-prefill`. A1 on the full workload would take about 3.5 hours, so both ran the small one. Only 2 rows fit: a BF16 KV cache of 32K positions takes 1.07 GB per row on each core. The FP8 cache the checkpoint was calibrated for would fit about twice as many, but the compiler accepts FP8 only inside NKI kernels.
 
@@ -141,6 +143,7 @@ In M3 the states are saved after each prompt's last chunk, full or not, and the 
 | M2 | Speculative decoding, 4 tokens per verify step, below | 4 x 32768 | 8 sessions, 53 turns | 654969 | 204409 | 1664 | 206.7 s | 3177.0 | key recalled; 47 of 53 turns' tokens the same as M1's |
 | M3 | States saved at each prompt's end, not its last whole chunk, so a turn prefills from there | 4 x 32768 | 8 sessions, 53 turns | 654969 | 192176 | 1641 | 198.5 s | 3307.0 | key recalled; 46 of 53 turns' tokens the same as M2's |
 | M4 | A13's gated delta prefill solve | 4 x 32768 | 8 sessions, 53 turns | 654969 | 192176 | 1633 | 194.1 s | 3382.6 | session 0's last turn searched for the key with a tool call instead of answering it; 35 of 53 turns' tokens the same as M3's |
+| M5 | A14's drafts from the MTP layer | 4 x 32768 | 8 sessions, 53 turns | 654969 | 192176 | 1634 | 192.0 s | 3420.4 | session 0's last turn searched for the key with a tool call, as in M4; 51 of 53 turns' tokens the same as M4's |
 
 ## Speculative decoding
 
@@ -157,6 +160,22 @@ Attention takes the 4 tokens as extra query heads in an NKI kernel. A gated delt
 | M2 | 8 multi-turn sessions, 53 turns | 3177.0 | 2851.1 | 33.7 s over 198 steps, against 57.1 s over 472 | 47 of 53 turns |
 
 Plain decoding is the same graphs run with `--no-speculation`, or M1 for the sessions. With every request generating 64 tokens, the same work either way, speculation is 1.5% faster in all and decode 12.5% faster. Single-turn answers accept few drafts, 1.43 tokens per row per step, against 2.34 in the sessions, whose replies repeat more of what came before, where decode is 41% faster and the run 11.4%. The answers that stop on their own come out at different lengths, 1871 tokens against 1951, so that row is not like for like. The first formulation gave 1078.5, 891.4 and 3097.2 tok/s on the same three workloads.
+
+### Drafts from the MTP layer
+
+The checkpoint has one multi-token prediction layer, in its own file, `model_mtp.safetensors` (850 MB of BF16), and from A14 it drafts instead of prompt lookup (`scripts/compile.py --mtp`, and `--mtp` for the benchmarks). Its index t takes the main model's last hidden state at t, after the final norm, and the embedding of token t + 1, normed each and joined through a 10240-by-5120 projection, then runs one full attention decoder layer with its own KV cache at position t + 1. Its output, through the layer's own norm, goes to the main lm_head and predicts token t + 2, and fed back as the next hidden state it drafts the token after. Each verify step's drafts take 3 MTP calls and 3 lm_head calls. The first runs the layer over each row's 4 tokens of the last step with the main model's hidden states, which also caches them, and drafts from its output at the last accepted one. Each of the other two drafts from the call before's output and the token it drafted. The layer's weights are FP8 e5m2 like lm_head's and its cache FP8 e4m3. The checkpoint has no cache scales for it, so they are measured: the largest key and value over standard library source, divided by 240, times 1.5. The blocks are compiled without the decode graph (`--no-decode`), which speculation never runs. That frees about 210 MB per core for the MTP layer's 212 MB of weights and 134 MB of cache.
+
+Every prompt chunk also goes through the MTP layer, to fill its cache. Nothing reads what its prefill would output, since the first draft after a prompt comes from a step, so the prefill graph computes only the projection and the keys and values it caches (`FullAttentionStep.cache_chunk`), the same bytes. That takes 5 ms per chunk. The whole layer took 9 to 15 ms, rising with the chunk's start, and cost 8.6 s of prefill on the fixed-length run instead of 3.1 s, 1154.6 tok/s instead of 1180.1.
+
+On standard library source, with FP8 weights on the chip, its first draft is the model's own greedy pick at 87.4% of positions. Given the drafts before it were right, the second is right 85% of the time and the third 80%. With the hidden state from before the final norm it agreed at 85.2%, and with the projection's halves swapped at 0.1%. A step keeps 3.5 tokens per row on single-turn requests against 1.7 for prompt lookup, and 3.7 in the sessions against 2.6. But it takes 209 ms against 168 ms: each MTP call takes 3 to 5 ms and each lm_head call 8.3 ms.
+
+| # | Workload | Total tok/s | With prompt lookup (A13, M4) | Prefill | Decode | Tokens per row per step |
+|---|---|---|---|---|---|---|
+| A14 | 16 prompts of 8K to 30K, every request 64 tokens | 1180.1 | 1140.5 | 240.3 s against 237.2 s | 19.0 s over 91 steps against 31.2 s over 185 | 3.51 against 1.66 |
+| A14 | 16 prompts of 8K to 30K, stopping where the answer does | 1141.5 | 1042.9 | 239.6 s against 238.0 s | 28.9 s over 137 steps against 56.0 s over 320 | 3.34 against 1.55 |
+| M5 | 8 multi-turn sessions, 53 turns | 3420.4 | 3382.6 | 164.1 s against 162.3 s | 27.8 s over 134 steps against 31.7 s over 188 | 3.72 against 2.64 |
+
+Tokens per row per step count each step's row and the drafts it kept. The tokens are A13's in 7 of the 17 fixed-length requests and in 51 of 53 turns: verify steps holding other drafts round differently. The answers that stop on their own came out shorter, 1483 tokens against 1592, so that row isn't like for like.
 
 Raw results are in [throughput/agentic/](throughput/agentic/) and [throughput/multi_turn/](throughput/multi_turn/).
 

@@ -6,7 +6,7 @@ import time
 from dataclasses import replace
 
 from qwen38_inf2.config import TextConfig, tiny_config
-from qwen38_inf2.neuron import build, build_head
+from qwen38_inf2.neuron import build, build_head, build_mtp
 
 
 def main():
@@ -23,6 +23,8 @@ def main():
     parser.add_argument("--kv-cache", choices=("bf16", "fp8"), default="bf16", help="fp8 uses the checkpoint's KV-cache scales and half the memory.")
     parser.add_argument("--chunk", type=int, help="Also compile a prefill graph taking this many prompt tokens of one row per call.")
     parser.add_argument("--verify-tokens", type=int, default=0, help="Also compile a verify graph of this many tokens per row, for speculative decoding.")
+    parser.add_argument("--no-decode", action="store_true", help="With --verify-tokens, leave out the one-token graph, which speculation never uses.")
+    parser.add_argument("--mtp", action="store_true", help="Compile the MTP drafter instead, with --batch-size, --max-seq-len, --chunk and --verify-tokens.")
     parser.add_argument("--compiler-args", default="")
     parser.add_argument("--optimize-layout", action="store_true", help="Use NxD's weight layout optimization.")
     parser.add_argument("--output", required=True)
@@ -44,10 +46,14 @@ def main():
         path = build_head(cfg, args.batch_size, args.output, args.tp_degree, args.target, workdir, args.head_format)
         print(f"compiled lm_head for {args.target} in {time.time() - started:.0f}s: {path}")
         return
+    if args.mtp:
+        path = build_mtp(cfg, args.max_seq_len, args.output, args.batch_size, args.chunk, args.verify_tokens, args.tp_degree, args.target, workdir)
+        print(f"compiled the MTP drafter for {args.target} in {time.time() - started:.0f}s: {path}")
+        return
 
     path = build(
         cfg, args.max_seq_len, args.output, args.tp_degree, args.target, args.compiler_args, workdir, args.optimize_layout, args.batch_size, args.chunk,
-        args.verify_tokens,
+        args.verify_tokens, not args.no_decode,
     )
     print(f"compiled {cfg.num_hidden_layers} layers for {args.target} in {time.time() - started:.0f}s: {path}")
 

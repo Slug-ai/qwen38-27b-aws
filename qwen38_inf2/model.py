@@ -781,15 +781,75 @@ class FullAttentionStep(nn.Module):
             if self.fp8_cache:
                 out = out.float() * scales[1].float()
         out = out.to(x.dtype).reshape(self.num_heads, tokens, head).transpose(0, 1).reshape(1, tokens, self.num_heads * head)
+        self._write_chunk(k_coded, v_coded, slot, start)
+        return self.all_reduce(self.o_proj(out * torch.sigmoid(gate)))
 
+    def cache_chunk(self, x, cos, sin, slot, start) -> None:
+        """Only what `prefill` writes for a chunk, its keys and values, for a layer whose prefill output nothing
+        reads. The query and gate `_project` makes go unused, so the compiled graph leaves them out."""
+        _, key, value, _ = self._project(x, cos, sin)
+        scales = (self.k_scale, self.v_scale) if self.fp8_cache else (None, None)
+        self._write_chunk(self._store(key, scales[0]), self._store(value, scales[1]), slot, start)
+
+    def _write_chunk(self, k_coded, v_coded, slot, start) -> None:
         # Every row gets a chunk of positions: `slot` its own, the others the junk positions at the end.
-        rows = self.k_cache.shape[0]
+        rows, tokens, device = self.k_cache.shape[0], k_coded.shape[2], k_coded.device
         positions = start.long() + torch.arange(tokens, device=device)
         junk = self.max_seq_len - tokens + torch.arange(tokens, device=device)
         others = torch.arange(rows, device=device) != slot.long()
         where = torch.where(others.unsqueeze(-1), junk.unsqueeze(0), positions.unsqueeze(0))
         self._write_both(k_coded.expand(rows, -1, -1, -1), v_coded.expand(rows, -1, -1, -1), where)
-        return self.all_reduce(self.o_proj(out * torch.sigmoid(gate)))
+
+
+class MTPStep(nn.Module):
+    """The checkpoint's multi-token prediction layer, drafting tokens for speculative decoding.
+
+    Index t takes the main model's hidden state at t, which it puts through the final norm, and the embedding of
+    token t + 1, and predicts token t + 2: both are normed, joined and projected back to the hidden size, and one
+    full attention decoder layer runs on that at position t + 1 (`cos`, `sin`) with its own KV cache, cached at
+    index t (`position`, or a chunk's `start`). The output goes through the layer's own norm and is divided by the
+    final norm's weight, so the model's lm_head graph, which applies that norm, picks what this layer predicts, and
+    so that fed back as `hidden` it drafts the token after: every norm on the way is scale-invariant.
+
+    The projection is split across cores by its input: core 0 takes the embedding's half and core 1 the hidden
+    state's (`rank_gate`), and their products are summed.
+
+    Steps take K tokens per row, with inputs as `generate.verify_inputs` builds them; prefill a chunk of one row, as
+    `generate.prefill_inputs` does, both with rotary terms for the index plus one (`generate.mtp_step_inputs`,
+    `generate.mtp_prefill_inputs`). Prefill only writes the cache, which costs the projections and not the layer.
+    """
+
+    def __init__(self, cfg: TextConfig, tp_degree: int, max_seq_len: int, dtype: torch.dtype, all_reduce: Callable, batch_size: int):
+        super().__init__()
+        self.cfg = cfg
+        self.all_reduce = all_reduce
+        size = cfg.hidden_size
+        self.fc = make_linear(cfg, 2 * size // tp_degree, size)
+        self.rank_gate = _frozen(tp_degree, dtype=torch.float32) if tp_degree > 1 else None
+        self.embedding_norm_weight = _frozen(size, dtype=dtype)
+        self.hidden_norm_weight = _frozen(size, dtype=dtype)
+        self.norm_weight = _frozen(size, dtype=dtype)
+        self.final_norm_weight = _frozen(size, dtype=dtype)
+        self.layer = DecoderLayer(cfg, FULL, tp_degree, max_seq_len, dtype, all_reduce, batch_size)
+
+    def forward(self, hidden, inputs_embeds, cos, sin, position=None, active=None, slot=None, start=None, n_valid=None) -> torch.Tensor:
+        eps = self.cfg.rms_norm_eps
+        embedded = rms_norm(inputs_embeds, self.embedding_norm_weight, eps)
+        state = rms_norm(rms_norm(hidden, self.final_norm_weight, eps), self.hidden_norm_weight, eps)
+        if self.rank_gate is None:
+            joined = torch.cat((embedded, state), dim=-1)
+        else:
+            joined = embedded * self.rank_gate[0].to(embedded.dtype) + state * self.rank_gate[1].to(embedded.dtype)
+        x = self.all_reduce(self.fc(joined))
+        if slot is not None:
+            # Prefill only fills the layer's cache: its outputs would draft tokens inside the prompt, which nothing
+            # reads, since the first draft after a prompt comes from a step. So it returns a placeholder.
+            self.layer.self_attn.cache_chunk(rms_norm(x, self.layer.input_layernorm_weight, eps), cos, sin, slot, start)
+            return x[:, :1]
+        # A full attention layer's verify path, which takes K tokens per row; `accepted` only routes it there.
+        x = self.layer(x, cos, sin, position, active, accepted=active)
+        out = rms_norm(x, self.norm_weight, eps)
+        return (out.float() / (1.0 + self.final_norm_weight.float())).to(x.dtype)
 
 
 class HeadStep(nn.Module):

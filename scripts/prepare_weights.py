@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Cut the checkpoint into one weights file per block per NeuronCore. Needs no Neuron SDK or hardware.
 
-Vision and MTP tensors are never read. In total this is about 6.9 GB per core for FP4 and 12.2 GB for FP8.
+Vision tensors are never read. In total this is about 6.9 GB per core for FP4 and 12.2 GB for FP8. With an MTP build
+(`scripts/compile.py --mtp`) as --compiled, it writes only the MTP layer's weights, from `model_mtp.safetensors`, 0.2 GB per core.
 """
 
 import argparse
 from dataclasses import replace
 
-from qwen38_inf2.checkpoint import TensorSource, add_kv_scales, read_build_info, write_head_weights, write_rank_weights
+from qwen38_inf2.checkpoint import MTP_FILE, TensorSource, add_kv_scales, read_build_info, write_head_weights, write_mtp_weights, write_rank_weights
 from qwen38_inf2.config import TextConfig
 
 
@@ -18,6 +19,7 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--head-only", action="store_true", help="Write only the weights for lm_head on the chip, 1.3 GB per core, or 0.6 GB for FP8.")
     parser.add_argument("--reuse", help="Weights written for a build that differs only in its BF16 KV cache: link to them and add the FP8 cache's scales.")
+    parser.add_argument("--mtp-kv-scales", type=float, nargs=2, metavar=("K", "V"), help="With an MTP build (--compiled), its FP8 KV cache's scales, measured.")
     args = parser.parse_args()
 
     if args.head_only:
@@ -29,6 +31,13 @@ def main():
     cfg = TextConfig.from_file(f"{args.model_dir}/config.json")
     info = read_build_info(args.compiled)
     cfg = replace(cfg, weight_format=info.get("weight_format", "fp4"), kv_cache_format=info.get("kv_cache_format", "bf16"))
+    if "mtp_tokens" in info:
+        if cfg.kv_cache_format == "fp8" and not args.mtp_kv_scales:
+            parser.error("an MTP build with an FP8 KV cache needs --mtp-kv-scales")
+        source = TensorSource(f"{args.model_dir}/model.safetensors")
+        write_mtp_weights(TensorSource(f"{args.model_dir}/{MTP_FILE}"), source, cfg, args.output, info["tp_degree"], args.mtp_kv_scales or (1.0, 1.0))
+        print(f"wrote MTP weights to {args.output}")
+        return
     if args.reuse:
         if cfg.kv_cache_format != "fp8":
             parser.error("--reuse only adds the FP8 KV cache's scales, and this build's cache isn't FP8")

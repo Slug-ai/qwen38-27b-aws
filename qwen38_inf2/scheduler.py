@@ -22,7 +22,7 @@ import torch
 
 from .config import TextConfig
 from .drafting import Drafter
-from .generate import batch_step_inputs, prefill_inputs, state_copy_inputs, verify_inputs
+from .generate import batch_step_inputs, mtp_prefill_inputs, mtp_step_inputs, prefill_inputs, state_copy_inputs, verify_inputs
 
 
 @dataclass
@@ -36,6 +36,9 @@ class _Row:
     tokens: list[int] = field(default_factory=list)
     # Drafts for speculative decoding, from the row's history so far.
     drafter: Drafter | None = None
+    # With an MTP drafter, where its next drafts start: the main model's hidden states ``[n, hidden]`` at the
+    # row's last tokens, the tokens after them, the first one's MTP index, and which of them to draft from.
+    mtp_seed: tuple | None = None
 
 
 class Scheduler:
@@ -48,6 +51,8 @@ class Scheduler:
         chunk: C, the prefill graph's tokens per call.
         copy_states: the graph that saves or restores one slot's recurrent states, called with
             `generate.state_copy_inputs`. Without one, or with `reuse_prefixes` False, every prompt is prefilled whole.
+        mtp: the MTP drafter's graph (`model.MTPStep`): with it and `verify`, drafts come from it instead of from the
+            row's history, and every prompt chunk also goes through it, to fill its cache.
         verify, verify_tokens: with these, every decode step is a verify step of `verify_tokens` tokens per row
             (`generate.verify_inputs`): each row's last token and the next ones drafted from its own history by
             `drafting.lookup_draft`. The drafted tokens the model would have chosen itself are kept, with the
@@ -70,6 +75,7 @@ class Scheduler:
         reuse_prefixes: bool = True,
         verify: Callable[..., torch.Tensor] | None = None,
         verify_tokens: int = 1,
+        mtp: Callable[..., torch.Tensor] | None = None,
     ):
         self.decode = decode
         self.prefill = prefill
@@ -97,6 +103,9 @@ class Scheduler:
         self.prefill_seconds = 0.0
         self.decode_seconds = 0.0
         self.decode_rows = 0
+        self.mtp = mtp if verify else None
+        # Per slot, the main model's hidden state at its prompt's last token, for a later turn that extends it.
+        self.mtp_last: list[torch.Tensor | None] = [None] * batch_size
 
     def _prefill(self, slot: int, row: _Row) -> int:
         """Write the prompt to `slot` in chunks, from the slot's saved states when they match its start, and return
@@ -108,6 +117,7 @@ class Scheduler:
         self.reused_tokens += begin
         if begin:
             self.copy_states(**state_copy_inputs(self.cfg, slot, False, self.dtype))
+        last = self.mtp_last[slot] if begin else None
         for start in range(begin, row.prompt_len, self.chunk):
             ids = row.ids[start : start + self.chunk]
             n_valid = len(ids)
@@ -115,6 +125,8 @@ class Scheduler:
             hidden = self.prefill(inputs_embeds=embeds, **prefill_inputs(self.cfg, slot, start, n_valid, self.chunk, self.dtype))
             self.prefill_calls += 1
             self.prefilled_tokens += n_valid
+            if self.mtp:
+                last = self._mtp_prefill(slot, start, n_valid, embeds, hidden, last)
         # The states at the prompt's end are saved, for a later prompt that extends this one. Padding past a
         # chunk's real tokens leaves them as they were, so the last chunk may be part full.
         if self.reuse_prefixes:
@@ -123,8 +135,61 @@ class Scheduler:
         self.accepted[slot] = 0
         row.written = row.prompt_len
         token_id = self.head.next_tokens(hidden[:, n_valid - 1 : n_valid])[0]
+        if self.mtp:
+            # The first drafts start from the prompt's last hidden state and the token chosen after it.
+            self.mtp_last[slot] = last
+            row.mtp_seed = (last[0], [token_id], row.prompt_len - 1, 0)
         self.prefill_seconds += time.perf_counter() - started
         return token_id
+
+    def _mtp_prefill(self, slot: int, start: int, n_valid: int, embeds: torch.Tensor, hidden: torch.Tensor, last) -> torch.Tensor:
+        """Put a prompt chunk through the MTP drafter, to fill its cache: its index t takes the main model's hidden
+        state at t and token t + 1, so the chunk at `start` covers indices from `start - 1`, starting from the last
+        chunk's final hidden state `last`, and its tokens are the chunk's own (`embeds`). The first chunk has no
+        index before it, so it covers one token fewer. Positions past the real ones take junk, as padding does in
+        prefill. Returns this chunk's final hidden state."""
+        if start == 0 or last is None:
+            first, states, embeds = start, hidden[:, : n_valid - 1], torch.cat((embeds[:, 1:], embeds[:, :1]), dim=1)
+        else:
+            first, states = start - 1, torch.cat((last, hidden[:, : n_valid - 1]), dim=1)
+        if states.shape[1]:
+            states = torch.cat((states, torch.zeros(1, self.chunk - states.shape[1], states.shape[-1], dtype=states.dtype)), dim=1)
+            self.mtp(hidden=states, inputs_embeds=embeds, **mtp_prefill_inputs(self.cfg, slot, first, n_valid - (first == start), self.chunk, self.dtype))
+        return hidden[:, n_valid - 1 : n_valid]
+
+    def _mtp_drafts(self, slots) -> dict[int, list[int]]:
+        """K - 1 drafts for every running slot from the MTP drafter: one step over each row's last tokens with the
+        main model's hidden states, which also caches them, whose output at the last accepted one drafts the next
+        token, then a step per further draft on its own output and the token it drafted."""
+        k, batch = self.step_tokens, self.batch_size
+        size = self.cfg.hidden_size
+        states = torch.zeros(batch, k, size, dtype=self.dtype)
+        tokens = [[0] * k for _ in range(batch)]
+        index, take, active = [0] * batch, [0] * batch, [False] * batch
+        for slot, row in enumerate(slots):
+            if row and row.mtp_seed:
+                hidden, ids, index[slot], take[slot] = row.mtp_seed
+                states[slot, : hidden.shape[0]] = hidden
+                tokens[slot][: len(ids)] = ids
+                active[slot] = True
+        ready = [slot for slot in range(batch) if active[slot]]
+        drafts = {slot: [] for slot in ready}
+        rows = torch.arange(batch)
+        embeds = self.head.embed_batch([t for row in tokens for t in row], self.dtype).reshape(batch, k, -1)
+        out = self.mtp(hidden=states, inputs_embeds=embeds, **mtp_step_inputs(self.cfg, index, k, self.max_seq_len, self.dtype, active))
+        current = out[rows, torch.tensor(take)]
+        for j in range(k - 1):
+            for slot, token in zip(ready, self.head.next_tokens(current[ready].unsqueeze(1))):
+                drafts[slot].append(token)
+            if j == k - 2:
+                break
+            states = torch.zeros(batch, k, size, dtype=self.dtype)
+            states[:, 0] = current
+            ids = [[drafts[slot][-1] if active[slot] else 0] + [0] * (k - 1) for slot in range(batch)]
+            embeds = self.head.embed_batch([t for row in ids for t in row], self.dtype).reshape(batch, k, -1)
+            at = [index[slot] + take[slot] + 1 + j for slot in range(batch)]
+            current = self.mtp(hidden=states, inputs_embeds=embeds, **mtp_step_inputs(self.cfg, at, k, self.max_seq_len, self.dtype, active))[:, 0]
+        return drafts
 
     def _finished(self, row: _Row, token_id: int, max_new_tokens: int) -> bool:
         # The next step would write positions from row.written. The cache's last `chunk` positions take junk writes.
@@ -204,15 +269,16 @@ class Scheduler:
         """One verify step for every running slot. Returns each ready slot's new tokens: the drafted ones the model
         chose too, then its own next choice."""
         k = self.step_tokens
-        drafts, tokens = {}, []
+        drafts, tokens = (self._mtp_drafts(slots) if self.mtp else {}), []
         for slot, row in enumerate(slots):
             if row:
-                if row.drafter is None:
-                    row.drafter = Drafter(row.ids)
-                else:
-                    row.drafter.extend(row.ids[len(row.drafter.tokens) :])
-                draft = row.drafter.draft(k - 1)
-                drafts[slot] = draft + [row.ids[-1]] * (k - 1 - len(draft))
+                if not self.mtp:
+                    if row.drafter is None:
+                        row.drafter = Drafter(row.ids)
+                    else:
+                        row.drafter.extend(row.ids[len(row.drafter.tokens) :])
+                    draft = row.drafter.draft(k - 1)
+                    drafts[slot] = draft + [row.ids[-1]] * (k - 1 - len(draft))
                 tokens += [row.ids[-1]] + drafts[slot]
             else:
                 tokens += [0] * k
@@ -229,4 +295,6 @@ class Scheduler:
             self.accepted[slot] = match + 1
             self.drafted_tokens += match
             out.append(picks[: match + 1])
+            if self.mtp:
+                slots[slot].mtp_seed = (hidden[slot], picks, positions[slot], match)
         return out

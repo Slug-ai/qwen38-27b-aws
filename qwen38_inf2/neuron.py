@@ -5,6 +5,7 @@ from pathlib import Path
 
 import torch
 from neuronx_distributed import ModelBuilder, NxDParallelState
+from safetensors.torch import load_file
 from neuronx_distributed.parallel_layers.mappings import reduce_from_tensor_model_parallel_region
 from neuronx_distributed.trace.nxd_model import NxDModel
 
@@ -95,12 +96,15 @@ def build(
     batch_size: int = 1,
     chunk: int | None = None,
     verify_tokens: int = 0,
+    decode: bool = True,
 ) -> Path:
     """Compile the one-token-per-row graph for the layers in `cfg`, plus a prefill graph of `chunk` tokens if given,
-    and a verify graph of `verify_tokens` tokens per row for speculative decoding if given."""
+    and a verify graph of `verify_tokens` tokens per row for speculative decoding if given. A build that always
+    speculates can leave out the one-token graph (`decode` False), which frees its memory."""
     # NxD allocates the state buffers the first graph uses, so the graph using the most of them goes first.
     traces = {"verify": verify_example_inputs(cfg, max_seq_len, batch_size, verify_tokens)} if verify_tokens else {}
-    traces["decode"] = example_inputs(cfg, max_seq_len, batch_size)
+    if decode or not verify_tokens:
+        traces["decode"] = example_inputs(cfg, max_seq_len, batch_size)
     if chunk:
         from .kernels import KEY_BLOCK
 
@@ -132,6 +136,7 @@ def build(
             "kv_cache_format": cfg.kv_cache_format,
             **({"chunk": chunk} if chunk else {}),
             **({"verify_tokens": verify_tokens} if verify_tokens else {}),
+            **({"decode": False} if verify_tokens and not decode else {}),
         },
         tp_degree,
         target,
@@ -155,6 +160,39 @@ def build_head(
         "",
         workdir,
     )
+
+
+def build_mtp(
+    cfg: TextConfig, max_seq_len: int, output_dir: str | Path, batch_size: int, chunk: int, tokens: int, tp_degree: int = 2,
+    target: str = "inf2", workdir=None,
+) -> Path:
+    """Compile the MTP drafter (`model.MTPStep`): steps of `tokens` per row, and prefill chunks of one row."""
+    from .generate import mtp_prefill_inputs, mtp_step_inputs
+    from .model import MTPStep
+
+    zeros = lambda rows, n: torch.zeros(rows, n, cfg.hidden_size, dtype=DTYPE)  # noqa: E731
+    traces = {
+        "step": {"hidden": zeros(batch_size, tokens), "inputs_embeds": zeros(batch_size, tokens), **mtp_step_inputs(cfg, [0] * batch_size, tokens, max_seq_len, DTYPE, [True] * batch_size)},
+        "prefill": {"hidden": zeros(1, chunk), "inputs_embeds": zeros(1, chunk), **mtp_prefill_inputs(cfg, 0, 0, chunk, chunk, DTYPE)},
+    }
+    return compile_graph(
+        lambda: MTPStep(cfg, tp_degree, max_seq_len, DTYPE, reduce_from_tensor_model_parallel_region, batch_size),
+        traces,
+        output_dir,
+        {
+            "max_seq_len": max_seq_len, "batch_size": batch_size, "chunk": chunk, "mtp_tokens": tokens,
+            "weight_format": cfg.weight_format, "kv_cache_format": cfg.kv_cache_format,
+        },
+        tp_degree,
+        target,
+        "",
+        workdir,
+    )
+
+
+def load_mtp_graph(model_dir: str | Path, weights_dir: str | Path):
+    tp_degree = checkpoint.read_build_info(model_dir)["tp_degree"]
+    return load_graph(model_dir, [load_file(checkpoint.mtp_path(weights_dir, rank)) for rank in range(tp_degree)])
 
 
 def load_head_graph(model_dir: str | Path, weights_dir: str | Path):
