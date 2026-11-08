@@ -153,8 +153,8 @@ class HostHead:
     def logits(self, hidden: torch.Tensor) -> torch.Tensor:
         return rms_norm(hidden.float(), self.norm_weight, self.eps).reshape(-1) @ self.lm_head.T
 
-    def next_tokens(self, hidden: torch.Tensor) -> list[int]:
-        """Greedy next token for each row of ``[rows, 1, hidden]``."""
+    def next_tokens(self, hidden: torch.Tensor, recheck_groups: int | None = None) -> list[int]:
+        """Greedy next token for each row of ``[rows, 1, hidden]``. `recheck_groups` is for `ChipHead`'s call."""
         norm = rms_norm(hidden.float(), self.norm_weight, self.eps).squeeze(1)
         return torch.argmax(norm @ self.lm_head.T, dim=-1).tolist()
 
@@ -177,26 +177,29 @@ class ChipHead:
         self.group_rows = group_rows
         self.recheck_groups = recheck_groups
         self.norm_weight = source.get(checkpoint.FINAL_NORM)
+        # lm_head ``[vocab, hidden]`` over the checkpoint's memory map: rows are read as the recheck slices them.
+        self.lm_head = source.matrix_view(checkpoint.LM_HEAD)
 
     def embed_batch(self, token_ids: Sequence[int], dtype: torch.dtype) -> torch.Tensor:
         return self.source.get_rows(checkpoint.EMBED_TOKENS, list(token_ids)).unsqueeze(1).to(dtype)
 
-    def next_tokens(self, hidden: torch.Tensor) -> list[int]:
-        """Greedy next token for each row of ``[rows, 1, hidden]``. Fewer rows than the batch are padded for the graph."""
+    def next_tokens(self, hidden: torch.Tensor, recheck_groups: int | None = None) -> list[int]:
+        """Greedy next token for each row of ``[rows, 1, hidden]``. Fewer rows than the batch are padded for the graph.
+
+        `recheck_groups` overrides how many of the chip's best groups the host rechecks, as for drafts, which need
+        not be exact. Each group is a slice of lm_head straight from the checkpoint's memory map."""
         rows = hidden.shape[0]
         full = torch.zeros(self.batch_size, 1, hidden.shape[-1], dtype=hidden.dtype)
         full[:rows] = hidden
         maxima = self.run_graph(hidden=full)[:rows].float()
-        best_groups = maxima.topk(min(self.recheck_groups, maxima.shape[-1]), dim=-1).indices.tolist()
+        best_groups = maxima.topk(min(recheck_groups or self.recheck_groups, maxima.shape[-1]), dim=-1).indices.tolist()
         norm = rms_norm(hidden.float(), self.norm_weight, self.eps).squeeze(1)
-        total = self.source.shape(checkpoint.LM_HEAD)[0]
         tokens = []
         for row, groups in enumerate(best_groups):
             best_token, best_logit = -1, -torch.inf
             for group in groups:
                 first = group * self.group_rows
-                candidates = self.source.get_row_range(checkpoint.LM_HEAD, first, min(self.group_rows, total - first)).float()
-                logit, index = (candidates @ norm[row]).max(dim=0)
+                logit, index = (self.lm_head[first : first + self.group_rows].float() @ norm[row]).max(dim=0)
                 if logit > best_logit:
                     best_token, best_logit = first + int(index), logit
             if best_token < 0:

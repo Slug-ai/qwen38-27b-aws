@@ -179,7 +179,8 @@ class Scheduler:
         out = self.mtp(hidden=states, inputs_embeds=embeds, **mtp_step_inputs(self.cfg, index, k, self.max_seq_len, self.dtype, active))
         current = out[rows, torch.tensor(take)]
         for j in range(k - 1):
-            for slot, token in zip(ready, self.head.next_tokens(current[ready].unsqueeze(1))):
+            # A draft needn't be exact, since verify keeps only what the model picks, so the chip's best group serves.
+            for slot, token in zip(ready, self.head.next_tokens(current[ready].unsqueeze(1), recheck_groups=1)):
                 drafts[slot].append(token)
             if j == k - 2:
                 break

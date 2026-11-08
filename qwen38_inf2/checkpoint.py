@@ -9,6 +9,7 @@ import json
 import mmap
 import re
 import struct
+import warnings
 import urllib.request
 from pathlib import Path
 
@@ -82,6 +83,20 @@ class TensorSource:
         for first in range(start, end, 1 << 26):
             np.frombuffer(self._read(self._base + first, min(1 << 26, end - first)), dtype=np.uint8).max()
 
+    def matrix_view(self, name: str) -> torch.Tensor:
+        """A local file's matrix as a tensor over the memory map, which reads rows from the page cache on use and
+        copies nothing up front. Read only."""
+        entry = self.header[name]
+        start, end = entry["data_offsets"]
+        if self.is_remote or entry["dtype"] not in ("BF16", "F32", "F16"):
+            return self.get(name)
+        dtype = {"BF16": torch.bfloat16, "F32": torch.float32, "F16": torch.float16}[entry["dtype"]]
+        with warnings.catch_warnings():
+            # The map is read only, and so is every use of the view.
+            warnings.simplefilter("ignore", UserWarning)
+            flat = torch.frombuffer(self._read(self._base + start, end - start), dtype=dtype)
+        return flat.reshape(entry["shape"])
+
     def get_rows(self, name: str, row_ids: list[int] | torch.Tensor) -> torch.Tensor:
         """Read selected rows of a matrix. Lets a test use a few embeddings without 2.5 GB of table."""
         entry = self.header[name]
@@ -127,6 +142,9 @@ class DictSource:
 
     def get_row_range(self, name: str, first: int, count: int) -> torch.Tensor:
         return self.tensors[name][first : first + count]
+
+    def matrix_view(self, name: str) -> torch.Tensor:
+        return self.tensors[name]
 
 
 def _slice_range(total: int, rank: int, tp_degree: int) -> tuple[int, int]:
